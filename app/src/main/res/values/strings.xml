@@ -1,0 +1,62 @@
+<resources>
+    <string name="app_name">AndroidProxy</string>
+    <string name="service_title">5G Proxy Pro</string>
+    <string name="service_not_started">Service not started</string>
+    <string name="proxy_port_label">Proxy Port: </string>
+    <string name="btn_start_proxy">🚀 Start 5G Proxy</string>
+    <string name="wifi_ip_fetching">📶 Wi-Fi IP: Fetching...</string>
+    <string name="cellular_ip_fetching">📲 5G IP: Fetching...</string>
+    <string name="btn_dev_speed_test">🛠️ Developer Speed Test</string>
+    <string name="btn_stop_proxy">🛑 Stop Proxy Service</string>
+    <string name="status_proxy_running">✅ 5G Proxy Running</string>
+    <string name="status_starting">🚀 Starting Service...</string>
+    <string name="status_stopped">Service Stopped</string>
+    <string name="last_exit_prefix">Last Exit: </string>
+    <string name="exit_reason_low_mem">System Low Memory (LMK)</string>
+    <string name="exit_reason_user_requested">User Requested</string>
+    <string name="exit_reason_user_stopped">System Force Stop</string>
+    <string name="exit_reason_signaled">Native Crash (Signal: %1$d)</string>
+    <string name="exit_reason_crash">Java Crash</string>
+    <string name="exit_reason_resource">Excessive Resource Usage</string>
+    <string name="exit_reason_other">Other: %1$d (%2$s)</string>
+    <string name="wifi_proxy_format">📶 Wi-Fi Proxy: %1$s:%2$d</string>
+    <string name="wifi_not_connected">📶 Wi-Fi: Not Connected</string>
+    <string name="wifi_fetch_failed">📶 Wi-Fi: Failed</string>
+    <string name="cellular_ip_format">📲 5G IP: %1$s</string>
+    <string name="cellular_ip_failed">Failed</string>
+    <string name="cellular_ip_not_locked">📲 5G IP: Not Locked</string>
+    <string name="speed_test_running">🏁 Running 5G Speed Test...</string>
+    <string name="speed_test_result">✅ Speed: %1$s Mbps</string>
+    <string name="speed_test_failed">❌ Speed Test Failed</string>
+    <string name="notification_proxying">🚀 5G SOCKS5 Proxying</string>
+    <string name="notification_init_network">Initializing 5G Network...</string>
+    <string name="notification_locked_format">Locked 5G - Listening Port %1$d</string>
+    <string name="notification_channel_name">5G SOCKS5 Proxy Pro</string>
+    
+    <string name="dialog_whitelist_completed_title">✅ Whitelist Configured</string>
+    <string name="dialog_whitelist_completed_msg_xiaomi">Whitelist configured, but to prevent 5G disconnection, please ensure:\n\nGo to: \"Battery &amp; performance\" > \"Battery\" > \"App battery saver\" > \"5G Battery Saver\" and turn it OFF.</string>
+    <string name="dialog_whitelist_completed_msg_default">App added to whitelist. This reduces disconnection probability.</string>
+    <string name="btn_check_settings">Check Settings</string>
+    <string name="btn_close">Close</string>
+    <string name="btn_go_settings">Go to Settings</string>
+    <string name="btn_cancel">Cancel</string>
+    
+    <string name="dialog_xiaomi_title">⚠️ Xiaomi/POCO Users</string>
+    <string name="dialog_xiaomi_msg">To ensure 5G stability:\n\n1. Click \"Go to Settings\"
+2. Tap \"Battery\"
+3. Find and OFF \"5G Battery Saver\"
+
+Also set this App\'s battery saver to \"No restrictions\".</string>
+    
+    <string name="dialog_samsung_title">⚠️ Samsung Users</string>
+    <string name="dialog_samsung_msg">Please add this App to \"Never sleeping apps\" and turn off \"Adaptive battery\".</string>
+    
+    <string name="dialog_oppo_title">⚠️ OPPO/Realme Users</string>
+    <string name="dialog_oppo_msg">Allow \"Background execution\" &amp; \"Auto launch\", and turn off \"Smart 5G\".</string>
+    
+    <string name="dialog_vivo_title">⚠️ Vivo Users</string>
+    <string name="dialog_vivo_msg">Allow \"High background power usage\" and turn off \"5G Smart Switch\".</string>
+    
+    <string name="dialog_default_title">⚠️ Stable Connection</string>
+    <string name="dialog_default_msg">Please check battery settings to prevent system from killing this App.</string>
+</resources>

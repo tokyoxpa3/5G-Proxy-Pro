@@ -1,0 +1,58 @@
+<resources>
+    <string name="app_name">AndroidProxy</string>
+    <string name="service_title">5G Proxy Pro</string>
+    <string name="service_not_started">服務未啟動</string>
+    <string name="proxy_port_label">代理端口: </string>
+    <string name="btn_start_proxy">🚀 一鍵開啟 5G 代理</string>
+    <string name="wifi_ip_fetching">📶 Wi-Fi IP: 獲取中...</string>
+    <string name="cellular_ip_fetching">📲 5G 行動 IP: 獲取中...</string>
+    <string name="btn_dev_speed_test">🛠️ 開發者原生測速</string>
+    <string name="btn_stop_proxy">🛑 停止代理服務</string>
+    <string name="status_proxy_running">✅ 5G Proxy Running</string>
+    <string name="status_starting">🚀 正在啟動服務...</string>
+    <string name="status_stopped">服務已停止</string>
+    <string name="last_exit_prefix">上次關閉原因：</string>
+    <string name="exit_reason_low_mem">系統記憶體不足 (LMK)</string>
+    <string name="exit_reason_user_requested">用戶手動關閉</string>
+    <string name="exit_reason_user_stopped">系統強行停止</string>
+    <string name="exit_reason_signaled">Native 層崩潰 (Signal: %1$d)</string>
+    <string name="exit_reason_crash">Java 層崩潰</string>
+    <string name="exit_reason_resource">資源佔用過大 (CPU/電量)</string>
+    <string name="exit_reason_other">其他原因: %1$d (%2$s)</string>
+    <string name="wifi_proxy_format">📶 Wi-Fi 代理: %1$s:%2$d</string>
+    <string name="wifi_not_connected">📶 Wi-Fi: 未連接</string>
+    <string name="wifi_fetch_failed">📶 Wi-Fi: 獲取失敗</string>
+    <string name="cellular_ip_format">📲 5G 行動 IP: %1$s</string>
+    <string name="cellular_ip_failed">獲取失敗</string>
+    <string name="cellular_ip_not_locked">📲 5G 行動 IP: 尚未鎖定</string>
+    <string name="speed_test_running">🏁 正在進行 5G 原生測速...</string>
+    <string name="speed_test_result">✅ 原生測速: %1$s Mbps</string>
+    <string name="speed_test_failed">❌ 測速失敗</string>
+    <string name="notification_proxying">🚀 5G SOCKS5 代理中</string>
+    <string name="notification_init_network">正在初始化 5G 網路...</string>
+    <string name="notification_locked_format">已鎖定 5G - 監聽 Port %1$d</string>
+    <string name="notification_channel_name">5G SOCKS5 Proxy Pro</string>
+    
+    <string name="dialog_whitelist_completed_title">✅ 白名單設定已完成</string>
+    <string name="dialog_whitelist_completed_msg_xiaomi">您已設定後台白名單，但為了防止 5G 斷線，請務必確認以下設定已關閉：\n\n路徑：「省電與電池」>「更多電池功能」>「5G 智慧省電」</string>
+    <string name="dialog_whitelist_completed_msg_default">您已將此 App 加入後台白名單，這能大幅減少斷線機率。</string>
+    <string name="btn_check_settings">前往檢查</string>
+    <string name="btn_close">關閉</string>
+    <string name="btn_go_settings">前往設定</string>
+    <string name="btn_cancel">取消</string>
+    
+    <string name="dialog_xiaomi_title">⚠️ 小米/POCO 用戶請注意</string>
+    <string name="dialog_xiaomi_msg">為了確保 5G 網路不被系統切斷，請依照以下路徑操作：\n\n1. 點擊「前往設定」打開頁面\n2. 點擊上方的【更多電池功能】\n3. 找到並關閉【5G 智慧省電】\n\n同時請將此 App 的省電策略設為「無限制」。</string>
+    
+    <string name="dialog_samsung_title">⚠️ 三星用戶請注意</string>
+    <string name="dialog_samsung_msg">請將此 App 加入「不會進入休眠的應用程式」清單，並關閉「自動最佳化」。</string>
+    
+    <string name="dialog_oppo_title">⚠️ OPPO/Realme 用戶請注意</string>
+    <string name="dialog_oppo_msg">請至電池設定中，允許此 App 的「背景執行」與「自啟動」，並關閉「智慧 5G」。</string>
+    
+    <string name="dialog_vivo_title">⚠️ Vivo 用戶請注意</string>
+    <string name="dialog_vivo_msg">請至電池設定允許「後台高耗電」，並關閉「5G 智慧切換」。</string>
+    
+    <string name="dialog_default_title">⚠️ 保持連線穩定</string>
+    <string name="dialog_default_msg">請檢查電池設定，確保系統不會在背景殺掉此 App，以維持 5G 鎖定功能。</string>
+</resources>
