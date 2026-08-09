@@ -177,7 +177,9 @@ static void* worker_loop_safe(void* arg) {
             uint32_t ev = events[i].events;
             
             int fatal_error = 0;
-            if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) fatal_error = 1;
+            // EPOLLRDHUP 不再視為立即致命:對端 FIN 前通常還有一批資料在緩衝區,
+            // 直接關閉會把最後一段回應丟掉 (HTTP 200 但 body 不完整)
+            if (ev & (EPOLLERR | EPOLLHUP)) fatal_error = 1;
 
             // 數據轉發邏輯
             if (!fatal_error) {
@@ -205,6 +207,13 @@ static void* worker_loop_safe(void* arg) {
                         if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off) < 0) fatal_error = 1;
                     } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) fatal_error = 1;
                 }
+            }
+
+            // 緩衝清空後以 MSG_PEEK 偵測對端是否已 FIN:
+            // 伺服器關閉 = 回應已完整送達,此時才結束連線
+            if (!fatal_error && full->c2t_len == 0 && full->t2c_len == 0) {
+                char tmp;
+                if (recv(full->target_fd, &tmp, 1, MSG_PEEK) == 0) fatal_error = 1;
             }
 
             if (fatal_error) {
@@ -413,29 +422,34 @@ static void handle_udp_session_full(int client_fd) {
         if (FD_ISSET(remote_udp_fd, &readfds) && client_src_len > 0) {
             struct sockaddr_in6 src6; socklen_t sl = sizeof(src6);
             int off = 22; // 預留足夠空間給 IPv6 Header
-            
+
             // 直接讀到 buffer 後面，保留前面給 Header
             ssize_t r = recvfrom(remote_udp_fd, udp_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
-            
+
             if (r > 0) {
-                udp_buf[off-3]=0; // FRAG
-                udp_buf[off-4]=0; // RSV
-                udp_buf[off-5]=0; // RSV
-                
                 int start = 0;
+                // 判斷來源地址類型;雙棧 socket 收到 IPv4 來源時會是 v4-mapped，一律輸出 IPv4 ATYP
                 if (src6.sin6_family == AF_INET) {
                     struct sockaddr_in *s4 = (struct sockaddr_in *)&src6;
-                    start = off - 10; 
-                    udp_buf[start+3]=0x01; // ATYP IPv4
-                    memcpy(&udp_buf[start+4], &s4->sin_addr, 4); 
+                    start = off - 10;
+                    memset(&udp_buf[start], 0, 3); // RSV (2 bytes) + FRAG (1 byte)
+                    udp_buf[start+3] = 0x01; // ATYP IPv4
+                    memcpy(&udp_buf[start+4], &s4->sin_addr, 4);
                     memcpy(&udp_buf[start+8], &s4->sin_port, 2);
+                } else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) {
+                    start = off - 10;
+                    memset(&udp_buf[start], 0, 3); // RSV + FRAG
+                    udp_buf[start+3] = 0x01; // ATYP IPv4
+                    memcpy(&udp_buf[start+4], &src6.sin6_addr.s6_addr[12], 4); // v4-mapped 尾 4 bytes
+                    memcpy(&udp_buf[start+8], &src6.sin6_port, 2);
                 } else {
-                    start = off - 22; 
-                    udp_buf[start+3]=0x04; // ATYP IPv6
-                    memcpy(&udp_buf[start+4], &src6.sin6_addr, 16); 
+                    start = off - 22;
+                    memset(&udp_buf[start], 0, 3); // RSV + FRAG
+                    udp_buf[start+3] = 0x04; // ATYP IPv6
+                    memcpy(&udp_buf[start+4], &src6.sin6_addr, 16);
                     memcpy(&udp_buf[start+20], &src6.sin6_port, 2);
                 }
-                sendto(local_udp_fd, udp_buf+start, r+(off-start), 0, (struct sockaddr*)&client_src_addr, client_src_len);
+                sendto(local_udp_fd, udp_buf + start, r + (off - start), 0, (struct sockaddr*)&client_src_addr, client_src_len);
             }
         }
     }

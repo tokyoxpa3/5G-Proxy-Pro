@@ -200,7 +200,11 @@ class Socks5ProxyService : Service() {
                 fd
             }
             else {
+                // 過濾無用的本機/鏈路本地地址,並優先嘗試 IPv4
+                // (5G 常見 IPv6 黑洞:連 IPv6 會卡到超時,先試 IPv4 可快速連上)
                 val addresses = network.getAllByName(host)
+                    .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
+                    .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
                 if (addresses.isEmpty()) return -1
                 var socket: java.net.Socket? = null
                 for (addr in addresses) {
@@ -210,7 +214,9 @@ class Socks5ProxyService : Service() {
                         candidate.sendBufferSize = 3 * 1024 * 1024
                         candidate.tcpNoDelay = true
                         network.bindSocket(candidate)
-                        candidate.connect(java.net.InetSocketAddress(addr, port), 5000)
+                        // IPv6 用短超時:黑洞時快速失敗,不讓單一連線卡 5 秒
+                        val connectTimeout = if (addr is java.net.Inet4Address) 5000 else 1500
+                        candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout)
                         socket = candidate
                         break
                     } catch (e: Exception) {

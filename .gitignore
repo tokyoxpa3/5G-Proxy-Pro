@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Local configuration file (sdk.dir)
+local.properties
+
+# CMake / NDK generated files
+.cxx/
+.externalNativeBuild/
+
+# IDE
+.idea/
+*.iml
+captures/
+
+# OS
+.DS_Store
+
+# APK outputs
+*.apk
+*.aab
