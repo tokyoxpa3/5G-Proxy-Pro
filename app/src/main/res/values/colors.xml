@@ -2,4 +2,7 @@
 <resources>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <color name="ic_launcher_background">#FF1A237E</color>
+    <color name="ic_launcher_meridian">#FF1A237E</color>
+    <color name="ic_launcher_arrow">#FFFF5722</color>
 </resources>

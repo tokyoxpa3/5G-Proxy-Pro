@@ -32,8 +32,20 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            // 關鍵：在測試階段讓 Release 版本使用 Debug 簽名，解決無法安裝的問題
-            signingConfig signingConfigs.debug
+            // 若根目錄存在 keystore.properties 則以正式金鑰簽名（自行發布用），
+            // 否則不簽名，供 F-Droid 等第三方使用自己的金鑰簽署。
+            def keystoreProps = rootProject.file('keystore.properties')
+            if (keystoreProps.exists()) {
+                def props = new Properties()
+                keystoreProps.withInputStream { props.load(it) }
+                signingConfigs.create('release') {
+                    storeFile file(props['storeFile'])
+                    storePassword props['storePassword']
+                    keyAlias props['keyAlias']
+                    keyPassword props['keyPassword']
+                }
+                signingConfig signingConfigs.release
+            }
         }
     }
     

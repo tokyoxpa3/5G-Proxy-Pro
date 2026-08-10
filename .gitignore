@@ -6,6 +6,11 @@ app/build/
 # Local configuration file (sdk.dir)
 local.properties
 
+# Release signing (never commit keystore or passwords)
+keystore.properties
+*.keystore
+*.jks
+
 # CMake / NDK generated files
 .cxx/
 .externalNativeBuild/

@@ -139,13 +139,26 @@ C 引擎收到客戶端連線後，透過 JNI 呼叫 Java `createSocketBoundToNe
 
 ## 注意事項
 
-- **Release 版目前使用 Debug 簽署**（`app/build.gradle` 中 `signingConfig signingConfigs.debug`），目的在讓 Google 認證的測試機可安裝。要上架商店需改為正式簽署設定。
+- **Release 版預設不簽名**：若要自行發布 APK，請在專案根目錄建立 `keystore.properties`（格式見下方），並準備一個正式 keystore；若沒有該檔案，Release 版會輸出未簽名的 APK，供 F-Droid 等第三方以自身金鑰簽署。
 - App 僅於「鎖定蜂巢狀網路」的狀態下運作，若沒有蜂巢狀訊號（無 SIM 卡）服務將無法啟動。
 - 專案包含 `local.properties`（SDK 路徑）與 `.gradle/`、`build/`、`.cxx/` 等產生目錄，這些已被 `.gitignore` 忽略，不會上傳。
 - 測速功能使用多個公網測速伺服器（Linode 新加坡/東京、OVH 等），某些電信運營商可能對國際頻寬限制而測速偏低。
+
+### Release 簽名設定（自行發布時）
+
+在專案根目錄建立 `keystore.properties`（已被 `.gitignore` 忽略，不會上傳）：
+
+```properties
+storeFile=C:/path/to/your-release.keystore
+storePassword=你的儲存庫密碼
+keyAlias=你的金鑰別名
+keyPassword=你的金鑰密碼
+```
+
+之後執行 `.\gradlew.bat assembleRelease` 即會以正式金鑰簽名。
 
 ---
 
 ## 授權
 
-本專案目前未指定授權條款（All Rights Reserved）。如需開源發布，建議在 GitHub 上加入 LICENSE 檔案（如 MIT）。
+本專案以 **MIT License** 授權釋出，詳見 [LICENSE](LICENSE)。
