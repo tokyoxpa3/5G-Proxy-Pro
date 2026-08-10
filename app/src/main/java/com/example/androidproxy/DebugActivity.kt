@@ -344,7 +344,8 @@ class DebugActivity : Activity() {
                 HotspotManager.getHotspotIP(applicationContext)
             }
             if (hotspotIP != null) {
-                hotspotIPText.text = getString(R.string.hotspot_ip_format, hotspotIP)
+                val port = portInput.text.toString().toIntOrNull() ?: 1080
+                hotspotIPText.text = getString(R.string.hotspot_ip_format, hotspotIP, port)
             } else {
                 hotspotIPText.text = getString(R.string.hotspot_ip_disabled)
             }

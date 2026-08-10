@@ -26,7 +26,7 @@
     <string name="cellular_ip_format">📲 5G IP: %1$s</string>
     <string name="cellular_ip_failed">Failed</string>
     <string name="cellular_ip_not_locked">📲 5G IP: Not Locked</string>
-    <string name="hotspot_ip_format">🛰️ Hotspot IP: %1$s</string>
+    <string name="hotspot_ip_format">🛰️ Hotspot Proxy: %1$s:%2$d</string>
     <string name="hotspot_ip_disabled">🛰️ Hotspot: Not Enabled</string>
     <string name="btn_refresh_status">🔄 Refresh Status</string>
     <string name="status_refreshing">🔄 Refreshing...</string>
