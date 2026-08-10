@@ -5,6 +5,7 @@
     <string name="proxy_port_label">代理端口: </string>
     <string name="btn_start_proxy">🚀 一鍵開啟 5G 代理</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: 獲取中...</string>
+    <string name="hotspot_ip_fetching">🛰️ 熱點分享 IP: 獲取中...</string>
     <string name="cellular_ip_fetching">📲 5G 行動 IP: 獲取中...</string>
     <string name="btn_dev_speed_test">🛠️ 開發者原生測速</string>
     <string name="btn_stop_proxy">🛑 停止代理服務</string>
@@ -25,6 +26,10 @@
     <string name="cellular_ip_format">📲 5G 行動 IP: %1$s</string>
     <string name="cellular_ip_failed">獲取失敗</string>
     <string name="cellular_ip_not_locked">📲 5G 行動 IP: 尚未鎖定</string>
+    <string name="hotspot_ip_format">🛰️ 熱點分享 IP: %1$s</string>
+    <string name="hotspot_ip_disabled">🛰️ 熱點分享: 未開啟</string>
+    <string name="btn_refresh_status">🔄 刷新狀態</string>
+    <string name="status_refreshing">🔄 正在刷新...</string>
     <string name="speed_test_running">🏁 正在進行 5G 原生測速...</string>
     <string name="speed_test_result">✅ 原生測速: %1$s Mbps</string>
     <string name="speed_test_failed">❌ 測速失敗</string>

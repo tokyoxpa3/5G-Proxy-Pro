@@ -5,6 +5,7 @@
     <string name="proxy_port_label">Proxy Port: </string>
     <string name="btn_start_proxy">🚀 Start 5G Proxy</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: Fetching...</string>
+    <string name="hotspot_ip_fetching">🛰️ Hotspot IP: Fetching...</string>
     <string name="cellular_ip_fetching">📲 5G IP: Fetching...</string>
     <string name="btn_dev_speed_test">🛠️ Developer Speed Test</string>
     <string name="btn_stop_proxy">🛑 Stop Proxy Service</string>
@@ -25,6 +26,10 @@
     <string name="cellular_ip_format">📲 5G IP: %1$s</string>
     <string name="cellular_ip_failed">Failed</string>
     <string name="cellular_ip_not_locked">📲 5G IP: Not Locked</string>
+    <string name="hotspot_ip_format">🛰️ Hotspot IP: %1$s</string>
+    <string name="hotspot_ip_disabled">🛰️ Hotspot: Not Enabled</string>
+    <string name="btn_refresh_status">🔄 Refresh Status</string>
+    <string name="status_refreshing">🔄 Refreshing...</string>
     <string name="speed_test_running">🏁 Running 5G Speed Test...</string>
     <string name="speed_test_result">✅ Speed: %1$s Mbps</string>
     <string name="speed_test_failed">❌ Speed Test Failed</string>

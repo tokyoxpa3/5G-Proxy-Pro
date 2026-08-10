@@ -16,7 +16,7 @@
 - ❤️ **20 秒循環心跳** — 防止 5G 掉線或進入省電模式
 - 🛡️ **原生引擎健康檢查** — 每 10 秒驗證 SOCKS5 伺服器存活，異常自動重啟
 - 📊 **開發者測速工具** — 綁定 5G 網路的原始下載測速（多伺服器自動切換）
-- 📶 顯示 Wi-Fi 內網 IP / 5G 公網 IP、上次退出原因（低記憶體、崩潰等）
+- 📶 顯示 Wi-Fi 內網 IP / 熱點分享 IP / 5G 公網 IP，附「刷新狀態」按鈕、上次退出原因（低記憶體、崩潰等）
 
 ---
 
@@ -114,13 +114,14 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 AndroidProxy/
 ├── app/src/main/
 │   ├── java/com/example/androidproxy/
-│   │   ├── DebugActivity.kt          # 主介面 + 測速
+│   │   ├── DebugActivity.kt          # 主介面 + 測速 + 熱點 IP 顯示
 │   │   ├── Socks5ProxyService.kt    # 前台服務：鎖定 5G、啟動 C 引擎
 │   │   ├── NativeEngine.kt          # JNI 橋接（socketProvider 回呼）
 │   │   ├── PowerPermissionHelper.kt # 各品牌電池最佳化白名單引導
 │   │   └── network/
 │   │       ├── CellularNetworkManager.kt  # requestNetwork() 鎖定與釋放
-│   │       └── PublicIPChecker.kt         # 5G 公網 IP 查詢
+│   │       ├── PublicIPChecker.kt         # 5G 公網 IP 查詢
+│   │       └── HotspotManager.kt          # 熱點分享 IP 偵測
 │   └── cpp/
 │       ├── jni_bridge.c       # JNI 註冊、Java↔C 呼叫橋樑
 │       ├── simple-socks5.c    # epoll SOCKS5 引擎（TCP/UDP）

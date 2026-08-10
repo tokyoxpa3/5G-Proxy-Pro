@@ -19,12 +19,14 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import com.example.androidproxy.network.CellularNetworkManager
+import com.example.androidproxy.network.HotspotManager
 import com.example.androidproxy.network.PublicIPChecker
 
 class DebugActivity : Activity() {
     
     private lateinit var statusText: TextView
     private lateinit var wifiIPText: TextView
+    private lateinit var hotspotIPText: TextView
     private lateinit var cellularIPText: TextView
     private lateinit var portInput: EditText
     private lateinit var mainButton: Button
@@ -193,6 +195,12 @@ class DebugActivity : Activity() {
                 setPadding(0, 8, 0, 8)
                 setTextColor(0xFF495057.toInt())
             }
+            hotspotIPText = TextView(context).apply {
+                text = getString(R.string.hotspot_ip_fetching)
+                textSize = 16f
+                setPadding(0, 8, 0, 8)
+                setTextColor(0xFF495057.toInt())
+            }
             cellularIPText = TextView(context).apply {
                 text = getString(R.string.cellular_ip_fetching)
                 textSize = 16f
@@ -200,7 +208,28 @@ class DebugActivity : Activity() {
                 setTextColor(0xFF495057.toInt())
             }
             addView(wifiIPText)
+            addView(hotspotIPText)
             addView(cellularIPText)
+        }
+        
+        // Refresh Status Button
+        val refreshButton = Button(this).apply {
+            text = getString(R.string.btn_refresh_status)
+            textSize = 14f
+            setTextColor(0xFF6200EE.toInt())
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadius = 12f
+                setStroke(2, 0xFF6200EE.toInt())
+            }
+            setPadding(0, 24, 0, 24)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 24
+            }
+            setOnClickListener { refreshStatus() }
         }
         
         rootLayout.addView(titleText)
@@ -208,6 +237,7 @@ class DebugActivity : Activity() {
         rootLayout.addView(portLayout)
         rootLayout.addView(mainButton)
         rootLayout.addView(ipCard)
+        rootLayout.addView(refreshButton)
         
         // 添加調試工具按鈕
         val debugTools = Button(this).apply {
@@ -282,6 +312,16 @@ class DebugActivity : Activity() {
         updateNetworkStatus()
     }
     
+    private fun refreshStatus() {
+        statusText.text = getString(R.string.status_refreshing)
+        updateNetworkStatus()
+        if (isRunning) {
+            statusText.text = getString(R.string.status_proxy_running)
+        } else {
+            statusText.text = getString(R.string.status_stopped)
+        }
+    }
+
     private fun updateNetworkStatus() {
         activityScope.launch {
             // 更新 Wi-Fi IP (內網)
@@ -297,6 +337,16 @@ class DebugActivity : Activity() {
                 }
             } catch (e: Exception) {
                 wifiIPText.text = getString(R.string.wifi_fetch_failed)
+            }
+
+            // 更新熱點分享 IP
+            val hotspotIP = withContext(Dispatchers.IO) {
+                HotspotManager.getHotspotIP(applicationContext)
+            }
+            if (hotspotIP != null) {
+                hotspotIPText.text = getString(R.string.hotspot_ip_format, hotspotIP)
+            } else {
+                hotspotIPText.text = getString(R.string.hotspot_ip_disabled)
             }
 
             // 更新 5G 行動 IP (公網)
