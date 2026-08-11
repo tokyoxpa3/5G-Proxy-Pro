@@ -141,7 +141,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_jvm = vm;
     JNIEnv *env;
     if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_ERR;
-    jclass cls = (*env)->FindClass(env, "com/example/androidproxy/NativeEngine");
+    jclass cls = (*env)->FindClass(env, "com/tokyoxpa3/androidproxy/NativeEngine");
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return JNI_ERR; }
     (*env)->RegisterNatives(env, cls, gMethods, sizeof(gMethods) / sizeof(gMethods[0]));
     return JNI_VERSION_1_6;

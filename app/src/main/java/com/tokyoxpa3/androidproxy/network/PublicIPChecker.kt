@@ -1,4 +1,4 @@
-package com.example.androidproxy.network
+package com.tokyoxpa3.androidproxy.network
 
 import android.net.Network
 import kotlinx.coroutines.Dispatchers
@@ -8,11 +8,6 @@ import java.net.URL
 
 class PublicIPChecker {
     
-    /**
-     * 使用指定的網路獲取公網 IP
-     * @param network 要使用的網路
-     * @return IP 地址字串，失敗返回 null
-     */
     suspend fun getPublicIP(network: android.net.Network? = null): String? = withContext(Dispatchers.IO) {
         try {
             val url = URL("https://api.ipify.org?format=text")
@@ -43,11 +38,6 @@ class PublicIPChecker {
         }
     }
     
-    /**
-     * 檢查網路連通性
-     * @param network 要使用的網路
-     * @return 是否連通
-     */
     suspend fun checkConnectivity(network: android.net.Network? = null): Boolean = withContext(Dispatchers.IO) {
         try {
             val url = URL("https://www.google.com")

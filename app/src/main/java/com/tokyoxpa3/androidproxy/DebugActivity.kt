@@ -1,4 +1,4 @@
-package com.example.androidproxy
+package com.tokyoxpa3.androidproxy
 
 import android.os.Bundle
 import android.util.Log
@@ -18,9 +18,9 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
-import com.example.androidproxy.network.CellularNetworkManager
-import com.example.androidproxy.network.HotspotManager
-import com.example.androidproxy.network.PublicIPChecker
+import com.tokyoxpa3.androidproxy.network.CellularNetworkManager
+import com.tokyoxpa3.androidproxy.network.HotspotManager
+import com.tokyoxpa3.androidproxy.network.PublicIPChecker
 
 class DebugActivity : Activity() {
     
@@ -238,8 +238,6 @@ class DebugActivity : Activity() {
             addView(authPassInput)
         }
 
-        // [新增] 帳號/密碼修改即時套用：代理運行中直接更新 C 引擎認證，
-        // 新連線立即生效，無需重啟代理（已連線的舊連線不受影響）
         val authWatcher = object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
@@ -321,7 +319,6 @@ class DebugActivity : Activity() {
         rootLayout.addView(ipCard)
         rootLayout.addView(refreshButton)
         
-        // 添加調試工具按鈕
         val debugTools = Button(this).apply {
             text = getString(R.string.btn_dev_speed_test)
             textSize = 12f
@@ -370,7 +367,6 @@ class DebugActivity : Activity() {
     }
 
     private fun startProxyFlow() {
-        // 檢查是否已在白名單
         if (!PowerPermissionHelper.isWhitelisted(this)) {
             PowerPermissionHelper.showOptimizationDialog(this)
             return 
@@ -378,7 +374,6 @@ class DebugActivity : Activity() {
 
         val port = portInput.text.toString().toIntOrNull() ?: 1080
 
-        // 儲存帳密設定（兩個都留空 = 無認證）
         getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
             .edit()
             .putString("auth_user", authUserInput.text.toString().trim())
@@ -396,7 +391,6 @@ class DebugActivity : Activity() {
         }
         startService(intent)
         
-        // 延遲更新顯示資訊
         activityScope.launch {
             delay(3000)
             updateNetworkStatus()
@@ -428,7 +422,6 @@ class DebugActivity : Activity() {
 
     private fun updateNetworkStatus() {
         activityScope.launch {
-            // 更新 Wi-Fi IP (內網)
             try {
                 val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
                 val ip = wifiManager.connectionInfo.ipAddress
@@ -443,7 +436,6 @@ class DebugActivity : Activity() {
                 wifiIPText.text = getString(R.string.wifi_fetch_failed)
             }
 
-            // 更新熱點分享 IP
             val hotspotIP = withContext(Dispatchers.IO) {
                 HotspotManager.getHotspotIP(applicationContext)
             }
@@ -454,7 +446,6 @@ class DebugActivity : Activity() {
                 hotspotIPText.text = getString(R.string.hotspot_ip_disabled)
             }
 
-            // 更新 5G 行動 IP (公網)
             cellularIPText.text = getString(R.string.cellular_ip_fetching)
             val cellularNetwork = withContext(Dispatchers.IO) {
                 networkManager.requestCellularNetwork(5000)

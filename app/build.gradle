@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace 'com.example.androidproxy'
+    namespace 'com.tokyoxpa3.androidproxy'
     compileSdk 34
     
     defaultConfig {

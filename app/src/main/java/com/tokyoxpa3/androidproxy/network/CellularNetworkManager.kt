@@ -1,4 +1,4 @@
-package com.example.androidproxy.network
+package com.tokyoxpa3.androidproxy.network
 
 import android.content.Context
 import android.net.ConnectivityManager
@@ -16,14 +16,12 @@ class CellularNetworkManager(private val context: Context) {
     private val connectivityManager: ConnectivityManager by lazy {
         try {
             val service = context.getSystemService(Context.CONNECTIVITY_SERVICE)
-            
             val cm = service as? ConnectivityManager
             if (cm == null) {
                 val errorMsg = "Cannot cast service to ConnectivityManager. Service type: ${service?.javaClass?.name}"
                 android.util.Log.e("CellularNetwork", errorMsg)
                 throw IllegalStateException(errorMsg)
             }
-            
             cm
         } catch (e: ClassCastException) {
             android.util.Log.e("CellularNetwork", "ClassCastException when getting ConnectivityManager", e)
@@ -36,14 +34,7 @@ class CellularNetworkManager(private val context: Context) {
     private var cellularNetwork: Network? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     
-    /**
-     * 請求並鎖定蜂巢式網路 (TRANSPORT_CELLULAR)
-     * @param timeoutMs 超時時間 (毫秒)
-     * @return Network 物件，如果失敗則返回 null
-     */
     suspend fun requestCellularNetwork(timeoutMs: Long = 10000L): Network? = try {
-
-        
         withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { continuation ->
                 val networkRequest = NetworkRequest.Builder()
@@ -72,8 +63,7 @@ class CellularNetworkManager(private val context: Context) {
                     
                     override fun onUnavailable() {
                         super.onUnavailable()
-                        android.util.Log.w("CellularNetwork", "Network request unavailable - no cellular network available")
-                        
+                        android.util.Log.w("CellularNetwork", "Network request unavailable")
                         try {
                             resumeOnce(null)
                         } catch (e: Exception) {
@@ -84,7 +74,6 @@ class CellularNetworkManager(private val context: Context) {
                 
                 try {
                     connectivityManager.requestNetwork(networkRequest, networkCallback!!)
-                    
                 } catch (e: Exception) {
                     android.util.Log.e("CellularNetwork", "Failed to request network", e)
                     continuation.resumeWithException(e)
@@ -107,9 +96,6 @@ class CellularNetworkManager(private val context: Context) {
         null
     }
     
-    /**
-     * 釋放網路鎖定
-     */
     fun releaseCellularNetwork() {
         try {
             networkCallback?.let { callback ->
@@ -122,16 +108,12 @@ class CellularNetworkManager(private val context: Context) {
         }
     }
     
-    /**
-     * 檢查當前是否有可用的蜂巢式網路
-     */
     fun hasCellularNetwork(): Boolean {
         return try {
             val activeNetwork = connectivityManager.activeNetwork
             val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
             val hasCellular = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
             val hasInternet = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-            
             hasCellular && hasInternet
         } catch (e: Exception) {
             android.util.Log.e("CellularNetwork", "Error checking cellular network", e)
@@ -139,15 +121,10 @@ class CellularNetworkManager(private val context: Context) {
         }
     }
     
-    /**
-     * 獲取當前網路資訊 (優先顯示鎖定的蜂巢式網路)
-     */
     fun getCurrentNetworkInfo(): String {
         return try {
-            // 如果有鎖定的 cellularNetwork 就用它，否則用系統預設的
             val targetNetwork = cellularNetwork ?: connectivityManager.activeNetwork
             val capabilities = connectivityManager.getNetworkCapabilities(targetNetwork)
-            
             buildString {
                 append("Active Network (Target): ${targetNetwork?.hashCode() ?: "None"}\n")
                 append("Is Using Locked Cellular: ${cellularNetwork != null}\n")

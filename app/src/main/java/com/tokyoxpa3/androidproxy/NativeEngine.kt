@@ -1,4 +1,4 @@
-package com.example.androidproxy
+package com.tokyoxpa3.androidproxy
 
 import android.util.Log
 
@@ -7,10 +7,7 @@ object NativeEngine {
     private var libraryLoaded = false
     private var initialized = false
     
-    // 唯一的 Socket Provider 定義：(Host, Port, IsUdp) -> FD
     var socketProvider: ((String, Int, Boolean) -> Int)? = null
-    
-    // 由 C++ 在 close(fd) 前調用，釋放 Java 端的強引用
     var onSocketClosed: ((Int) -> Unit)? = null
 
     init {
@@ -37,7 +34,6 @@ object NativeEngine {
     
     private external fun nativeRegisterInstance()
     
-    // C++ 會調用此方法 (對應 jni_bridge.c 中的 GetMethodID)
     fun createSocketFromNative(host: String, port: Int, isUdp: Boolean): Int {
         return socketProvider?.invoke(host, port, isUdp) ?: -1
     }
@@ -46,7 +42,6 @@ object NativeEngine {
         onSocketClosed?.invoke(fd)
     }
     
-    // JNI 方法定義
     external fun startSocks5Server(port: Int): String
     external fun stopSocks5Server(): String
     external fun setSocks5Auth(user: String, pass: String): String

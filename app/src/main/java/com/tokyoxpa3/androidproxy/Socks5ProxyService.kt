@@ -1,4 +1,4 @@
-package com.example.androidproxy
+package com.tokyoxpa3.androidproxy
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -20,11 +20,10 @@ class Socks5ProxyService : Service() {
     private var wakeLock: android.os.PowerManager.WakeLock? = null
     
     private val networkManager by lazy { 
-        com.example.androidproxy.network.CellularNetworkManager(this) 
+        com.tokyoxpa3.androidproxy.network.CellularNetworkManager(this) 
     }
     private var cellularNetwork: android.net.Network? = null
 
-    // 儲存強引用，Key 為 FD
     private val activeSockets = java.util.concurrent.ConcurrentHashMap<Int, Any>()
     
     companion object {
@@ -40,7 +39,6 @@ class Socks5ProxyService : Service() {
     override fun onCreate() {
         super.onCreate()
         
-        // --- [新增] 全域異常捕獲器：抓取導致 REASON_CRASH 的元兇 ---
         val originalHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             val crashDetail = """
@@ -52,13 +50,11 @@ class Socks5ProxyService : Service() {
                 ${throwable.stackTraceToString()}
             """.trimIndent()
             
-            // 存入 SharedPreferences
             getSharedPreferences("debug_log", MODE_PRIVATE)
                 .edit()
                 .putString("last_java_crash", crashDetail)
-                .commit() // 使用 commit 確保立即寫入磁碟
+                .commit()
 
-            // 呼叫原本的處理器（讓系統記錄到 ApplicationExitInfo）
             originalHandler?.uncaughtException(thread, throwable)
         }
 
@@ -66,28 +62,23 @@ class Socks5ProxyService : Service() {
         val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "5GProxy::WakeLock").apply { acquire() }
         
-        // --- 關鍵修復：收到 C 層通知時，真正關閉 Java Socket ---
         NativeEngine.onSocketClosed = { fd -> 
             val socket = activeSockets.remove(fd)
             if (socket is Closeable) {
                 try { 
                     socket.close() 
-                    // Log.d(TAG, "✅ Socket $fd closed cleanly")
                 } catch (e: Exception) {
-                    // Log.e(TAG, "❌ Error closing socket $fd: ${e.message}")
                 }
             }
         }
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 如果 intent 為 null，代表是系統因記憶體回收後自動重啟
         val port = intent?.getIntExtra(EXTRA_PORT, 1080) ?: 1080 
         
         if (intent?.action == ACTION_STOP_PROXY) {
             stopProxy()
         } else {
-            // 如果是系統重啟且原本就在運行，則重新初始化
             startProxy(port) 
         }
         return START_STICKY
@@ -126,7 +117,6 @@ class Socks5ProxyService : Service() {
                 }
                 NativeEngine.registerInstance()
 
-                // 套用帳密認證：兩個都留空 = 無認證（開放代理）
                 val prefs = getSharedPreferences("proxy_config", android.content.Context.MODE_PRIVATE)
                 val authUser = prefs.getString("auth_user", "") ?: ""
                 val authPass = prefs.getString("auth_pass", "") ?: ""
@@ -134,7 +124,6 @@ class Socks5ProxyService : Service() {
                 
                 NativeEngine.startSocks5Server(port)
 
-                // 啟動心跳機制：每 30 秒發送一個極小請求，防止 5G 掉線或進入省電模式
                 launch {
                     while (isProxyRunning) {
                         delay(30000)
@@ -145,22 +134,19 @@ class Socks5ProxyService : Service() {
                                     inputStream.use { it.read() }
                                 }
                             } catch (e: Exception) {
-                                // 忽略錯誤
                             }
                         }
                     }
                 }
 
-                // 監控 C 層線程狀態 (Health Check)
                 launch {
                     while (isProxyRunning) {
-                        delay(10000) // 每 10 秒檢查一次
-                        // 這裡透過嘗試連接 Local Port 來檢查 C 層是否活著
+                        delay(10000)
                         if (NativeEngine.isLibraryLoaded() && !isNativeThreadAlive(port)) {
                              Log.e(TAG, "偵測到 Native 引擎異常停止，嘗試重啟...")
-                             isProxyRunning = false // 重置狀態
+                             isProxyRunning = false
                              try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}
-                             startProxy(port) // 重新啟動
+                             startProxy(port)
                              break
                         }
                     }
@@ -180,7 +166,6 @@ class Socks5ProxyService : Service() {
                 networkManager.releaseCellularNetwork()
                 cellularNetwork = null
                 
-                // 清理所有殘留連線
                 activeSockets.values.forEach { 
                     if (it is Closeable) try { it.close() } catch(e: Exception){} 
                 }
@@ -206,8 +191,6 @@ class Socks5ProxyService : Service() {
                 fd
             }
             else {
-                // 過濾無用的本機/鏈路本地地址,並優先嘗試 IPv4
-                // (5G 常見 IPv6 黑洞:連 IPv6 會卡到超時,先試 IPv4 可快速連上)
                 val addresses = network.getAllByName(host)
                     .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
                     .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
@@ -220,7 +203,6 @@ class Socks5ProxyService : Service() {
                         candidate.sendBufferSize = 3 * 1024 * 1024
                         candidate.tcpNoDelay = true
                         network.bindSocket(candidate)
-                        // IPv6 用短超時:黑洞時快速失敗,不讓單一連線卡 5 秒
                         val connectTimeout = if (addr is java.net.Inet4Address) 5000 else 1500
                         candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout)
                         socket = candidate
@@ -240,7 +222,6 @@ class Socks5ProxyService : Service() {
 
     private fun isNativeThreadAlive(port: Int): Boolean {
         return try {
-            // 嘗試連接本地 SOCKS5 端口
             java.net.Socket("127.0.0.1", port).use { true }
         } catch (e: Exception) {
             false
