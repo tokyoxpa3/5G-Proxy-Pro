@@ -1,0 +1,4 @@
+- SOCKS5 username/password authentication (RFC 1929)
+- Foreground service type connectedDevice
+- Show proxy port with hotspot IP on Wi-Fi display
+- Hotspot IP display and refresh button
