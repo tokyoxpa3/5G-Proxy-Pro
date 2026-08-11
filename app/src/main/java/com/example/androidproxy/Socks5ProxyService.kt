@@ -112,7 +112,7 @@ class Socks5ProxyService : Service() {
         if (isProxyRunning) return
         isServiceRunning = true
         startForeground(NOTIFICATION_ID, createNotification(getString(R.string.notification_proxying), getString(R.string.notification_init_network)), 
-            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         
         serviceScope.launch {
             try {
@@ -125,6 +125,12 @@ class Socks5ProxyService : Service() {
                     createSocketBoundToNetwork(host, p, isUdp) 
                 }
                 NativeEngine.registerInstance()
+
+                // 套用帳密認證：兩個都留空 = 無認證（開放代理）
+                val prefs = getSharedPreferences("proxy_config", android.content.Context.MODE_PRIVATE)
+                val authUser = prefs.getString("auth_user", "") ?: ""
+                val authPass = prefs.getString("auth_pass", "") ?: ""
+                NativeEngine.setSocks5Auth(authUser, authPass)
                 
                 NativeEngine.startSocks5Server(port)
 

@@ -3,6 +3,11 @@
     <string name="service_title">5G Proxy Pro</string>
     <string name="service_not_started">Service not started</string>
     <string name="proxy_port_label">Proxy Port: </string>
+    <string name="auth_user_label">Username: </string>
+    <string name="auth_user_hint">Empty = not verified</string>
+    <string name="auth_pass_label">Password: </string>
+    <string name="auth_pass_hint">Empty = not verified</string>
+    <string name="auth_applied_live">Auth applied live (new connections)</string>
     <string name="btn_start_proxy">🚀 Start 5G Proxy</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: Fetching...</string>
     <string name="hotspot_ip_fetching">🛰️ Hotspot IP: Fetching...</string>

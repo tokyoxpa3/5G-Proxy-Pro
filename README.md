@@ -11,6 +11,7 @@
 ## 功能特色
 
 - 🔒 **強制鎖定蜂巢式網路** — 透過 `NetworkRequest` 將 Socket 綁定到 5G 網路（`Network.bindSocket`），不受 Wi-Fi 干擾
+- 🔑 **可選帳密認證**（RFC 1929）— 預設無認證（開放代理）；在 App 內設定帳號密碼後，客戶端必須通過認證才能連線
 - 🧦 **完整 SOCKS5 代理** — 原生 C 引擎（epoll，可併發），支援 TCP（CONNECT）與 UDP（ASSOCIATE），IPv4 / IPv6 / 網域 (DOMAIN) 地址皆支援
 - 🔁 **IPv6 自動 Fallback** — TCP 連線依序嘗試所有解析出的地址（IPv6/IPv4）
 - ❤️ **20 秒循環心跳** — 防止 5G 掉線或進入省電模式
@@ -85,7 +86,7 @@ cd AndroidProxy
 adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
-4. 安裝完畢後，需要 **使用系統連接受權**（`FOREGROUND_SERVICE_DATA_SYNC`），App 首次執行會提示允許電池最佳化白名單，建議照提示操作（尤其小米/三星使用者）。
+4. 安裝完畢後，需要 **使用系統連接受權**（`FOREGROUND_SERVICE_CONNECTED_DEVICE`），App 首次執行會提示允許電池最佳化白名單，建議照提示操作（尤其小米/三星使用者）。
 
 ---
 
@@ -93,16 +94,19 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 
 1. 開啟 App（5G Proxy Pro）
 2. 輸入代理連接埠（預設 `1080`）
-3. 點「🚀 Start 5G Proxy」，等待狀態顯示「✅ 5G Proxy Running」
-4. 在同一個 Wi-Fi 下的其他裝置設定 SOCKS5 代理（例如手機 Wi-Fi 進階設定，或電腦系統 Proxy 設定）：
+3. （可選）輸入「使用者」與「密碼」——**兩者都留空 = 無認證（開放代理）**；任一欄位有設定即啟用認證，留空的欄位不驗證（例：只設帳號，則密碼任意皆可）。**代理運行中修改帳密會即時套用**（新連線生效，已連線的舊連線不受影響），不需停止重啟
+4. 點「🚀 Start 5G Proxy」，等待狀態顯示「✅ 5G Proxy Running」
+5. 在同一個 Wi-Fi 下的其他裝置設定 SOCKS5 代理（例如手機 Wi-Fi 進階設定，或電腦系統 Proxy 設定）：
 
 ```
 伺服器：手機的 Wi-Fi IP（App 會顯示）
 連接埠：1080
 通訊協定：SOCKS5
+使用者名稱：<有設定才需要填>
+密碼：<有設定才需要填>
 ```
 
-> SOCKS5 代理本身不需要驗證（開放代理）。請務必只在信任的區域網路使用！
+> ⚠️ 若未設定帳密即為開放代理，任何能連到手機位址的人都能使用。請務必只在信任的區域網路使用，或設定帳密保護！
 
 停止方式：回到 App 點「🛑 Stop Proxy Service」，或關閉服務。
 

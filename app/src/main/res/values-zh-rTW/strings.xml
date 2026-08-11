@@ -3,6 +3,11 @@
     <string name="service_title">5G Proxy Pro</string>
     <string name="service_not_started">服務未啟動</string>
     <string name="proxy_port_label">代理端口: </string>
+    <string name="auth_user_label">使用者: </string>
+    <string name="auth_user_hint">留空 = 不驗證此欄位</string>
+    <string name="auth_pass_label">密碼: </string>
+    <string name="auth_pass_hint">留空 = 不驗證此欄位</string>
+    <string name="auth_applied_live">認證已即時套用（新連線生效）</string>
     <string name="btn_start_proxy">🚀 一鍵開啟 5G 代理</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: 獲取中...</string>
     <string name="hotspot_ip_fetching">🛰️ 熱點分享 IP: 獲取中...</string>

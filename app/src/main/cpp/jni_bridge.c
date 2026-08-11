@@ -19,6 +19,7 @@ static jmethodID g_mid_notifyClosed = NULL;
 
 extern int socks5_server_main_dynamic(int port);
 extern void socks5_server_quit(void);
+extern void socks5_server_set_auth(const char *user, const char *pass);
 
 static pthread_t g_server_thread;
 static int g_server_running = 0;
@@ -115,6 +116,15 @@ JNIEXPORT jstring JNICALL native_stop_socks5_server(JNIEnv *env, jobject thiz) {
     return (*env)->NewStringUTF(env, "Stopped");
 }
 
+JNIEXPORT jstring JNICALL native_set_socks5_auth(JNIEnv *env, jobject thiz, jstring user, jstring pass) {
+    const char *cuser = user ? (*env)->GetStringUTFChars(env, user, NULL) : NULL;
+    const char *cpass = pass ? (*env)->GetStringUTFChars(env, pass, NULL) : NULL;
+    socks5_server_set_auth(cuser ? cuser : "", cpass ? cpass : "");
+    if (cuser) (*env)->ReleaseStringUTFChars(env, user, cuser);
+    if (cpass) (*env)->ReleaseStringUTFChars(env, pass, cpass);
+    return (*env)->NewStringUTF(env, "OK");
+}
+
 JNIEXPORT jstring JNICALL native_test_native_5g(JNIEnv *env, jobject thiz, jint fd) {
     return (*env)->NewStringUTF(env, "OK");
 }
@@ -123,6 +133,7 @@ static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
     {"startSocks5Server", "(I)Ljava/lang/String;", (void *)native_start_socks5_server},
     {"stopSocks5Server", "()Ljava/lang/String;", (void *)native_stop_socks5_server},
+    {"setSocks5Auth", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *)native_set_socks5_auth},
     {"testNative5G", "(I)Ljava/lang/String;", (void *)native_test_native_5g},
 };
 

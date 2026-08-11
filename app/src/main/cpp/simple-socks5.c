@@ -34,6 +34,10 @@ static atomic_int g_conn_count = 0;
 static atomic_int g_handshake_count = 0;
 static int g_shutdown_pipe[2] = {-1, -1};
 
+static char g_auth_user[256];
+static char g_auth_pass[256];
+static int g_auth_enabled = 0;
+
 typedef struct full_conn_t {
     int client_fd;
     int target_fd;
@@ -462,19 +466,79 @@ static void handle_udp_session_full(int client_fd) {
     atomic_fetch_sub(&g_conn_count, 1);
 }
 
+void socks5_server_set_auth(const char *user, const char *pass) {
+    // 只要帳號或密碼任一有設定，就啟用認證；全空才維持開放（無認證）
+    if (!user || !pass || (!user[0] && !pass[0])) {
+        g_auth_enabled = 0;
+        g_auth_user[0] = '\0';
+        g_auth_pass[0] = '\0';
+        return;
+    }
+    strncpy(g_auth_user, user, sizeof(g_auth_user) - 1);
+    strncpy(g_auth_pass, pass, sizeof(g_auth_pass) - 1);
+    g_auth_user[sizeof(g_auth_user) - 1] = '\0';
+    g_auth_pass[sizeof(g_auth_pass) - 1] = '\0';
+    g_auth_enabled = 1;
+}
+
+// RFC 1929 username/password 子協商。成功回傳 0，失敗回傳 -1（連線將被關閉）
+static int do_auth_check(int client_fd, unsigned char *buf) {
+    unsigned char ulen, plen;
+
+    if (recv(client_fd, buf, 2, MSG_WAITALL) != 2 || buf[0] != 0x01) return -1;
+    ulen = buf[1];
+    if (ulen == 0 || ulen > 255) return -1;
+    // 帳號使用獨立緩衝區，避免後續 PLEN/密碼讀取覆蓋帳號內容
+    if (recv(client_fd, buf + 2, ulen, MSG_WAITALL) != ulen) return -1;
+    if (recv(client_fd, buf, 1, MSG_WAITALL) != 1) return -1;
+    plen = buf[0];
+    if (plen > 255) return -1;
+    // 密碼也使用獨立緩衝區（允許 plen == 0：設定的密碼為空時，客戶端可不送密碼）
+    if (plen > 0 && recv(client_fd, buf + 258, plen, MSG_WAITALL) != plen) return -1;
+
+    const unsigned char *user = buf + 2;
+    const unsigned char *pass = buf + 258;
+
+    // 設定值為空時該欄位放行任何內容（例：只設帳號 → 密碼不拘）
+    int user_ok = (g_auth_user[0] == '\0') ||
+                  ((ulen == (unsigned char)strlen(g_auth_user)) &&
+                   memcmp(user, g_auth_user, ulen) == 0);
+    int pass_ok = (g_auth_pass[0] == '\0') ||
+                  ((plen == (unsigned char)strlen(g_auth_pass)) &&
+                   memcmp(pass, g_auth_pass, plen) == 0);
+    int ok = user_ok && pass_ok;
+
+    send(client_fd, ok ? "\x01\x00" : "\x01\x01", 2, MSG_NOSIGNAL);
+    return ok ? 0 : -1;
+}
+
 static void* handle_handshake(void* arg) {
     int client_fd = *(int*)arg; free(arg);
     unsigned char buf[1024]; 
     struct timeval tv = {5, 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
-    // ... SOCKS5 握手邏輯 (這部分你原本寫得沒問題) ...
-    // 為了簡潔，這裡省略握手細節，請保留你原本的握手代碼
-    
     if (recv(client_fd, buf, 2, MSG_WAITALL) != 2 || buf[0] != 0x05) goto err;
     int nmethods = buf[1];
+    if (nmethods < 1 || nmethods > 255) goto err;
     if (recv(client_fd, buf, nmethods, MSG_WAITALL) != nmethods) goto err;
-    send(client_fd, "\x05\x00", 2, MSG_NOSIGNAL);
+
+    // 認證方式選擇：開啟認證時只接受 0x02 (user/pass)，否則只接受 0x00 (no auth)
+    int desired_method = g_auth_enabled ? 0x02 : 0x00;
+    int method_offered = 0;
+    for (int i = 0; i < nmethods; i++) {
+        if (buf[i] == desired_method) { method_offered = 1; break; }
+    }
+    if (!method_offered) {
+        send(client_fd, "\x05\xff", 2, MSG_NOSIGNAL);
+        goto err;
+    }
+    if (g_auth_enabled) {
+        send(client_fd, "\x05\x02", 2, MSG_NOSIGNAL);
+        if (do_auth_check(client_fd, buf) != 0) goto err;
+    } else {
+        send(client_fd, "\x05\x00", 2, MSG_NOSIGNAL);
+    }
 
     if (recv(client_fd, buf, 4, MSG_WAITALL) != 4 || buf[0] != 0x05) goto err;
     int cmd = buf[1];

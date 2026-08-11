@@ -29,6 +29,8 @@ class DebugActivity : Activity() {
     private lateinit var hotspotIPText: TextView
     private lateinit var cellularIPText: TextView
     private lateinit var portInput: EditText
+    private lateinit var authUserInput: EditText
+    private lateinit var authPassInput: EditText
     private lateinit var mainButton: Button
     
     private var isRunning = false
@@ -169,6 +171,84 @@ class DebugActivity : Activity() {
             addView(label)
             addView(portInput)
         }
+
+        // Auth Config (可選帳密，留空 = 無認證)
+        val authPrefs = getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
+        val authLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, 16)
+            gravity = Gravity.CENTER_VERTICAL
+
+            val label = TextView(context).apply {
+                text = getString(R.string.auth_user_label)
+                textSize = 18f
+                setTextColor(0xFF212529.toInt())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            }
+            authUserInput = EditText(context).apply {
+                setText(authPrefs.getString("auth_user", "") ?: "")
+                hint = getString(R.string.auth_user_hint)
+                inputType = android.text.InputType.TYPE_CLASS_TEXT
+                gravity = Gravity.CENTER
+                setPadding(32, 24, 32, 24)
+                setTextColor(0xFF212529.toInt())
+                setHintTextColor(0xFFADB5BD.toInt())
+                background = GradientDrawable().apply {
+                    setColor(0xFFE9ECEF.toInt())
+                    cornerRadius = 8f
+                    setStroke(2, 0xFFCED4DA.toInt())
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f
+                )
+            }
+            addView(label)
+            addView(authUserInput)
+        }
+
+        val passLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, 48)
+            gravity = Gravity.CENTER_VERTICAL
+
+            val label = TextView(context).apply {
+                text = getString(R.string.auth_pass_label)
+                textSize = 18f
+                setTextColor(0xFF212529.toInt())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            }
+            authPassInput = EditText(context).apply {
+                setText(authPrefs.getString("auth_pass", "") ?: "")
+                hint = getString(R.string.auth_pass_hint)
+                inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                gravity = Gravity.CENTER
+                setPadding(32, 24, 32, 24)
+                setTextColor(0xFF212529.toInt())
+                setHintTextColor(0xFFADB5BD.toInt())
+                background = GradientDrawable().apply {
+                    setColor(0xFFE9ECEF.toInt())
+                    cornerRadius = 8f
+                    setStroke(2, 0xFFCED4DA.toInt())
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f
+                )
+            }
+            addView(label)
+            addView(authPassInput)
+        }
+
+        // [新增] 帳號/密碼修改即時套用：代理運行中直接更新 C 引擎認證，
+        // 新連線立即生效，無需重啟代理（已連線的舊連線不受影響）
+        val authWatcher = object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                applyAuthChange()
+            }
+        }
+        authUserInput.addTextChangedListener(authWatcher)
+        authPassInput.addTextChangedListener(authWatcher)
         
         // Main Action Button
         mainButton = Button(this).apply {
@@ -235,6 +315,8 @@ class DebugActivity : Activity() {
         rootLayout.addView(titleText)
         rootLayout.addView(statusCard)
         rootLayout.addView(portLayout)
+        rootLayout.addView(authLayout)
+        rootLayout.addView(passLayout)
         rootLayout.addView(mainButton)
         rootLayout.addView(ipCard)
         rootLayout.addView(refreshButton)
@@ -273,6 +355,20 @@ class DebugActivity : Activity() {
         }
     }
     
+    private fun applyAuthChange() {
+        val user = authUserInput.text.toString().trim()
+        val pass = authPassInput.text.toString()
+        getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
+            .edit()
+            .putString("auth_user", user)
+            .putString("auth_pass", pass)
+            .apply()
+        if (Socks5ProxyService.isServiceRunning) {
+            NativeEngine.setSocks5Auth(user, pass)
+            Toast.makeText(this, getString(R.string.auth_applied_live), Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun startProxyFlow() {
         // 檢查是否已在白名單
         if (!PowerPermissionHelper.isWhitelisted(this)) {
@@ -281,6 +377,14 @@ class DebugActivity : Activity() {
         }
 
         val port = portInput.text.toString().toIntOrNull() ?: 1080
+
+        // 儲存帳密設定（兩個都留空 = 無認證）
+        getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
+            .edit()
+            .putString("auth_user", authUserInput.text.toString().trim())
+            .putString("auth_pass", authPassInput.text.toString())
+            .apply()
+
         isRunning = true
         mainButton.text = getString(R.string.btn_stop_proxy)
         mainButton.background = createButtonDrawable(0xFFDC3545.toInt())
