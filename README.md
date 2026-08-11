@@ -117,7 +117,7 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 AndroidProxy/
 ├── app/src/main/
-│   ├── java/com/example/androidproxy/
+│   ├── java/com/tokyoxpa3/androidproxy/
 │   │   ├── DebugActivity.kt          # 主介面 + 測速 + 熱點 IP 顯示
 │   │   ├── Socks5ProxyService.kt    # 前台服務：鎖定 5G、啟動 C 引擎
 │   │   ├── NativeEngine.kt          # JNI 橋接（socketProvider 回呼）
