@@ -27,6 +27,7 @@ class DebugActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var wifiIPText: TextView
     private lateinit var hotspotIPText: TextView
+    private lateinit var usbTetherIPText: TextView
     private lateinit var cellularIPText: TextView
     private lateinit var portInput: EditText
     private lateinit var authUserInput: EditText
@@ -279,6 +280,12 @@ class DebugActivity : Activity() {
                 setPadding(0, 8, 0, 8)
                 setTextColor(0xFF495057.toInt())
             }
+            usbTetherIPText = TextView(context).apply {
+                text = getString(R.string.usb_tether_ip_fetching)
+                textSize = 16f
+                setPadding(0, 8, 0, 8)
+                setTextColor(0xFF495057.toInt())
+            }
             cellularIPText = TextView(context).apply {
                 text = getString(R.string.cellular_ip_fetching)
                 textSize = 16f
@@ -287,6 +294,7 @@ class DebugActivity : Activity() {
             }
             addView(wifiIPText)
             addView(hotspotIPText)
+            addView(usbTetherIPText)
             addView(cellularIPText)
         }
         
@@ -444,6 +452,16 @@ class DebugActivity : Activity() {
                 hotspotIPText.text = getString(R.string.hotspot_ip_format, hotspotIP, port)
             } else {
                 hotspotIPText.text = getString(R.string.hotspot_ip_disabled)
+            }
+
+            val usbTetherIP = withContext(Dispatchers.IO) {
+                HotspotManager.getUsbTetherIP(applicationContext)
+            }
+            if (usbTetherIP != null) {
+                val port = portInput.text.toString().toIntOrNull() ?: 1080
+                usbTetherIPText.text = getString(R.string.usb_tether_ip_format, usbTetherIP, port)
+            } else {
+                usbTetherIPText.text = getString(R.string.usb_tether_ip_disabled)
             }
 
             cellularIPText.text = getString(R.string.cellular_ip_fetching)

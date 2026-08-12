@@ -33,6 +33,9 @@
     <string name="cellular_ip_not_locked">📲 5G 行動 IP: 尚未鎖定</string>
     <string name="hotspot_ip_format">🛰️ 熱點分享代理: %1$s:%2$d</string>
     <string name="hotspot_ip_disabled">🛰️ 熱點分享: 未開啟</string>
+    <string name="usb_tether_ip_fetching">🔌 USB 分享 IP: 獲取中...</string>
+    <string name="usb_tether_ip_format">🔌 USB 分享代理: %1$s:%2$d</string>
+    <string name="usb_tether_ip_disabled">🔌 USB 分享: 未開啟</string>
     <string name="btn_refresh_status">🔄 刷新狀態</string>
     <string name="status_refreshing">🔄 正在刷新...</string>
     <string name="speed_test_running">🏁 正在進行 5G 原生測速...</string>

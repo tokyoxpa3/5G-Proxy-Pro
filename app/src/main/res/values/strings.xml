@@ -33,6 +33,9 @@
     <string name="cellular_ip_not_locked">📲 5G IP: Not Locked</string>
     <string name="hotspot_ip_format">🛰️ Hotspot Proxy: %1$s:%2$d</string>
     <string name="hotspot_ip_disabled">🛰️ Hotspot: Not Enabled</string>
+    <string name="usb_tether_ip_fetching">🔌 USB Tether IP: Fetching...</string>
+    <string name="usb_tether_ip_format">🔌 USB Tether Proxy: %1$s:%2$d</string>
+    <string name="usb_tether_ip_disabled">🔌 USB Tether: Not Enabled</string>
     <string name="btn_refresh_status">🔄 Refresh Status</string>
     <string name="status_refreshing">🔄 Refreshing...</string>
     <string name="speed_test_running">🏁 Running 5G Speed Test...</string>

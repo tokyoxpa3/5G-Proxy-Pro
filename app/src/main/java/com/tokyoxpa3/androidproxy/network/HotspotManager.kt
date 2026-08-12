@@ -21,19 +21,20 @@ object HotspotManager {
         "172.20.10."
     )
 
+    private val usbTetherSubnets = listOf(
+        "192.168.42."
+    )
+
     fun getHotspotIP(context: Context): String? {
+        return getWiFiHotspotIP(context)
+    }
+
+    fun getWiFiHotspotIP(context: Context): String? {
         try {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            if (cm != null) {
-                val method = ConnectivityManager::class.java.getMethod("getTetheredIfaces")
-                @Suppress("UNCHECKED_CAST")
-                val tetheredIfaces = method.invoke(cm) as? Array<String>
-                if (tetheredIfaces != null) {
-                    for (ifaceName in tetheredIfaces) {
-                        val ip = getInterfaceIPv4(ifaceName)
-                        if (ip != null) return ip
-                    }
-                }
+            for (ifaceName in getTetheredIfaces(context)) {
+                if (isUsbTetherIface(ifaceName)) continue
+                val ip = getInterfaceIPv4(ifaceName)
+                if (ip != null) return ip
             }
         } catch (e: Exception) {
             android.util.Log.w(TAG, "Reflection getTetheredIfaces failed, fallback to enumeration", e)
@@ -62,6 +63,69 @@ object HotspotManager {
             android.util.Log.e(TAG, "Failed to enumerate network interfaces", e)
             null
         }
+    }
+
+    fun getUsbTetherIP(context: Context): String? {
+        try {
+            for (ifaceName in getTetheredIfaces(context)) {
+                if (!isUsbTetherIface(ifaceName)) continue
+                val ip = getInterfaceIPv4(ifaceName)
+                if (ip != null) return ip
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "Reflection getTetheredIfaces failed, fallback to enumeration", e)
+        }
+
+        // 掃描介面名稱（rndis0/usb0/f_rndis/ncm 等）
+        val currentWifiIP = getCurrentWifiIP(context)
+        return try {
+            val interfaces = JavaNetworkInterface.getNetworkInterfaces() ?: return null
+            for (iface in interfaces) {
+                if (!iface.isUp || iface.isLoopback) continue
+                if (isCellularInterface(iface.name)) continue
+                val ip = getInterfaceIPv4(iface.name) ?: continue
+                if (ip == currentWifiIP) continue
+                if (isUsbTetherIface(iface.name)) return ip
+            }
+            // 最後一搏：USB 分享常用網段
+            for (iface in interfaces) {
+                if (!iface.isUp || iface.isLoopback) continue
+                if (isCellularInterface(iface.name)) continue
+                val addresses = iface.inetAddresses ?: continue
+                for (addr in addresses) {
+                    if (addr is Inet4Address) {
+                        val ip = addr.hostAddress ?: continue
+                        if (ip == currentWifiIP) continue
+                        if (usbTetherSubnets.any { ip.startsWith(it) }) {
+                            return ip
+                        }
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Failed to enumerate network interfaces", e)
+            null
+        }
+    }
+
+    private fun getTetheredIfaces(context: Context): List<String> {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return emptyList()
+            val method = ConnectivityManager::class.java.getMethod("getTetheredIfaces")
+            @Suppress("UNCHECKED_CAST")
+            (method.invoke(cm) as? Array<String>)?.toList() ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun isUsbTetherIface(name: String): Boolean {
+        val lower = name.lowercase()
+        return lower.contains("rndis") ||
+            lower.contains("usb") ||
+            lower.contains("ncm")
     }
 
     private fun getInterfaceIPv4(ifaceName: String): String? {
@@ -110,7 +174,6 @@ object HotspotManager {
             lower.contains("ccmni") ||
             lower.contains("ppp") ||
             lower.contains("wwan") ||
-            lower.contains("radio") ||
-            lower.contains("rndis")
+            lower.contains("radio")
     }
 }
