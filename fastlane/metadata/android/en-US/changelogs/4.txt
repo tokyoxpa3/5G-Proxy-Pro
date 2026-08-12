@@ -1,0 +1,1 @@
+﻿- UDP relay fixes: fixed reply target (source validation), FRAG!=0 dropped with log, IPv6 UDP destination support (dual-stack socket), extended idle timeout to 300s
