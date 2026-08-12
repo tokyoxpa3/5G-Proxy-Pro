@@ -28,7 +28,7 @@ extern void release_java_socket(int fd);
 #define WORKER_COUNT 4
 #define MAX_CONCURRENT_CONNS 1000 
 #define MAX_HANDSHAKE_THREADS 128
-#define IDLE_TIMEOUT_SEC 60 
+#define IDLE_TIMEOUT_SEC 300 
 
 static atomic_int g_conn_count = 0;
 static atomic_int g_handshake_count = 0;
@@ -360,6 +360,23 @@ static void handle_udp_session_full(int client_fd) {
         return; 
     }
 
+    // 記錄控制連線的對端位址：UDP relay 只接受來自此用戶端的封包，
+    // 且回覆一律送回此位址，避免被其他裝置竄改轉送目標
+    struct sockaddr_storage peer_ss;
+    socklen_t peer_ss_len = sizeof(peer_ss);
+    struct sockaddr_in peer4 = {0};
+    if (getpeername(client_fd, (struct sockaddr*)&peer_ss, &peer_ss_len) == 0) {
+        if (peer_ss.ss_family == AF_INET) {
+            memcpy(&peer4, &peer_ss, sizeof(peer4));
+        } else if (peer_ss.ss_family == AF_INET6) {
+            struct sockaddr_in6 *p6 = (struct sockaddr_in6 *)&peer_ss;
+            if (IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr)) {
+                peer4.sin_family = AF_INET;
+                memcpy(&peer4.sin_addr, &p6->sin6_addr.s6_addr[12], 4);
+            }
+        }
+    }
+
     unsigned char *udp_buf = malloc(BUFFER_SIZE + 64);
     struct sockaddr_in client_src_addr = {0}; 
     socklen_t client_src_len = 0;
@@ -391,34 +408,45 @@ static void handle_udp_session_full(int client_fd) {
         if (FD_ISSET(local_udp_fd, &readfds)) {
             struct sockaddr_in tmp; socklen_t tlen = sizeof(tmp);
             ssize_t r = recvfrom(local_udp_fd, udp_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
-            if (r > 3) { // SOCKS5 UDP Header 至少 4 bytes (RSV+FRAG+ATYP+...)
-                client_src_addr = tmp; 
-                client_src_len = tlen;
-                
-                int hlen = 0; 
-                void* dst = NULL; 
-                socklen_t dlen = 0;
-                struct sockaddr_in d4; 
-                struct sockaddr_in6 d6;
-                
-                // 解析 SOCKS5 UDP Header
-                if (udp_buf[3] == 0x01) { // IPv4
-                    hlen = 10; 
-                    d4.sin_family=AF_INET; 
-                    memcpy(&d4.sin_addr,&udp_buf[4],4); 
-                    memcpy(&d4.sin_port,&udp_buf[8],2); 
-                    dst=&d4; dlen=sizeof(d4);
-                } else if (udp_buf[3] == 0x04) { // IPv6
-                    hlen = 22; 
-                    d6.sin6_family=AF_INET6; 
-                    memcpy(&d6.sin6_addr,&udp_buf[4],16); 
-                    memcpy(&d6.sin6_port,&udp_buf[20],2); 
-                    dst=&d6; dlen=sizeof(d6);
+            if (r > 3 && udp_buf[2] == 0) { // SOCKS5 UDP Header 至少 4 bytes (RSV+FRAG+ATYP)，FRAG 須為 0
+                // 來源驗證：只接受控制連線同來源 IP 的封包 (允許多個 UDP 來源 port)
+                if (peer4.sin_family != AF_INET || tmp.sin_addr.s_addr != peer4.sin_addr.s_addr) {
+                    LOGE("UDP relay: 拒絕未授權來源封包 %s:%u", inet_ntoa(tmp.sin_addr), ntohs(tmp.sin_port));
+                } else {
+                    client_src_addr = tmp; 
+                    client_src_len = tlen;
+                    
+                    int hlen = 0; 
+                    void* dst = NULL; 
+                    socklen_t dlen = 0;
+                    struct sockaddr_in d4; 
+                    struct sockaddr_in6 d6;
+                    
+                    // 解析 SOCKS5 UDP Header
+                    if (udp_buf[3] == 0x01) { // IPv4
+                        hlen = 10; 
+                        d4.sin_family=AF_INET; 
+                        memcpy(&d4.sin_addr,&udp_buf[4],4); 
+                        memcpy(&d4.sin_port,&udp_buf[8],2); 
+                        dst=&d4; dlen=sizeof(d4);
+                    } else if (udp_buf[3] == 0x04) { // IPv6
+                        hlen = 22; 
+                        d6.sin6_family=AF_INET6; 
+                        memcpy(&d6.sin6_addr,&udp_buf[4],16); 
+                        memcpy(&d6.sin6_port,&udp_buf[20],2); 
+                        dst=&d6; dlen=sizeof(d6);
+                    }
+                    
+                    if (dst && r > hlen) {
+                        if (sendto(remote_udp_fd, udp_buf+hlen, r-hlen, 0, (struct sockaddr*)dst, dlen) < 0) {
+                            LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
+                        }
+                    } else {
+                        LOGE("UDP relay: 無法解析 SOCKS5 UDP Header (atyp=%u, len=%zd)", udp_buf[3], r);
+                    }
                 }
-                
-                if (dst && r > hlen) {
-                    sendto(remote_udp_fd, udp_buf+hlen, r-hlen, 0, (struct sockaddr*)dst, dlen);
-                }
+            } else if (r > 3) {
+                LOGE("UDP relay: 收到 FRAG!=0 的 UDP 封包，已丟棄");
             }
         }
         

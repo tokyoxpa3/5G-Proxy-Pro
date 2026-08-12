@@ -183,7 +183,16 @@ class Socks5ProxyService : Service() {
         val network = cellularNetwork ?: return -1
         return try {
             if (isUdp) {
-                val ds = java.net.DatagramSocket()
+                // 雙棧 UDP socket：IPv4-only 的 DatagramSocket 無法對 IPv6 目標 sendto
+                // (EAFNOSUPPORT)，會讓「走代理的 IPv6 UDP/DNS」整段靜默失敗。
+                // 綁定 IPv6 ANY (::) 在 Android/Linux 預設即為雙棧 (bindv6only=0)
+                val ds = try {
+                    java.net.DatagramSocket(
+                        java.net.InetSocketAddress(java.net.InetAddress.getByName("::"), 0)
+                    )
+                } catch (e: Exception) {
+                    java.net.DatagramSocket()
+                }
                 network.bindSocket(ds)
                 val pfd = android.os.ParcelFileDescriptor.fromDatagramSocket(ds)
                 val fd = pfd.detachFd()
