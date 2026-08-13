@@ -44,6 +44,8 @@
     <string name="notification_proxying">🚀 5G SOCKS5 代理中</string>
     <string name="notification_init_network">正在初始化 5G 網路...</string>
     <string name="notification_locked_format">已鎖定 5G - 監聽 Port %1$d</string>
+    <string name="notification_restarting">🔄 偵測到 5G IP 切換，正在自動重建代理...</string>
+    <string name="notification_waiting_network">📡 5G 網路已中斷，等待恢復後自動重連...</string>
     <string name="notification_channel_name">5G SOCKS5 Proxy Pro</string>
     
     <string name="dialog_whitelist_completed_title">✅ 白名單設定已完成</string>

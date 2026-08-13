@@ -44,6 +44,8 @@
     <string name="notification_proxying">🚀 5G SOCKS5 Proxying</string>
     <string name="notification_init_network">Initializing 5G Network...</string>
     <string name="notification_locked_format">Locked 5G - Listening Port %1$d</string>
+    <string name="notification_restarting">🔄 5G IP Changed - Auto Restarting Proxy</string>
+    <string name="notification_waiting_network">📡 5G Network Lost - Waiting to Reconnect</string>
     <string name="notification_channel_name">5G SOCKS5 Proxy Pro</string>
     
     <string name="dialog_whitelist_completed_title">✅ Whitelist Configured</string>

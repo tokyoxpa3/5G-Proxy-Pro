@@ -1,0 +1,3 @@
+- Auto-rebuild proxy connection when carrier switches 5G IP
+- Monitor cellular network changes (onLost / new Network) with auto-recovery
+- Network health check with automatic restart (no more manual stop/start)
