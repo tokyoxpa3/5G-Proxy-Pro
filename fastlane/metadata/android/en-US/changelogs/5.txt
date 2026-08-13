@@ -1,0 +1,3 @@
+- USB tethering IP detection (rndis/usb/ncm)
+- Fix rndis misclassified as cellular interface
+- Show USB tethering proxy IP on main screen

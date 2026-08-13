@@ -1,0 +1,3 @@
+- 新增 USB 分享 IP 偵測（rndis/usb/ncm）
+- 修正 rndis 被誤判為蜂巢介面
+- 主介面顯示 USB 分享代理 IP
