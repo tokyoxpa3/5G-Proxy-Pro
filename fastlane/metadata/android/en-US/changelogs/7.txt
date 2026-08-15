@@ -1,0 +1,2 @@
+- Fix native crash when opening many concurrent connections (fd > 1024): UDP relay now uses poll() instead of select()
+- More stable under heavy TCP/UDP traffic

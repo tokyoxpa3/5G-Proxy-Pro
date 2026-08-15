@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -381,31 +382,31 @@ static void handle_udp_session_full(int client_fd) {
     struct sockaddr_in client_src_addr = {0}; 
     socklen_t client_src_len = 0;
     
-    fd_set readfds;
-    int max_fd = (local_udp_fd > remote_udp_fd ? local_udp_fd : remote_udp_fd);
-    if (client_fd > max_fd) max_fd = client_fd;
-    if (g_shutdown_pipe[0] > max_fd) max_fd = g_shutdown_pipe[0];
+    // [關鍵修正] 使用 poll() 取代 select()/FD_SET：
+    // select() 的 FD_SET 受 FD_SETSIZE(1024) 硬限制，當進程開啟的 fd 超過 1024
+    // (例如大量 TCP 連線各佔 2 個 fd) 時，FD_SET 會觸發 bionic FORTIFY 檢查並
+    // SIGABRT：'FORTIFY: FD_SET: file descriptor NNNN >= FD_SETSIZE 1024'。
+    // poll() 以 pollfd 陣列管理，無此上限。
+    struct pollfd fds[4];
 
     while (server_running) {
-        FD_ZERO(&readfds);
-        FD_SET(local_udp_fd, &readfds); 
-        FD_SET(remote_udp_fd, &readfds); 
-        FD_SET(client_fd, &readfds); 
-        FD_SET(g_shutdown_pipe[0], &readfds);
+        fds[0].fd = g_shutdown_pipe[0]; fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[1].fd = client_fd;          fds[1].events = POLLIN; fds[1].revents = 0;
+        fds[2].fd = local_udp_fd;       fds[2].events = POLLIN; fds[2].revents = 0;
+        fds[3].fd = remote_udp_fd;      fds[3].events = POLLIN; fds[3].revents = 0;
 
-        struct timeval timeout = {IDLE_TIMEOUT_SEC, 0}; 
-        int res = select(max_fd + 1, &readfds, NULL, NULL, &timeout);
+        int res = poll(fds, 4, IDLE_TIMEOUT_SEC * 1000);
         if (res <= 0) break; // 超時或錯誤
 
-        if (FD_ISSET(g_shutdown_pipe[0], &readfds)) break;
+        if (fds[0].revents) break; // shutdown pipe
         
         // 監測 TCP 控制通道是否斷開
-        if (FD_ISSET(client_fd, &readfds)) {
+        if (fds[1].revents) {
             if (recv(client_fd, udp_buf, 1, MSG_PEEK) <= 0) break;
         }
 
         // 收到 Client 的 UDP 封包 -> 轉發給 5G
-        if (FD_ISSET(local_udp_fd, &readfds)) {
+        if (fds[2].revents) {
             struct sockaddr_in tmp; socklen_t tlen = sizeof(tmp);
             ssize_t r = recvfrom(local_udp_fd, udp_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
             if (r > 3 && udp_buf[2] == 0) { // SOCKS5 UDP Header 至少 4 bytes (RSV+FRAG+ATYP)，FRAG 須為 0
@@ -451,7 +452,7 @@ static void handle_udp_session_full(int client_fd) {
         }
         
         // 收到 5G 的 UDP 封包 -> 封裝 Header 轉回給 Client
-        if (FD_ISSET(remote_udp_fd, &readfds) && client_src_len > 0) {
+        if (fds[3].revents && client_src_len > 0) {
             struct sockaddr_in6 src6; socklen_t sl = sizeof(src6);
             int off = 22; // 預留足夠空間給 IPv6 Header
 

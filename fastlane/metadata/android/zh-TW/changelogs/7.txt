@@ -1,0 +1,2 @@
+- 修正大量並發連線時 (fd > 1024) 的原生崩潰：UDP relay 改用 poll() 取代 select()
+- 高 TCP/UDP 流量下更穩定
