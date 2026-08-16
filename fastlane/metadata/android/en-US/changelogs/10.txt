@@ -1,0 +1,3 @@
+- Fix: connection GC overflow no longer leaks file descriptors (connections are now always destroyed, even when more than 128 expire in one sweep)
+- Fix: worker shutdown now also destroys pending garbage; no fd leak on service stop
+- Performance: epoll event capacity raised to 512 to handle burst traffic from 5G clients

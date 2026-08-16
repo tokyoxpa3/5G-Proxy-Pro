@@ -26,7 +26,7 @@ extern void release_java_socket(int fd);
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 #define BUFFER_SIZE (256 * 1024)
-#define MAX_EVENTS 128
+#define MAX_EVENTS 512
 #define WORKER_COUNT 4
 #define MAX_CONCURRENT_CONNS 1000 
 #define MAX_HANDSHAKE_THREADS 128
@@ -234,11 +234,14 @@ static void* worker_loop_safe(void* arg) {
 
             if (fatal_error) {
                 // [關鍵] 標記刪除，稍後統一處理
+                // 注意：同一連線的兩個 fd 可能在同一批事件中同時觸發，
+                // 因此不能在事件迴圈內立即 destroy（第二個事件會讀到已釋放記憶體）。
+                // 事件迴圈最多加入 nfds(<=MAX_EVENTS) 個垃圾，不可能溢出。
                 pthread_mutex_lock(&me->list_lock);
                 if (!full->closed) {
                     full->closed = 1;
                     list_remove_locked(me, full);
-                    if (garbage_count < MAX_EVENTS) garbage_list[garbage_count++] = full;
+                    garbage_list[garbage_count++] = full;
                 }
                 pthread_mutex_unlock(&me->list_lock);
             } else {
@@ -247,6 +250,8 @@ static void* worker_loop_safe(void* arg) {
         }
 
         // 2. 檢查超時 (每 5 秒一次)
+        //    鏈表最多可有 MAX_CONCURRENT_CONNS(1000) 條連線，超過 MAX_EVENTS 的
+        //    超時連線若直接丟棄會造成 fd 永久洩漏；桶滿時先鎖外銷毀再繼續收集。
         if (now - last_check_time >= 5) {
             pthread_mutex_lock(&me->list_lock); // [關鍵] 鎖住鏈表進行遍歷
             full_conn_t *curr = me->conn_list_head;
@@ -258,9 +263,12 @@ static void* worker_loop_safe(void* arg) {
                     list_remove_locked(me, curr);
                     if (garbage_count < MAX_EVENTS) garbage_list[garbage_count++] = curr;
                     else {
-                        // 如果垃圾桶滿了，不得不這裡處理 (極端情況)
-                        // 為避免持有鎖做 JNI，這裡選擇放棄這次回收，等待下輪，或者直接 break
-                        // 實務上單次循環很難超過 128 個超時
+                        // 桶滿：先鎖外銷毀已收集的垃圾騰出空間，再收下這條連線
+                        pthread_mutex_unlock(&me->list_lock);
+                        for (int g = 0; g < garbage_count; g++) destroy_connection(garbage_list[g]);
+                        garbage_count = 0;
+                        pthread_mutex_lock(&me->list_lock);
+                        garbage_list[garbage_count++] = curr;
                     }
                 }
                 curr = next;
@@ -286,7 +294,10 @@ exit_worker:
     }
     me->conn_list_head = NULL;
     pthread_mutex_unlock(&me->list_lock);
-    
+
+    // 銷毀事件迴圈中途退出時尚未處理的垃圾
+    for (int g = 0; g < garbage_count; g++) destroy_connection(garbage_list[g]);
+
     close(me->epoll_fd);
     jni_detach_thread();
     return NULL;
