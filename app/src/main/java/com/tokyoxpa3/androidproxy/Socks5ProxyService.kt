@@ -42,7 +42,7 @@ class Socks5ProxyService : Service() {
     private val dnsExecutor = java.util.concurrent.ThreadPoolExecutor(
             4, 4,
             0L, java.util.concurrent.TimeUnit.MILLISECONDS,
-            java.util.concurrent.ArrayBlockingQueue(64),
+            java.util.concurrent.ArrayBlockingQueue(32),
             { r -> Thread(r, "socks5-dns").apply { isDaemon = true } },
             java.util.concurrent.ThreadPoolExecutor.DiscardPolicy()
         )
@@ -53,11 +53,12 @@ class Socks5ProxyService : Service() {
         val hit = dnsCache[key]
         if (hit != null && hit.expiresAt > now) return hit.addresses
         if (dnsCache.size >= 256) dnsCache.clear()
-        // 5G 網路劣化時 DNS 可能長時間無回應；加上 2 秒 timeout，
-        // 避免 handshake 線程被 DNS 卡死（128 線程全滿時新連線會被直接拒絕）。
-        // 注意：不能加 @Synchronized —— 否則 128 個 handshake 線程會在鎖上串行排隊，
-        // 每次 DNS 超時 2 秒 × 128 = 最後一個線程要等 ~4 分鐘，等於拒絕服務。
+        // 5G 網路劣化時 DNS 可能長時間無回應；加上 1 秒 timeout，
+        // 避免 handshake 線程被 DNS 卡死（線程池全滿時新連線會被直接拒絕）。
+        // 注意：不能加 @Synchronized —— 否則所有 handshake 線程會在鎖上串行排隊，
+        // 每次 DNS 超時 1 秒 × N = 最後一個線程要等 N 秒，等於拒絕服務。
         // dnsCache 是 ConcurrentHashMap 已線程安全，重複解析同一個 host 無害。
+        // 失敗（超時/無結果）也負快取 3 秒，避免測速風暴下同一 host 反覆卡住握手線程。
         val addresses = try {
             val future = dnsExecutor.submit<List<java.net.InetAddress>> {
                 network.getAllByName(host)
@@ -65,7 +66,7 @@ class Socks5ProxyService : Service() {
                     .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
             }
             try {
-                future.get(2, java.util.concurrent.TimeUnit.SECONDS)
+                future.get(1, java.util.concurrent.TimeUnit.SECONDS)
             } finally {
                 future.cancel(true)
             }
@@ -73,7 +74,11 @@ class Socks5ProxyService : Service() {
             if (hit != null) return hit.addresses
             emptyList()
         }
-        if (addresses.isNotEmpty()) dnsCache[key] = DnsEntry(addresses, now + 5 * 60 * 1000L)
+        if (addresses.isNotEmpty()) {
+            dnsCache[key] = DnsEntry(addresses, now + 5 * 60 * 1000L)
+        } else {
+            dnsCache[key] = DnsEntry(emptyList(), now + 3 * 1000L)
+        }
         return addresses
     }
     

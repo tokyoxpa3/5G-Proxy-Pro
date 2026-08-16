@@ -29,7 +29,7 @@ extern void release_java_socket(int fd);
 #define MAX_EVENTS 512
 #define WORKER_COUNT 4
 #define MAX_CONCURRENT_CONNS 1000 
-#define MAX_HANDSHAKE_THREADS 128
+#define MAX_HANDSHAKE_THREADS 256
 #define IDLE_TIMEOUT_SEC 300 
 
 static atomic_int g_conn_count = 0;

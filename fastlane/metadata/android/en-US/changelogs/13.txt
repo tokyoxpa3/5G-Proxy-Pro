@@ -1,0 +1,3 @@
+- Fix: failed DNS lookups are now negatively cached for 3 seconds, so a degraded 5G network no longer makes every new connection wait out the full DNS timeout (handshake threads are released almost immediately instead of blocking in bulk)
+- Fix: DNS timeout shortened to 1 second for faster failover
+- Reliability: handshake thread pool raised to 256 so burst traffic (speed tests) can no longer exhaust it
