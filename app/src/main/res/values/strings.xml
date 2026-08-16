@@ -74,4 +74,9 @@ Also set this App\'s battery saver to \"No restrictions\".</string>
     
     <string name="dialog_default_title">⚠️ Stable Connection</string>
     <string name="dialog_default_msg">Please check battery settings to prevent system from killing this App.</string>
+
+    <string name="debug_crash_log_title">Java Crash Log</string>
+    <string name="btn_copy_and_close">Copy &amp; Close</string>
+    <string name="toast_copied">Log copied to clipboard</string>
+    <string name="crash_detail_format">Time: %1$s\nThread: %2$s\nType: %3$s\nMessage: %4$s\nStack:\n%5$s</string>
 </resources>

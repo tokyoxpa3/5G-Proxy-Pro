@@ -65,9 +65,9 @@ class DebugActivity : Activity() {
 
         if (detailedLog != null) {
             android.app.AlertDialog.Builder(this)
-                .setTitle("Java 崩潰詳細日誌")
+                .setTitle(getString(R.string.debug_crash_log_title))
                 .setMessage(detailedLog)
-                .setPositiveButton("複製並關閉") { _, _ ->
+                .setPositiveButton(getString(R.string.btn_copy_and_close)) { _, _ ->
                     // 複製到剪貼簿方便你傳給我
                     val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val clip = ClipData.newPlainText("Crash Log", detailedLog)
@@ -75,7 +75,7 @@ class DebugActivity : Activity() {
                     
                     // 清除紀錄避免重複顯示
                     sp.edit().remove("last_java_crash").apply()
-                    Toast.makeText(this, "日誌已複製到剪貼簿", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, getString(R.string.toast_copied), Toast.LENGTH_SHORT).show()
                 }
                 .show()
         }

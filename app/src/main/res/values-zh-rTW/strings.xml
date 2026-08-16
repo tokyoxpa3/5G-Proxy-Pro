@@ -70,4 +70,9 @@
     
     <string name="dialog_default_title">⚠️ 保持連線穩定</string>
     <string name="dialog_default_msg">請檢查電池設定，確保系統不會在背景殺掉此 App，以維持 5G 鎖定功能。</string>
+
+    <string name="debug_crash_log_title">Java 崩潰詳細日誌</string>
+    <string name="btn_copy_and_close">複製並關閉</string>
+    <string name="toast_copied">日誌已複製到剪貼簿</string>
+    <string name="crash_detail_format">時間: %1$s\n線程: %2$s\n類型: %3$s\n訊息: %4$s\n堆疊:\n%5$s</string>
 </resources>

@@ -495,6 +495,137 @@ static void handle_udp_session_full(int client_fd) {
     atomic_fetch_sub(&g_conn_count, 1);
 }
 
+// UDP-in-TCP（自訂擴充 SOCKS5 指令 0x04）：
+// 握手成功後，同一條 TCP 連線以 frame 承載 UDP datagram。
+// frame = [2-byte 長度, network order] + [SOCKS5 UDP datagram]
+//        datagram = RSV(2)=0 + FRAG(1)=0 + ATYP(0x01|0x04) + ADDR + PORT(2) + DATA
+static void handle_udp_tcp_session(int client_fd) {
+    atomic_fetch_add(&g_conn_count, 1);
+
+    // 先建立 5G UDP socket，成功才回覆成功；失敗回 REP=0x04 讓 client 退回標準協定
+    int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
+    unsigned char resp[10] = {0x05, 0x00, 0, 0x01, 0,0,0,0, 0,0};
+    if (remote_udp_fd < 0) {
+        resp[1] = 0x04; // host unreachable（此擴充指令失敗）
+        send(client_fd, resp, 10, MSG_NOSIGNAL);
+        close(client_fd);
+        atomic_fetch_sub(&g_conn_count, 1);
+        return;
+    }
+    send(client_fd, resp, 10, MSG_NOSIGNAL);
+
+    // 取消 handshake 階段的 5 秒讀超時；blocking socket 由 poll 決定何時讀寫
+    struct timeval tv = {IDLE_TIMEOUT_SEC, 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
+
+    unsigned char *datagram = malloc(BUFFER_SIZE + 64);
+    if (!datagram) {
+        release_java_socket(remote_udp_fd);
+        close(remote_udp_fd);
+        close(client_fd);
+        atomic_fetch_sub(&g_conn_count, 1);
+        return;
+    }
+
+    struct sockaddr_in6 src6; socklen_t sl = sizeof(src6);
+
+    while (server_running) {
+        struct pollfd fds[3];
+        fds[0].fd = g_shutdown_pipe[0]; fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[1].fd = client_fd;          fds[1].events = POLLIN; fds[1].revents = 0;
+        fds[2].fd = remote_udp_fd;      fds[2].events = POLLIN; fds[2].revents = 0;
+
+        int res = poll(fds, 3, IDLE_TIMEOUT_SEC * 1000);
+        if (res <= 0) break; // 超時或錯誤
+        if (fds[0].revents) break; // shutdown pipe
+
+        // client → 讀 frame → 5G UDP
+        if (fds[1].revents) {
+            unsigned char h[2];
+            if (recv(client_fd, h, 2, MSG_WAITALL) != 2) break;
+            int dlen = (h[0] << 8) | h[1];
+            if (dlen < 4 || dlen > BUFFER_SIZE) break; // 協定違規
+            if (recv(client_fd, datagram, dlen, MSG_WAITALL) != dlen) break;
+
+            // 解析 SOCKS5 UDP datagram（RSV=0, FRAG=0）
+            if (datagram[0] == 0 && datagram[1] == 0 && datagram[2] == 0) {
+                int hlen = 0;
+                void *dst = NULL;
+                socklen_t dlen2 = 0;
+                struct sockaddr_in d4;
+                struct sockaddr_in6 d6;
+                if (datagram[3] == 0x01 && dlen >= 10) { // IPv4
+                    hlen = 10;
+                    d4.sin_family = AF_INET;
+                    memcpy(&d4.sin_addr, datagram + 4, 4);
+                    memcpy(&d4.sin_port, datagram + 8, 2);
+                    dst = &d4; dlen2 = sizeof(d4);
+                } else if (datagram[3] == 0x04 && dlen >= 22) { // IPv6
+                    hlen = 22;
+                    d6.sin6_family = AF_INET6;
+                    memcpy(&d6.sin6_addr, datagram + 4, 16);
+                    memcpy(&d6.sin6_port, datagram + 20, 2);
+                    dst = &d6; dlen2 = sizeof(d6);
+                }
+                if (dst && dlen > hlen) {
+                    if (sendto(remote_udp_fd, datagram + hlen, dlen - hlen, 0,
+                               (struct sockaddr*)dst, dlen2) < 0) {
+                        LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
+                    }
+                }
+            }
+        }
+
+        // 5G UDP → 封裝成 frame → client（單一 send 送出 長度欄 + datagram）
+        if (fds[2].revents) {
+            sl = sizeof(src6);
+            int off = 22; // 預留空間給 IPv6 Header
+            ssize_t r = recvfrom(remote_udp_fd, datagram + off, BUFFER_SIZE - off, 0,
+                                 (struct sockaddr*)&src6, &sl);
+            if (r > 0) {
+                int start = 0;
+                if (src6.sin6_family == AF_INET) {
+                    struct sockaddr_in *s4 = (struct sockaddr_in *)&src6;
+                    start = off - 10;
+                    memset(&datagram[start], 0, 3); // RSV + FRAG
+                    datagram[start+3] = 0x01;       // ATYP IPv4
+                    memcpy(&datagram[start+4], &s4->sin_addr, 4);
+                    memcpy(&datagram[start+8], &s4->sin_port, 2);
+                } else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) {
+                    start = off - 10;
+                    memset(&datagram[start], 0, 3);
+                    datagram[start+3] = 0x01;
+                    memcpy(&datagram[start+4], &src6.sin6_addr.s6_addr[12], 4);
+                    memcpy(&datagram[start+8], &src6.sin6_port, 2);
+                } else {
+                    start = off - 22;
+                    memset(&datagram[start], 0, 3);
+                    datagram[start+3] = 0x04;       // ATYP IPv6
+                    memcpy(&datagram[start+4], &src6.sin6_addr, 16);
+                    memcpy(&datagram[start+20], &src6.sin6_port, 2);
+                }
+                int dlen = r + (off - start);
+                datagram[start - 2] = (unsigned char)(dlen >> 8);
+                datagram[start - 1] = (unsigned char)(dlen & 0xFF);
+                int total = dlen + 2;
+                ssize_t tt = 0;
+                while (tt < total) {
+                    ssize_t n = send(client_fd, datagram + start - 2 + tt, total - tt, MSG_NOSIGNAL);
+                    if (n > 0) tt += n;
+                    else break;
+                }
+            }
+        }
+    }
+
+    free(datagram);
+    release_java_socket(remote_udp_fd);
+    close(remote_udp_fd);
+    close(client_fd);
+    atomic_fetch_sub(&g_conn_count, 1);
+}
+
 void socks5_server_set_auth(const char *user, const char *pass) {
     // 只要帳號或密碼任一有設定，就啟用認證；全空才維持開放（無認證）
     if (!user || !pass || (!user[0] && !pass[0])) {
@@ -602,6 +733,10 @@ static void* handle_handshake(void* arg) {
         return NULL;
     } else if (cmd == 0x03) { // UDP
         handle_udp_session_full(client_fd);
+        atomic_fetch_sub(&g_handshake_count, 1);
+        return NULL; 
+    } else if (cmd == 0x04) { // UDP-in-TCP（自訂擴充）
+        handle_udp_tcp_session(client_fd);
         atomic_fetch_sub(&g_handshake_count, 1);
         return NULL; 
     }

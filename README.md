@@ -13,6 +13,7 @@
 - 🔒 **強制鎖定蜂巢式網路** — 透過 `NetworkRequest` 將 Socket 綁定到 5G 網路（`Network.bindSocket`），不受 Wi-Fi 干擾
 - 🔑 **可選帳密認證**（RFC 1929）— 預設無認證（開放代理）；在 App 內設定帳號密碼後，客戶端必須通過認證才能連線
 - 🧦 **完整 SOCKS5 代理** — 原生 C 引擎（epoll，可併發），支援 TCP（CONNECT）與 UDP（ASSOCIATE），IPv4 / IPv6 / 網域 (DOMAIN) 地址皆支援
+- 🧵 **UDP-in-TCP** — 自訂擴充指令 `0x04`：UDP relay 資料以 frame 走同一條 TCP 連線，不受 UDP 壅塞/優先權影響（見下方協定規格）
 - 🔁 **IPv6 自動 Fallback** — TCP 連線依序嘗試所有解析出的地址（IPv6/IPv4）
 - ❤️ **20 秒循環心跳** — 防止 5G 掉線或進入省電模式
 - 🛡️ **原生引擎健康檢查** — 每 10 秒驗證 SOCKS5 伺服器存活，異常自動重啟
@@ -139,6 +140,51 @@ AndroidProxy/
 ```
 
 C 引擎收到客戶端連線後，透過 JNI 呼叫 Java `createSocketBoundToNetwork()`，使用電子網路專屬的 Socket 進行真正的資料傳輸，確保所有流量走 5G/蜂巢狀，而非 Wi-Fi。
+
+---
+
+## UDP-in-TCP 協定規格（自訂擴充指令 0x04）
+
+標準 SOCKS5 的 UDP relay 走獨立的 UDP 通道（UDP ASSOCIATE）；本伺服器另支援自訂指令 `0x04`「UDP ASSOCIATE over TCP」，UDP 資料以 frame 形式走**同一條 TCP 控制連線**，避免 UDP 在壅塞網路上被丟棄、以及 NAT/防火牆對 UDP 的影響。
+
+### 握手
+
+```
+Client → Server: {0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0}   （SOCKS5 request，cmd=0x04）
+Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功回覆，BND 全 0）
+```
+
+成功回覆後，同一條 TCP 連線雙向以 frame 承載 UDP datagram。若伺服器不支援 0x04，會回覆 REP≠0，客戶端應在同一條連線退回標準 `0x03`（UDP ASSOCIATE）。
+
+### Frame 格式（雙向相同）
+
+```
++--------+--------+-----...------+
+| len_hi | len_lo | SOCKS5 UDP datagram |
++--------+--------+---------------------+
+```
+
+- `len`：16-bit **network order**，為後方 datagram 的總位元組數（不含長度欄本身）
+- datagram 採用標準 SOCKS5 UDP header：
+
+```
++----+------+------+----------+----------+----------+
+|RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
++----+------+------+----------+----------+----------+
+| 2  |  1   |  1   | Variable |    2     | Variable |
+```
+
+- `RSV=0`、`FRAG=0`
+- `ATYP=0x01`（IPv4，表頭 10B）或 `ATYP=0x04`（IPv6，表頭 22B）；不支援網域 ATYP=0x03
+- 伺服器收到 frame 後解析目標位址，以 5G socket `sendto`；收到 5G 回覆後以來源位址封裝為 frame 送回客戶端（v4-mapped 一律輸出 ATYP=0x01）
+
+### 實作位置
+
+- `app/src/main/cpp/simple-socks5.c` → `handle_udp_tcp_session()`（`handle_handshake` 分派 cmd==0x04）
+
+### 搭配客戶端
+
+- 5G-Proxy-Client 勾選「UDP relay 走 TCP（UDP-in-TCP）」即使用本協定；對一般 SOCKS5 伺服器會自動退回標準協定，兩者皆可互通。
 
 ---
 

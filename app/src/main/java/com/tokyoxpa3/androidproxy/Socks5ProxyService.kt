@@ -47,14 +47,14 @@ class Socks5ProxyService : Service() {
         
         val originalHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            val crashDetail = """
-                時間: ${java.util.Date()}
-                線程: ${thread.name}
-                錯誤類型: ${throwable.javaClass.simpleName}
-                訊息: ${throwable.message}
-                堆疊追蹤:
-                ${throwable.stackTraceToString()}
-            """.trimIndent()
+            val crashDetail = getString(
+                R.string.crash_detail_format,
+                java.util.Date(),
+                thread.name,
+                throwable.javaClass.simpleName,
+                throwable.message,
+                throwable.stackTraceToString()
+            )
             
             getSharedPreferences("debug_log", MODE_PRIVATE)
                 .edit()
