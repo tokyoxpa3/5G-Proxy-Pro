@@ -39,19 +39,25 @@ class Socks5ProxyService : Service() {
     private class DnsEntry(val addresses: List<java.net.InetAddress>, val expiresAt: Long)
     private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, DnsEntry>()
     private val dnsCacheLock = Any()
-    private val dnsExecutor = java.util.concurrent.Executors.newFixedThreadPool(4) { r ->
-        Thread(r, "socks5-dns").apply { isDaemon = true }
-    }
+    private val dnsExecutor = java.util.concurrent.ThreadPoolExecutor(
+            4, 4,
+            0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+            java.util.concurrent.ArrayBlockingQueue(64),
+            { r -> Thread(r, "socks5-dns").apply { isDaemon = true } },
+            java.util.concurrent.ThreadPoolExecutor.DiscardPolicy()
+        )
 
-    @Synchronized
     private fun resolveWithCache(network: android.net.Network, host: String): List<java.net.InetAddress> {
         val key = host.lowercase()
         val now = System.currentTimeMillis()
         val hit = dnsCache[key]
         if (hit != null && hit.expiresAt > now) return hit.addresses
         if (dnsCache.size >= 256) dnsCache.clear()
-        // 5G 網路劣化時 DNS 可能長時間無回應；加上 3 秒 timeout，
-        // 避免 handshake 線程被 DNS 卡死（128 線程全滿時新連線會被直接拒絕）
+        // 5G 網路劣化時 DNS 可能長時間無回應；加上 2 秒 timeout，
+        // 避免 handshake 線程被 DNS 卡死（128 線程全滿時新連線會被直接拒絕）。
+        // 注意：不能加 @Synchronized —— 否則 128 個 handshake 線程會在鎖上串行排隊，
+        // 每次 DNS 超時 2 秒 × 128 = 最後一個線程要等 ~4 分鐘，等於拒絕服務。
+        // dnsCache 是 ConcurrentHashMap 已線程安全，重複解析同一個 host 無害。
         val addresses = try {
             val future = dnsExecutor.submit<List<java.net.InetAddress>> {
                 network.getAllByName(host)
@@ -59,7 +65,7 @@ class Socks5ProxyService : Service() {
                     .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
             }
             try {
-                future.get(3, java.util.concurrent.TimeUnit.SECONDS)
+                future.get(2, java.util.concurrent.TimeUnit.SECONDS)
             } finally {
                 future.cancel(true)
             }

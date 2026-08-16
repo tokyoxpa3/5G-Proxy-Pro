@@ -49,6 +49,7 @@ typedef struct full_conn_t {
     ssize_t t2c_len, t2c_off;
     int closed; // 標記是否已進入關閉流程
     int client_eof; // 客戶端已 FIN（半關閉）: 停止讀取但繼續轉發 target→client
+    time_t eof_since; // client_eof 的起始時間（grace period 用）
     uint32_t client_events;
     uint32_t target_events;
     
@@ -213,6 +214,7 @@ static void* worker_loop_safe(void* arg) {
                     } else if (r == 0) {
                         // 客戶端半關閉 (FIN): 停止讀取，但仍須把 target 的剩餘資料轉發回去
                         full->client_eof = 1;
+                        full->eof_since = now;
                     } else if (errno != EAGAIN && errno != EWOULDBLOCK) fatal_error = 1;
                 }
                 // Read from Target
@@ -228,8 +230,18 @@ static void* worker_loop_safe(void* arg) {
             // 緩衝清空後以 MSG_PEEK 偵測對端是否已 FIN:
             // 伺服器關閉 = 回應已完整送達,此時才結束連線
             if (!fatal_error && full->c2t_len == 0 && full->t2c_len == 0) {
-                char tmp;
-                if (recv(full->target_fd, &tmp, 1, MSG_PEEK) == 0) fatal_error = 1;
+                if (full->client_eof) {
+                    // [關鍵] client 已 FIN（半關閉）且所有資料已轉發完成：
+                    // 給 target 2 秒 grace period 等待剩餘資料（半關閉的 client
+                    // 仍可能再收到 target 遲到的回應），逾時即結束連線回收 fd。
+                    // 不能無限期等 target 的 FIN——HTTP keep-alive 的 target
+                    // 不會發 FIN，否則測速等大量短連線會堆積數百條 CLOSE_WAIT
+                    // 消耗 fd，最終拒絕服務。
+                    if (now - full->eof_since >= 2) fatal_error = 1;
+                } else {
+                    char tmp;
+                    if (recv(full->target_fd, &tmp, 1, MSG_PEEK) == 0) fatal_error = 1;
+                }
             }
 
             if (fatal_error) {
@@ -258,7 +270,12 @@ static void* worker_loop_safe(void* arg) {
             while (curr) {
                 full_conn_t *next = curr->next;
                 // 檢查是否超時且未被關閉
-                if (!curr->closed && (now - curr->last_active > IDLE_TIMEOUT_SEC)) {
+                // 1. 一般 idle 超時
+                // 2. client 已半關閉且超過 2 秒 grace period（target 的 keep-alive
+                //    連線不會發 FIN，事件迴圈不會再觸發，必須靠這裡回收，
+                //    否則 CLOSE_WAIT 堆積消耗 fd）
+                if (!curr->closed && (now - curr->last_active > IDLE_TIMEOUT_SEC ||
+                    (curr->client_eof && now - curr->eof_since >= 2))) {
                     curr->closed = 1;
                     list_remove_locked(me, curr);
                     if (garbage_count < MAX_EVENTS) garbage_list[garbage_count++] = curr;

@@ -1,0 +1,3 @@
+- Fix: DNS lookups no longer serialize on a global lock; a slow 5G network can no longer make 128 handshake threads queue behind each other (previously the last thread could wait ~4 minutes, blocking new connections)
+- Fix: connections closed by the client are now recycled 2 seconds after all data is forwarded instead of waiting for the target to close (HTTP keep-alive targets never send FIN, which used to pile up CLOSE_WAIT connections and exhaust fds)
+- Reliability: handshake threads now churn fast (DNS 2s + connect 3s timeouts) so the proxy stays responsive even under heavy parallel connections
