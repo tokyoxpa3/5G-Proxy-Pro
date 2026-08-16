@@ -1,0 +1,4 @@
+- UDP-in-TCP relay (custom SOCKS5 command 0x04): UDP data carried over reliable TCP frames, immune to UDP QoS throttling and NAT/firewall UDP limits
+- Protocol specification documented in README (frame format: len + SOCKS5 UDP datagram, IPv4/IPv6 support)
+- Crash dialog improvements: Java crash log shows time/thread/type/message/stack, copy-to-clipboard button
+- Strings moved to resources (values/values-zh-rTW)
