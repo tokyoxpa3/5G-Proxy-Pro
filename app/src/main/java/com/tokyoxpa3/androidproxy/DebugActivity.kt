@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.util.Log
 import android.widget.*
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.net.Network
 import android.net.ConnectivityManager
 import android.net.wifi.WifiManager
@@ -36,6 +37,8 @@ class DebugActivity : Activity() {
     
     private var isRunning = false
     private var isSpeedTestRunning = false
+    private var pendingNotificationPermission = false
+    private val REQUEST_NOTIFICATION_PERMISSION = 1002
     private val speedTestUrls = listOf(
         "https://speedtest.singapore.linode.com/100MB-singapore.bin",
         "https://speedtest.tokyo2.linode.com/100MB-tokyo2.bin",
@@ -55,6 +58,11 @@ class DebugActivity : Activity() {
         isRunning = Socks5ProxyService.isServiceRunning
 
         setupUI()
+        
+        // 訂閱 Service 狀態變更，UI 與真實狀態同步
+        Socks5ProxyService.onStatusChanged = { status ->
+            activityScope.launch { onProxyStatusChanged(status) }
+        }
         
         // 檢查上次退出原因
         checkLastExitReason()
@@ -80,14 +88,72 @@ class DebugActivity : Activity() {
                 .show()
         }
 
-        // 2. 根據狀態更新 UI
-        if (isRunning) {
-            mainButton.text = getString(R.string.btn_stop_proxy)
-            mainButton.background = createButtonDrawable(0xFFDC3545.toInt())
-            statusText.text = getString(R.string.status_proxy_running)
+        // 2. 根據狀態更新 UI（已停止時保留「上次退出原因」的文字，不覆寫）
+        if (Socks5ProxyService.currentStatus != Socks5ProxyService.ProxyStatus.STOPPED) {
+            onProxyStatusChanged(Socks5ProxyService.currentStatus)
         }
         
         updateNetworkStatus()
+    }
+
+    override fun onDestroy() {
+        Socks5ProxyService.onStatusChanged = null
+        activityScope.cancel()
+        super.onDestroy()
+    }
+
+    private fun onProxyStatusChanged(status: Socks5ProxyService.ProxyStatus) {
+        val stopText = getString(R.string.btn_stop_proxy)
+        val startText = getString(R.string.btn_start_proxy)
+        when (status) {
+            Socks5ProxyService.ProxyStatus.STARTING -> {
+                isRunning = true
+                mainButton.text = stopText
+                mainButton.background = createButtonDrawable(0xFFDC3545.toInt())
+                statusText.text = getString(R.string.status_starting)
+                statusText.setTextColor(0xFF6C757D.toInt())
+            }
+            Socks5ProxyService.ProxyStatus.RUNNING -> {
+                isRunning = true
+                mainButton.text = stopText
+                mainButton.background = createButtonDrawable(0xFFDC3545.toInt())
+                statusText.text = getString(R.string.status_proxy_running)
+                statusText.setTextColor(0xFF6C757D.toInt())
+            }
+            Socks5ProxyService.ProxyStatus.RESTARTING -> {
+                isRunning = true
+                mainButton.text = stopText
+                mainButton.background = createButtonDrawable(0xFFDC3545.toInt())
+                statusText.text = getString(R.string.status_restarting)
+                statusText.setTextColor(0xFF6C757D.toInt())
+            }
+            Socks5ProxyService.ProxyStatus.PAUSED -> {
+                isRunning = true
+                mainButton.text = stopText
+                mainButton.background = createButtonDrawable(0xFFDC3545.toInt())
+                statusText.text = getString(R.string.status_waiting_network)
+                statusText.setTextColor(0xFF6C757D.toInt())
+            }
+            Socks5ProxyService.ProxyStatus.STOPPED -> {
+                isRunning = false
+                mainButton.text = startText
+                mainButton.background = createButtonDrawable(0xFF6200EE.toInt())
+                statusText.text = getString(R.string.status_stopped)
+                statusText.setTextColor(0xFF6C757D.toInt())
+            }
+            Socks5ProxyService.ProxyStatus.FAILED -> {
+                isRunning = false
+                mainButton.text = startText
+                mainButton.background = createButtonDrawable(0xFF6200EE.toInt())
+                val error = Socks5ProxyService.lastErrorMessage
+                statusText.text = if (error != null) {
+                    getString(R.string.status_failed, error)
+                } else {
+                    getString(R.string.status_failed_generic)
+                }
+                statusText.setTextColor(android.graphics.Color.RED)
+            }
+        }
     }
 
     private fun checkLastExitReason() {
@@ -376,10 +442,42 @@ class DebugActivity : Activity() {
 
     private fun startProxyFlow() {
         if (!PowerPermissionHelper.isWhitelisted(this)) {
-            PowerPermissionHelper.showOptimizationDialog(this)
-            return 
+            // 未加入電池白名單：說明風險，並允許使用者「仍然繼續」
+            PowerPermissionHelper.showOptimizationDialog(this) {
+                Toast.makeText(this, getString(R.string.toast_battery_warning), Toast.LENGTH_LONG).show()
+                continueStartProxyFlow()
+            }
+            return
         }
+        continueStartProxyFlow()
+    }
 
+    private fun continueStartProxyFlow() {
+        // Android 13+：要求通知權限，否則前景服務通知不會顯示
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingNotificationPermission = true
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATION_PERMISSION)
+            return
+        }
+        startProxyInternal()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_NOTIFICATION_PERMISSION && pendingNotificationPermission) {
+            pendingNotificationPermission = false
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Log.d("DebugActivity", "Notification permission granted")
+            } else {
+                Toast.makeText(this, getString(R.string.toast_notification_denied), Toast.LENGTH_LONG).show()
+            }
+            startProxyInternal()
+        }
+    }
+
+    private fun startProxyInternal() {
         val port = portInput.text.toString().toIntOrNull() ?: 1080
 
         getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
@@ -421,11 +519,8 @@ class DebugActivity : Activity() {
     private fun refreshStatus() {
         statusText.text = getString(R.string.status_refreshing)
         updateNetworkStatus()
-        if (isRunning) {
-            statusText.text = getString(R.string.status_proxy_running)
-        } else {
-            statusText.text = getString(R.string.status_stopped)
-        }
+        // 以 Service 實際回報的狀態更新，不依賴 Activity 本地猜測
+        onProxyStatusChanged(Socks5ProxyService.currentStatus)
     }
 
     private fun updateNetworkStatus() {

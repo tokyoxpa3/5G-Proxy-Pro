@@ -1,6 +1,7 @@
 Locks your phone to the cellular (5G/4G) network and exposes a SOCKS5
-proxy server over Wi-Fi, so other devices can route their traffic through
-the phone's cellular connection.
+proxy server on your local area network (Wi-Fi, hotspot or USB tethering),
+so other devices can route their traffic through the phone's cellular
+connection.
 
 The proxy engine is a native C implementation (epoll-based) supporting TCP
 (CONNECT) and UDP (ASSOCIATE) with IPv4, IPv6 and domain addresses. All
@@ -8,7 +9,18 @@ connections are bound to the cellular network via Network.bindSocket().
 A heartbeat keeps the cellular link alive, and a health check restarts the
 engine automatically if it fails.
 
-Optional username/password authentication (RFC 1929) protects the proxy;
-by default the proxy is open, so only use it on trusted local networks.
+Security:
+- The listener only binds to LAN interfaces (Wi-Fi / hotspot / USB
+  tethering); it is never exposed on the cellular interface.
+- Optional username/password authentication (RFC 1929): auth is enabled
+  only when both fields are set. Leave them empty for an open proxy, and
+  only use it on trusted local networks.
+- A foreground service notification shows the proxy status.
+
+Network usage:
+- connectivitycheck.gstatic.com/generate_204 - cellular health check
+- api.ipify.org - displays the cellular public IP in the app
+- Speed test servers (Linode/OVH/Hetzner/Tele2/ThinkBroadband) - only when
+  using the developer speed test button
 
 A cellular speed test tool is also included.

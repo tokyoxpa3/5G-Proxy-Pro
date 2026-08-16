@@ -36,7 +36,7 @@ object PowerPermissionHelper {
         }
     }
 
-    fun showOptimizationDialog(context: Context) {
+    fun showOptimizationDialog(context: Context, onContinue: (() -> Unit)? = null) {
         if (isWhitelisted(context)) {
             val isXiaomi = Build.MANUFACTURER.lowercase().let { 
                 it.contains("xiaomi") || it.contains("poco") || it.contains("redmi") 
@@ -63,6 +63,11 @@ object PowerPermissionHelper {
                 .setMessage(message)
                 .setPositiveButton(context.getString(R.string.btn_go_settings)) { _, _ -> requestIgnoreBatteryOptimization(context) }
                 .setNegativeButton(context.getString(R.string.btn_cancel), null)
+                .apply {
+                    if (onContinue != null) {
+                        setNeutralButton(context.getString(R.string.btn_continue_anyway)) { _, _ -> onContinue() }
+                    }
+                }
                 .show()
         }
     }

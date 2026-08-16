@@ -4,9 +4,9 @@
     <string name="service_not_started">服務未啟動</string>
     <string name="proxy_port_label">代理端口: </string>
     <string name="auth_user_label">使用者: </string>
-    <string name="auth_user_hint">留空 = 不驗證此欄位</string>
+    <string name="auth_user_hint">留空 = 不啟用認證</string>
     <string name="auth_pass_label">密碼: </string>
-    <string name="auth_pass_hint">留空 = 不驗證此欄位</string>
+    <string name="auth_pass_hint">留空 = 不啟用認證</string>
     <string name="auth_applied_live">認證已即時套用（新連線生效）</string>
     <string name="btn_start_proxy">🚀 一鍵開啟 5G 代理</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: 獲取中...</string>
@@ -17,6 +17,10 @@
     <string name="status_proxy_running">✅ 5G Proxy Running</string>
     <string name="status_starting">🚀 正在啟動服務...</string>
     <string name="status_stopped">服務已停止</string>
+    <string name="status_restarting">🔄 5G IP 已切換，自動重建代理中...</string>
+    <string name="status_waiting_network">📡 5G 網路已中斷，等待恢復中...</string>
+    <string name="status_failed">❌ 代理啟動失敗: %1$s</string>
+    <string name="status_failed_generic">❌ 代理啟動失敗</string>
     <string name="last_exit_prefix">上次關閉原因：</string>
     <string name="exit_reason_low_mem">系統記憶體不足 (LMK)</string>
     <string name="exit_reason_user_requested">用戶手動關閉</string>
@@ -55,6 +59,7 @@
     <string name="btn_close">關閉</string>
     <string name="btn_go_settings">前往設定</string>
     <string name="btn_cancel">取消</string>
+    <string name="btn_continue_anyway">仍然繼續</string>
     
     <string name="dialog_xiaomi_title">⚠️ 小米/POCO 用戶請注意</string>
     <string name="dialog_xiaomi_msg">為了確保 5G 網路不被系統切斷，請依照以下路徑操作：\n\n1. 點擊「前往設定」打開頁面\n2. 點擊上方的【更多電池功能】\n3. 找到並關閉【5G 智慧省電】\n\n同時請將此 App 的省電策略設為「無限制」。</string>
@@ -75,4 +80,10 @@
     <string name="btn_copy_and_close">複製並關閉</string>
     <string name="toast_copied">日誌已複製到剪貼簿</string>
     <string name="crash_detail_format">時間: %1$s\n線程: %2$s\n類型: %3$s\n訊息: %4$s\n堆疊:\n%5$s</string>
+
+    <string name="toast_battery_warning">警告：未加入電池白名單時，系統可能於背景停止代理服務，建議前往開啟。</string>
+    <string name="toast_notification_denied">通知權限未開啟，代理仍會運行，但不會顯示狀態通知。</string>
+    <string name="error_no_lan_interface">找不到可綁定的 LAN 介面（請先開啟 Wi-Fi、熱點或 USB 分享）</string>
+    <string name="error_cellular_unavailable">5G 網路不可用</string>
+    <string name="error_native_start">原生伺服器啟動失敗: %1$s</string>
 </resources>

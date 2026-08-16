@@ -1,0 +1,7 @@
+- Fix: stopping the proxy now fully closes the listener; no zombie listener left bound to the port after Stop
+- Security: SOCKS5 listener binds only to LAN interfaces (Wi-Fi / hotspot / USB tethering), never to the cellular interface
+- Security: authentication now requires both username and password; empty fields no longer bypass auth
+- Fix: status line now reflects the real service state (running/paused/restarting/failed) via service callbacks
+- Fix: battery-optimization dialog can be dismissed with "Continue Anyway" and explains the risk
+- Android 13+: notification permission is requested at runtime so the foreground notification is visible
+- Fix: service no longer auto-restarts after a user-requested stop (START_NOT_STICKY + stop guard)

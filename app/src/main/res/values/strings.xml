@@ -4,9 +4,9 @@
     <string name="service_not_started">Service not started</string>
     <string name="proxy_port_label">Proxy Port: </string>
     <string name="auth_user_label">Username: </string>
-    <string name="auth_user_hint">Empty = not verified</string>
+    <string name="auth_user_hint">Empty = auth disabled</string>
     <string name="auth_pass_label">Password: </string>
-    <string name="auth_pass_hint">Empty = not verified</string>
+    <string name="auth_pass_hint">Empty = auth disabled</string>
     <string name="auth_applied_live">Auth applied live (new connections)</string>
     <string name="btn_start_proxy">🚀 Start 5G Proxy</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: Fetching...</string>
@@ -17,6 +17,10 @@
     <string name="status_proxy_running">✅ 5G Proxy Running</string>
     <string name="status_starting">🚀 Starting Service...</string>
     <string name="status_stopped">Service Stopped</string>
+    <string name="status_restarting">🔄 5G IP Changed - Auto Restarting Proxy</string>
+    <string name="status_waiting_network">📡 5G Network Lost - Waiting to Reconnect</string>
+    <string name="status_failed">❌ Proxy Failed to Start: %1$s</string>
+    <string name="status_failed_generic">❌ Proxy Failed to Start</string>
     <string name="last_exit_prefix">Last Exit: </string>
     <string name="exit_reason_low_mem">System Low Memory (LMK)</string>
     <string name="exit_reason_user_requested">User Requested</string>
@@ -55,6 +59,7 @@
     <string name="btn_close">Close</string>
     <string name="btn_go_settings">Go to Settings</string>
     <string name="btn_cancel">Cancel</string>
+    <string name="btn_continue_anyway">Continue Anyway</string>
     
     <string name="dialog_xiaomi_title">⚠️ Xiaomi/POCO Users</string>
     <string name="dialog_xiaomi_msg">To ensure 5G stability:\n\n1. Click \"Go to Settings\"
@@ -79,4 +84,10 @@ Also set this App\'s battery saver to \"No restrictions\".</string>
     <string name="btn_copy_and_close">Copy &amp; Close</string>
     <string name="toast_copied">Log copied to clipboard</string>
     <string name="crash_detail_format">Time: %1$s\nThread: %2$s\nType: %3$s\nMessage: %4$s\nStack:\n%5$s</string>
+
+    <string name="toast_battery_warning">Warning: without the battery whitelist, the system may stop the proxy in the background. It is recommended to enable it.</string>
+    <string name="toast_notification_denied">Notifications disabled - proxy will run without a visible status notification</string>
+    <string name="error_no_lan_interface">No LAN interface found (enable Wi-Fi, hotspot or USB tethering first)</string>
+    <string name="error_cellular_unavailable">5G network unavailable</string>
+    <string name="error_native_start">Native server failed: %1$s</string>
 </resources>

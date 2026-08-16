@@ -23,6 +23,7 @@ extern void release_java_socket(int fd);
 
 #define LOG_TAG "SimpleSocks5"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 #define BUFFER_SIZE (256 * 1024)
 #define MAX_EVENTS 128
@@ -47,6 +48,7 @@ typedef struct full_conn_t {
     ssize_t c2t_len, c2t_off;
     ssize_t t2c_len, t2c_off;
     int closed; // 標記是否已進入關閉流程
+    int client_eof; // 客戶端已 FIN（半關閉）: 停止讀取但繼續轉發 target→client
     uint32_t client_events;
     uint32_t target_events;
     
@@ -64,9 +66,15 @@ typedef struct {
 
 static worker_t workers[WORKER_COUNT];
 static volatile int server_running = 0;
-static int worker_server_fd = -1;
 static pthread_t listener_thread;
 static int next_worker_idx = 0;
+
+#define MAX_LISTENERS 8
+#define MAX_BIND_ADDRS 16
+static int g_listener_fds[MAX_LISTENERS];
+static int g_listener_count = 0;
+static char g_bind_addrs[MAX_BIND_ADDRS][INET6_ADDRSTRLEN];
+static int g_bind_count = 0;
 
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -115,7 +123,7 @@ static int try_send(int fd, unsigned char *buf, ssize_t *len, ssize_t *off) {
 static void update_conn_events(int epoll_fd, full_conn_t *full) {
     if (full->closed) return;
     uint32_t c_ev = EPOLLRDHUP; 
-    if (full->c2t_len == 0) c_ev |= EPOLLIN;
+    if (full->c2t_len == 0 && !full->client_eof) c_ev |= EPOLLIN;
     if (full->t2c_len > 0)  c_ev |= EPOLLOUT;
 
     uint32_t t_ev = EPOLLRDHUP;
@@ -197,12 +205,15 @@ static void* worker_loop_safe(void* arg) {
                     if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off) < 0) fatal_error = 1;
                 }
                 // Read from Client
-                if (!fatal_error && full->c2t_len == 0) {
+                if (!fatal_error && full->c2t_len == 0 && !full->client_eof) {
                     ssize_t r = recv(full->client_fd, full->c2t_buf, BUFFER_SIZE, 0);
                     if (r > 0) {
                         full->c2t_len = r; full->c2t_off = 0;
                         if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off) < 0) fatal_error = 1;
-                    } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) fatal_error = 1;
+                    } else if (r == 0) {
+                        // 客戶端半關閉 (FIN): 停止讀取，但仍須把 target 的剩餘資料轉發回去
+                        full->client_eof = 1;
+                    } else if (errno != EAGAIN && errno != EWOULDBLOCK) fatal_error = 1;
                 }
                 // Read from Target
                 if (!fatal_error && full->t2c_len == 0) {
@@ -572,6 +583,8 @@ static void handle_udp_tcp_session(int client_fd) {
                     if (sendto(remote_udp_fd, datagram + hlen, dlen - hlen, 0,
                                (struct sockaddr*)dst, dlen2) < 0) {
                         LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
+                    } else {
+                        LOGI("UDP-in-TCP: client→5G frame dlen=%d hlen=%d payload=%d", dlen, hlen, dlen - hlen);
                     }
                 }
             }
@@ -584,6 +597,7 @@ static void handle_udp_tcp_session(int client_fd) {
             ssize_t r = recvfrom(remote_udp_fd, datagram + off, BUFFER_SIZE - off, 0,
                                  (struct sockaddr*)&src6, &sl);
             if (r > 0) {
+                LOGI("UDP-in-TCP: 5G→client datagram r=%zd", r);
                 int start = 0;
                 if (src6.sin6_family == AF_INET) {
                     struct sockaddr_in *s4 = (struct sockaddr_in *)&src6;
@@ -627,8 +641,9 @@ static void handle_udp_tcp_session(int client_fd) {
 }
 
 void socks5_server_set_auth(const char *user, const char *pass) {
-    // 只要帳號或密碼任一有設定，就啟用認證；全空才維持開放（無認證）
-    if (!user || !pass || (!user[0] && !pass[0])) {
+    // 安全原則：必須「同時」設定帳號與密碼才啟用認證。
+    // 任一欄位留空 = 不啟用認證，避免「空值放行任意輸入」的漏洞。
+    if (!user || !pass || !user[0] || !pass[0]) {
         g_auth_enabled = 0;
         g_auth_user[0] = '\0';
         g_auth_pass[0] = '\0';
@@ -659,13 +674,11 @@ static int do_auth_check(int client_fd, unsigned char *buf) {
     const unsigned char *user = buf + 2;
     const unsigned char *pass = buf + 258;
 
-    // 設定值為空時該欄位放行任何內容（例：只設帳號 → 密碼不拘）
-    int user_ok = (g_auth_user[0] == '\0') ||
-                  ((ulen == (unsigned char)strlen(g_auth_user)) &&
-                   memcmp(user, g_auth_user, ulen) == 0);
-    int pass_ok = (g_auth_pass[0] == '\0') ||
-                  ((plen == (unsigned char)strlen(g_auth_pass)) &&
-                   memcmp(pass, g_auth_pass, plen) == 0);
+    // 帳號與密碼都必須完全相符（啟用認證時兩欄皆非空，因此不再允許空值放行）
+    int user_ok = (ulen == (unsigned char)strlen(g_auth_user)) &&
+                  memcmp(user, g_auth_user, ulen) == 0;
+    int pass_ok = (plen == (unsigned char)strlen(g_auth_pass)) &&
+                  memcmp(pass, g_auth_pass, plen) == 0;
     int ok = user_ok && pass_ok;
 
     send(client_fd, ok ? "\x01\x00" : "\x01\x01", 2, MSG_NOSIGNAL);
@@ -746,9 +759,40 @@ err:
     return NULL;
 }
 
+typedef struct {
+    int port;
+} ListenerArgs;
+
+// 為指定位址建立 TCP listener（AF_INET / AF_INET6），成功則加入 g_listener_fds
+static void add_listener(int family, const void *addr, socklen_t addrlen, int port) {
+    if (g_listener_count >= MAX_LISTENERS) return;
+    int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    set_nonblocking(fd);
+    if (family == AF_INET6) {
+        int v6only = 1;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        struct sockaddr_in6 sa;
+        memcpy(&sa, addr, sizeof(sa));
+        sa.sin6_port = htons(port);
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return; }
+    } else {
+        struct sockaddr_in sa;
+        memcpy(&sa, addr, sizeof(sa));
+        sa.sin_port = htons(port);
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return; }
+    }
+    if (listen(fd, 128) < 0) { close(fd); return; }
+    g_listener_fds[g_listener_count++] = fd;
+}
+
 static void* listener_task(void* arg) {
-    int port = *(int*)arg; free(arg);
-    
+    ListenerArgs *args = (ListenerArgs *)arg;
+    int port = args->port;
+    free(args);
+
     if (pipe(g_shutdown_pipe) < 0) return NULL;
     set_nonblocking(g_shutdown_pipe[0]); set_nonblocking(g_shutdown_pipe[1]);
 
@@ -759,34 +803,85 @@ static void* listener_task(void* arg) {
         pthread_create(&workers[i].thread_id, NULL, worker_loop_safe, &workers[i]);
     }
 
-    // ... (Listener Bind/Listen 代碼同原檔) ...
-    worker_server_fd = socket(AF_INET6, SOCK_STREAM, 0);
-    int opt = 1; setsockopt(worker_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    int no = 0; setsockopt(worker_server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
-    struct sockaddr_in6 addr = { .sin6_family = AF_INET6, .sin6_port = htons(port) };
-    if (bind(worker_server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return NULL;
-    listen(worker_server_fd, 128);
+    g_listener_count = 0;
 
-    while (server_running) {
-        struct sockaddr_in6 caddr; socklen_t clen = sizeof(caddr);
-        int cfd = accept(worker_server_fd, (struct sockaddr*)&caddr, &clen);
-        if (cfd < 0) { if (server_running) continue; break; }
-        
-        if (atomic_load(&g_handshake_count) >= MAX_HANDSHAKE_THREADS) {
-            close(cfd);
-            usleep(10000);
-            continue;
+    // 本機 loopback（供健康檢查與本機使用，不對外暴露）
+    struct sockaddr_in lo4 = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    add_listener(AF_INET, &lo4, sizeof(lo4), port);
+    struct sockaddr_in6 lo6 = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    add_listener(AF_INET6, &lo6, sizeof(lo6), port);
+
+    // 只綁定 LAN 介面位址（Wi-Fi / 熱點 / USB 分享），絕不綁到行動網路
+    for (int i = 0; i < g_bind_count && g_listener_count < MAX_LISTENERS; i++) {
+        struct in_addr a4;
+        struct in6_addr a6;
+        if (inet_pton(AF_INET, g_bind_addrs[i], &a4) == 1) {
+            struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr = a4 };
+            add_listener(AF_INET, &sa, sizeof(sa), port);
+        } else if (inet_pton(AF_INET6, g_bind_addrs[i], &a6) == 1) {
+            struct sockaddr_in6 sa = { .sin6_family = AF_INET6, .sin6_addr = a6 };
+            add_listener(AF_INET6, &sa, sizeof(sa), port);
         }
-
-        atomic_fetch_add(&g_handshake_count, 1);
-        pthread_t t; int* p = malloc(sizeof(int)); *p = cfd;
-        pthread_attr_t attr; pthread_attr_init(&attr); 
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        pthread_create(&t, &attr, handle_handshake, p); pthread_attr_destroy(&attr);
     }
-    
-    if (worker_server_fd >= 0) { close(worker_server_fd); worker_server_fd = -1; }
+
+    if (g_listener_count == 0) {
+        LOGE("沒有可綁定的 LAN 位址，SOCKS5 伺服器無法啟動");
+        server_running = 0;
+        if (g_shutdown_pipe[1] != -1) {
+            char stop_sig = 1;
+            write(g_shutdown_pipe[1], &stop_sig, 1);
+        }
+        return NULL;
+    }
+
+    struct pollfd pfds[MAX_LISTENERS + 1];
+    while (server_running) {
+        pfds[0].fd = g_shutdown_pipe[0]; pfds[0].events = POLLIN; pfds[0].revents = 0;
+        int n = 1;
+        for (int i = 0; i < g_listener_count; i++) {
+            pfds[n].fd = g_listener_fds[i]; pfds[n].events = POLLIN; pfds[n].revents = 0;
+            n++;
+        }
+        int res = poll(pfds, n, 1000);
+        if (res <= 0) continue;
+        if (pfds[0].revents) break; // shutdown pipe
+
+        for (int i = 1; i < n; i++) {
+            if (!(pfds[i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
+            for (;;) {
+                int cfd = accept(pfds[i].fd, NULL, NULL);
+                if (cfd < 0) break; // EAGAIN / 已關閉
+
+                if (atomic_load(&g_handshake_count) >= MAX_HANDSHAKE_THREADS) {
+                    close(cfd);
+                    usleep(10000);
+                    continue;
+                }
+
+                atomic_fetch_add(&g_handshake_count, 1);
+                pthread_t t; int* p = malloc(sizeof(int)); *p = cfd;
+                pthread_attr_t attr; pthread_attr_init(&attr);
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                pthread_create(&t, &attr, handle_handshake, p); pthread_attr_destroy(&attr);
+            }
+        }
+    }
+
+    for (int i = 0; i < g_listener_count; i++) {
+        if (g_listener_fds[i] >= 0) { close(g_listener_fds[i]); g_listener_fds[i] = -1; }
+    }
+    g_listener_count = 0;
     return NULL;
+}
+
+void socks5_server_set_bind_addrs(const char **addrs, int count) {
+    g_bind_count = 0;
+    for (int i = 0; i < count && g_bind_count < MAX_BIND_ADDRS; i++) {
+        if (!addrs || !addrs[i] || !addrs[i][0]) continue;
+        strncpy(g_bind_addrs[g_bind_count], addrs[i], INET6_ADDRSTRLEN - 1);
+        g_bind_addrs[g_bind_count][INET6_ADDRSTRLEN - 1] = '\0';
+        g_bind_count++;
+    }
 }
 
 int socks5_server_main_dynamic(int port) {
@@ -795,16 +890,22 @@ int socks5_server_main_dynamic(int port) {
     server_running = 1;
     atomic_store(&g_conn_count, 0);
     atomic_store(&g_handshake_count, 0);
-    int* p = malloc(sizeof(int)); *p = port;
-    pthread_create(&listener_thread, NULL, listener_task, p);
+    ListenerArgs *args = malloc(sizeof(ListenerArgs));
+    args->port = port;
+    pthread_create(&listener_thread, NULL, listener_task, args);
     return 0;
 }
 
 void socks5_server_quit(void) {
     if (!server_running) return;
     server_running = 0;
-    
-    if (worker_server_fd >= 0) { shutdown(worker_server_fd, SHUT_RDWR); close(worker_server_fd); worker_server_fd = -1; }
+
+    // 關閉所有 listener，立即釋放綁定的埠號
+    for (int i = 0; i < g_listener_count; i++) {
+        if (g_listener_fds[i] >= 0) { shutdown(g_listener_fds[i], SHUT_RDWR); close(g_listener_fds[i]); g_listener_fds[i] = -1; }
+    }
+    g_listener_count = 0;
+
     if (g_shutdown_pipe[1] != -1) {
         char stop_sig = 1;
         for(int k=0; k<10; k++) write(g_shutdown_pipe[1], &stop_sig, 1);

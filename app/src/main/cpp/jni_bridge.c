@@ -20,6 +20,7 @@ static jmethodID g_mid_notifyClosed = NULL;
 extern int socks5_server_main_dynamic(int port);
 extern void socks5_server_quit(void);
 extern void socks5_server_set_auth(const char *user, const char *pass);
+extern void socks5_server_set_bind_addrs(const char **addrs, int count);
 
 static pthread_t g_server_thread;
 static int g_server_running = 0;
@@ -28,9 +29,8 @@ typedef struct { int port; } ServerArgs;
 
 static void *server_thread_func(void *arg) {
     ServerArgs *args = (ServerArgs *)arg;
-    socks5_server_main_dynamic(args->port);
+    if (socks5_server_main_dynamic(args->port) != 0) g_server_running = 0;
     free(args);
-    g_server_running = 0;
     return NULL;
 }
 
@@ -99,8 +99,35 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     g_mid_notifyClosed = (*env)->GetMethodID(env, cls, "notifySocketClosed", "(I)V");
 }
 
-JNIEXPORT jstring JNICALL native_start_socks5_server(JNIEnv *env, jobject thiz, jint port) {
+JNIEXPORT jstring JNICALL native_start_socks5_server(JNIEnv *env, jobject thiz, jint port, jobjectArray jAddrs) {
     if (g_server_running) return (*env)->NewStringUTF(env, "Already running");
+
+    // 從 Java 複製綁定位址到 C 層靜態緩衝區（socks5_server_set_bind_addrs 會自行複製內容）
+    const char *tmp[32];
+    jstring jsArr[32];
+    int count = 0;
+    if (jAddrs) {
+        jsize len = (*env)->GetArrayLength(env, jAddrs);
+        if (len > 32) len = 32;
+        for (jsize i = 0; i < len; i++) {
+            jstring js = (jstring)(*env)->GetObjectArrayElement(env, jAddrs, i);
+            if (!js) continue;
+            const char *c = (*env)->GetStringUTFChars(env, js, NULL);
+            if (c) {
+                jsArr[count] = js;
+                tmp[count] = c;
+                count++;
+            } else {
+                (*env)->DeleteLocalRef(env, js);
+            }
+        }
+    }
+    socks5_server_set_bind_addrs(tmp, count);
+    for (int i = 0; i < count; i++) {
+        (*env)->ReleaseStringUTFChars(env, jsArr[i], tmp[i]);
+        (*env)->DeleteLocalRef(env, jsArr[i]);
+    }
+
     ServerArgs *args = malloc(sizeof(ServerArgs));
     args->port = (int)port;
     g_server_running = 1;
@@ -131,7 +158,7 @@ JNIEXPORT jstring JNICALL native_test_native_5g(JNIEnv *env, jobject thiz, jint 
 
 static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
-    {"startSocks5Server", "(I)Ljava/lang/String;", (void *)native_start_socks5_server},
+    {"startSocks5Server", "(I[Ljava/lang/String;)Ljava/lang/String;", (void *)native_start_socks5_server},
     {"stopSocks5Server", "()Ljava/lang/String;", (void *)native_stop_socks5_server},
     {"setSocks5Auth", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *)native_set_socks5_auth},
     {"testNative5G", "(I)Ljava/lang/String;", (void *)native_test_native_5g},

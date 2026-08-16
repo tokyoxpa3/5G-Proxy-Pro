@@ -14,6 +14,8 @@ import kotlinx.coroutines.*
 import java.io.Closeable
 
 class Socks5ProxyService : Service() {
+
+    enum class ProxyStatus { STARTING, RUNNING, PAUSED, RESTARTING, STOPPED, FAILED }
     
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     @Volatile
@@ -22,6 +24,8 @@ class Socks5ProxyService : Service() {
     private var isRestarting = false
     @Volatile
     private var proxyPaused = false
+    @Volatile
+    private var stopRequested = false
     private var wakeLock: android.os.PowerManager.WakeLock? = null
     
     private val networkManager by lazy { 
@@ -31,6 +35,29 @@ class Socks5ProxyService : Service() {
     private var cellularNetwork: android.net.Network? = null
 
     private val activeSockets = java.util.concurrent.ConcurrentHashMap<Int, Any>()
+
+    private class DnsEntry(val addresses: List<java.net.InetAddress>, val expiresAt: Long)
+    private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, DnsEntry>()
+    private val dnsCacheLock = Any()
+
+    @Synchronized
+    private fun resolveWithCache(network: android.net.Network, host: String): List<java.net.InetAddress> {
+        val key = host.lowercase()
+        val now = System.currentTimeMillis()
+        val hit = dnsCache[key]
+        if (hit != null && hit.expiresAt > now) return hit.addresses
+        if (dnsCache.size >= 256) dnsCache.clear()
+        val addresses = try {
+            network.getAllByName(host)
+                .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
+                .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+        } catch (e: Exception) {
+            if (hit != null) return hit.addresses
+            emptyList()
+        }
+        if (addresses.isNotEmpty()) dnsCache[key] = DnsEntry(addresses, now + 5 * 60 * 1000L)
+        return addresses
+    }
     
     companion object {
         const val TAG = "Socks5ProxyService"
@@ -39,7 +66,18 @@ class Socks5ProxyService : Service() {
         const val ACTION_START_PROXY = "START_PROXY"
         const val ACTION_STOP_PROXY = "STOP_PROXY"
         const val EXTRA_PORT = "PROXY_PORT"
-        var isServiceRunning = false
+        @Volatile var isServiceRunning = false
+
+        @Volatile var currentStatus = ProxyStatus.STOPPED
+        @Volatile var lastErrorMessage: String? = null
+        @Volatile var onStatusChanged: ((ProxyStatus) -> Unit)? = null
+
+        // 允許監聽的 LAN 介面前綴（Wi-Fi / 熱點 / USB 分享 / 乙太網路 / 藍牙 PAN）。
+        // 刻意排除所有行動網路介面（rmnet/ccmni/wwan 等），避免代理暴露到 5G 網段。
+        private val LAN_IFACE_PREFIXES = listOf(
+            "wlan", "wl", "ap", "sap", "swlan", "softap",
+            "rndis", "usb", "ncm", "eth", "bnep", "p2p", "up"
+        )
     }
     
     override fun onCreate() {
@@ -80,14 +118,21 @@ class Socks5ProxyService : Service() {
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val port = intent?.getIntExtra(EXTRA_PORT, 1080) ?: 1080 
+        // 不使用 START_STICKY：系統重啟服務時若帶 null intent（無使用者意圖），
+        // 直接停止，避免代理在「使用者已停止」後被悄悄重新啟動。
+        if (intent?.action == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val port = intent.getIntExtra(EXTRA_PORT, 1080)
         
-        if (intent?.action == ACTION_STOP_PROXY) {
+        if (intent.action == ACTION_STOP_PROXY) {
             stopProxy()
         } else {
-            startProxy(port) 
+            stopRequested = false
+            startProxy(port)
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
     
     override fun onBind(intent: Intent?): IBinder? = null
@@ -106,9 +151,10 @@ class Socks5ProxyService : Service() {
     }
     
     private fun startProxy(port: Int) {
-        if (isProxyRunning) return
+        if (stopRequested || isProxyRunning) return
         isServiceRunning = true
         proxyPaused = false
+        updateStatus(ProxyStatus.STARTING)
         startForeground(NOTIFICATION_ID, createNotification(getString(R.string.notification_proxying), getString(R.string.notification_init_network)), 
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         
@@ -116,7 +162,8 @@ class Socks5ProxyService : Service() {
             try {
                 isProxyRunning = true
                 val network = withTimeoutOrNull(15000) { networkManager.requestCellularNetwork() }
-                if (network == null) { stopSelf(); return@launch }
+                if (network == null) { failStop(getString(R.string.error_cellular_unavailable)); return@launch }
+                if (stopRequested) { stopSelf(); return@launch }
                 cellularNetwork = network
                 
                 // 監控電信端切換 5G IP / 網路重建事件，偵測到變更時自動恢復代理
@@ -135,7 +182,19 @@ class Socks5ProxyService : Service() {
                 val authPass = prefs.getString("auth_pass", "") ?: ""
                 NativeEngine.setSocks5Auth(authUser, authPass)
                 
-                NativeEngine.startSocks5Server(port)
+                // 只綁定 LAN 介面（Wi-Fi/熱點/USB 分享），絕不綁到行動網路
+                val bindAddrs = collectLanBindAddresses()
+                if (bindAddrs.isEmpty()) {
+                    failStop(getString(R.string.error_no_lan_interface))
+                    return@launch
+                }
+                Log.i(TAG, "SOCKS5 listener bind addresses: ${bindAddrs.joinToString()}")
+                val startResult = NativeEngine.startSocks5Server(port, bindAddrs)
+                if (startResult != "Started") {
+                    failStop(getString(R.string.error_native_start, startResult))
+                    return@launch
+                }
+                if (stopRequested) { try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}; stopSelf(); return@launch }
 
                 launch {
                     var consecutiveFailures = 0
@@ -158,22 +217,67 @@ class Socks5ProxyService : Service() {
                 }
 
                 launch {
-                    while (isProxyRunning) {
+                    while (isProxyRunning && !stopRequested) {
                         delay(10000)
+                        if (stopRequested || !isProxyRunning) break
                         if (NativeEngine.isLibraryLoaded() && !isNativeThreadAlive(port) && !isRestarting) {
                              Log.e(TAG, "偵測到 Native 引擎異常停止，嘗試重啟...")
-                             isProxyRunning = false
-                             try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}
-                             startProxy(port)
+                             restartProxy(port)
                              break
                         }
                     }
                 }
 
+                updateStatus(ProxyStatus.RUNNING)
                 val nm = getSystemService(NotificationManager::class.java)
                 nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.status_proxy_running), getString(R.string.notification_locked_format, port)))
-            } catch (e: Exception) { stopSelf() }
+            } catch (e: Exception) { failStop(e.message) }
         }
+    }
+
+    private fun updateStatus(status: ProxyStatus) {
+        currentStatus = status
+        try { onStatusChanged?.invoke(status) } catch (e: Exception) {}
+    }
+
+    private fun failStop(message: String?) {
+        Log.e(TAG, "代理啟動失敗: ${message ?: "unknown"}")
+        lastErrorMessage = message
+        isProxyRunning = false
+        proxyPaused = false
+        isServiceRunning = false
+        updateStatus(ProxyStatus.FAILED)
+        try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}
+        try { networkManager.releaseCellularNetwork() } catch (e: Exception) {}
+        cellularNetwork = null
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /**
+     * 收集可安全綁定的 LAN 位址：僅限 Wi-Fi / 熱點 / USB 分享等本機區域網路介面，
+     * 排除 loopback、link-local 與任何行動網路介面，防止代理暴露在 5G 網段。
+     */
+    private fun collectLanBindAddresses(): Array<String> {
+        val result = linkedSetOf<String>()
+        try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return emptyArray()
+            for (nif in interfaces) {
+                if (!nif.isUp || nif.isLoopback) continue
+                val name = nif.name.lowercase()
+                if (!LAN_IFACE_PREFIXES.any { name.startsWith(it) }) continue
+                for (addr in nif.inetAddresses) {
+                    if (addr.isLoopbackAddress || addr.isLinkLocalAddress || addr.isAnyLocalAddress) continue
+                    var ip = addr.hostAddress ?: continue
+                    val zone = ip.indexOf('%')
+                    if (zone >= 0) ip = ip.substring(0, zone)
+                    result.add(ip)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "收集 LAN 綁定位址失敗", e)
+        }
+        return result.toTypedArray()
     }
     
     /**
@@ -199,8 +303,9 @@ class Socks5ProxyService : Service() {
      * 但不會停止服務與前台通知。
      */
     private fun restartProxy(port: Int) {
-        if (isRestarting || (!isProxyRunning && !proxyPaused)) return
+        if (stopRequested || isRestarting || (!isProxyRunning && !proxyPaused)) return
         isRestarting = true
+        updateStatus(ProxyStatus.RESTARTING)
         serviceScope.launch {
             try {
                 Log.w(TAG, "開始重建代理：停止舊代理並釋放舊 socket...")
@@ -211,6 +316,7 @@ class Socks5ProxyService : Service() {
                     if (it is Closeable) try { it.close() } catch (e: Exception) {} 
                 }
                 activeSockets.clear()
+                dnsCache.clear()
                 cellularNetwork = null
                 
                 val nm = getSystemService(NotificationManager::class.java)
@@ -236,7 +342,9 @@ class Socks5ProxyService : Service() {
             if (it is Closeable) try { it.close() } catch (e: Exception) {} 
         }
         activeSockets.clear()
+        dnsCache.clear()
         cellularNetwork = null
+        updateStatus(ProxyStatus.PAUSED)
         val nm = getSystemService(NotificationManager::class.java)
         nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.notification_waiting_network), getString(R.string.notification_waiting_network)))
     }
@@ -259,6 +367,13 @@ class Socks5ProxyService : Service() {
     
     private fun stopProxy() {
         if (!isProxyRunning && !proxyPaused) return
+        // 同步設定停止旗標：watchdog / restart 邏輯會立即停止動作，
+        // 避免「使用者按下停止」與「自動重啟」競態造成殭屍 listener。
+        stopRequested = true
+        isProxyRunning = false
+        proxyPaused = false
+        isServiceRunning = false
+        updateStatus(ProxyStatus.STOPPED)
         serviceScope.launch {
             try {
                 NativeEngine.stopSocks5Server()
@@ -269,10 +384,8 @@ class Socks5ProxyService : Service() {
                     if (it is Closeable) try { it.close() } catch(e: Exception){} 
                 }
                 activeSockets.clear()
+                dnsCache.clear()
                 
-                isProxyRunning = false
-                proxyPaused = false
-                isServiceRunning = false
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             } catch (e: Exception) { stopSelf() }
@@ -300,9 +413,7 @@ class Socks5ProxyService : Service() {
                 fd
             }
             else {
-                val addresses = network.getAllByName(host)
-                    .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
-                    .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+                val addresses = resolveWithCache(network, host)
                 if (addresses.isEmpty()) return -1
                 var socket: java.net.Socket? = null
                 for (addr in addresses) {
@@ -340,9 +451,11 @@ class Socks5ProxyService : Service() {
     override fun onDestroy() {
         wakeLock?.let { if (it.isHeld) it.release() }
         serviceScope.cancel()
+        stopRequested = true
         isProxyRunning = false
         proxyPaused = false
         isServiceRunning = false
+        updateStatus(ProxyStatus.STOPPED)
         super.onDestroy()
     }
 }

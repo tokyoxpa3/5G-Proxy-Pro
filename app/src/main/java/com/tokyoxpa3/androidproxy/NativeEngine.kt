@@ -42,7 +42,7 @@ object NativeEngine {
         onSocketClosed?.invoke(fd)
     }
     
-    external fun startSocks5Server(port: Int): String
+    external fun startSocks5Server(port: Int, bindAddrs: Array<String>): String
     external fun stopSocks5Server(): String
     external fun setSocks5Auth(user: String, pass: String): String
     external fun testNative5G(fd: Int): String
