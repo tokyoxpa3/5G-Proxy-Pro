@@ -1,0 +1,3 @@
+- Fix: DNS resolution now has a 3-second timeout; a degraded 5G network can no longer stall all handshake threads and block new connections
+- Fix: shortened connect timeout (5s to 3s) so failed targets release handshake threads faster
+- Reliability: burst traffic (e.g. speed tests) no longer exhausts the handshake thread pool

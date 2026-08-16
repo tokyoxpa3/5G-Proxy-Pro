@@ -39,6 +39,9 @@ class Socks5ProxyService : Service() {
     private class DnsEntry(val addresses: List<java.net.InetAddress>, val expiresAt: Long)
     private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, DnsEntry>()
     private val dnsCacheLock = Any()
+    private val dnsExecutor = java.util.concurrent.Executors.newFixedThreadPool(4) { r ->
+        Thread(r, "socks5-dns").apply { isDaemon = true }
+    }
 
     @Synchronized
     private fun resolveWithCache(network: android.net.Network, host: String): List<java.net.InetAddress> {
@@ -47,10 +50,19 @@ class Socks5ProxyService : Service() {
         val hit = dnsCache[key]
         if (hit != null && hit.expiresAt > now) return hit.addresses
         if (dnsCache.size >= 256) dnsCache.clear()
+        // 5G 網路劣化時 DNS 可能長時間無回應；加上 3 秒 timeout，
+        // 避免 handshake 線程被 DNS 卡死（128 線程全滿時新連線會被直接拒絕）
         val addresses = try {
-            network.getAllByName(host)
-                .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
-                .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+            val future = dnsExecutor.submit<List<java.net.InetAddress>> {
+                network.getAllByName(host)
+                    .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
+                    .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+            }
+            try {
+                future.get(3, java.util.concurrent.TimeUnit.SECONDS)
+            } finally {
+                future.cancel(true)
+            }
         } catch (e: Exception) {
             if (hit != null) return hit.addresses
             emptyList()
@@ -423,7 +435,7 @@ class Socks5ProxyService : Service() {
                         candidate.sendBufferSize = 3 * 1024 * 1024
                         candidate.tcpNoDelay = true
                         network.bindSocket(candidate)
-                        val connectTimeout = if (addr is java.net.Inet4Address) 5000 else 1500
+                        val connectTimeout = if (addr is java.net.Inet4Address) 3000 else 1500
                         candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout)
                         socket = candidate
                         break
