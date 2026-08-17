@@ -25,17 +25,17 @@ extern void release_java_socket(int fd);
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-#define BUFFER_SIZE (256 * 1024)
+#define BUFFER_SIZE (64 * 1024)
 #define MAX_EVENTS 512
 #define WORKER_COUNT 4
 #define MAX_CONCURRENT_CONNS 1000 
-#define MAX_HANDSHAKE_THREADS 256
-#define IDLE_TIMEOUT_SEC 300 
+#define IDLE_TIMEOUT_SEC 300
+#define UDP_IDLE_TIMEOUT_SEC 60 
 
 static atomic_int g_conn_count = 0;
-static atomic_int g_handshake_count = 0;
 static int g_shutdown_pipe[2] = {-1, -1};
 
+static pthread_mutex_t g_auth_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_auth_user[256];
 static char g_auth_pass[256];
 static int g_auth_enabled = 0;
@@ -66,9 +66,9 @@ typedef struct {
 } worker_t;
 
 static worker_t workers[WORKER_COUNT];
-static volatile int server_running = 0;
+static atomic_int server_running = 0;
 static pthread_t listener_thread;
-static int next_worker_idx = 0;
+static atomic_int next_worker_idx = 0;
 
 #define MAX_LISTENERS 8
 #define MAX_BIND_ADDRS 16
@@ -175,7 +175,7 @@ static void* worker_loop_safe(void* arg) {
     struct epoll_event stop_ev; stop_ev.events = EPOLLIN; stop_ev.data.ptr = NULL;
     epoll_ctl(me->epoll_fd, EPOLL_CTL_ADD, g_shutdown_pipe[0], &stop_ev);
 
-    while (server_running) {
+    while (atomic_load(&server_running)) {
         garbage_count = 0;
         int nfds = epoll_wait(me->epoll_fd, events, MAX_EVENTS, 2000); // 縮短 wait 時間增加反應速度
         time_t now = time(NULL);
@@ -321,25 +321,35 @@ exit_worker:
 }
 
 static void handoff_to_worker(int client_fd, int target_fd) {
-    int idx = next_worker_idx;
-    next_worker_idx = (next_worker_idx + 1) % WORKER_COUNT;
+    // [item1] next_worker_idx 以 atomic 取用，避免多個 handshake 執行緒的資料競態
+    int idx = atomic_fetch_add(&next_worker_idx, 1) % WORKER_COUNT;
     worker_t *w = &workers[idx];
 
     full_conn_t *full = calloc(1, sizeof(full_conn_t));
-    if (!full) { close(client_fd); release_java_socket(target_fd); close(target_fd); return; }
+    if (!full) {
+        // [item3] 連線數已在 handle_handshake 預佔（CAS），此路徑需歸還
+        atomic_fetch_sub(&g_conn_count, 1);
+        close(client_fd); release_java_socket(target_fd); close(target_fd); return;
+    }
 
     // [關鍵] 先完全初始化，再加入鏈表
     full->client_fd = client_fd; 
     full->target_fd = target_fd;
     full->c2t_buf = malloc(BUFFER_SIZE); 
     full->t2c_buf = malloc(BUFFER_SIZE);
+    // [item3] 任一緩衝配置失敗即整條回收（destroy_connection 會關閉 fd、
+    // 釋放記憶體並歸還連線數額度），避免 c2t_buf 成功但 t2c_buf 失敗時洩漏
+    if (!full->c2t_buf || !full->t2c_buf) {
+        destroy_connection(full);
+        return;
+    }
     full->last_active = time(NULL);
     full->closed = 0;
     
     set_nonblocking(client_fd); set_nonblocking(target_fd);
     optimize_socket(client_fd); optimize_socket(target_fd);
     
-    atomic_fetch_add(&g_conn_count, 1);
+    // [item3] g_conn_count 已由 handle_handshake 預佔，此處不再重複累加
 
     full->client_events = EPOLLIN | EPOLLRDHUP;
     full->target_events = EPOLLIN | EPOLLRDHUP;
@@ -351,9 +361,22 @@ static void handoff_to_worker(int client_fd, int target_fd) {
 
     struct epoll_event ev;
     ev.events = full->client_events; ev.data.ptr = full;
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+    // [item7] epoll_ctl ADD 失敗時立即回收，避免 fd/記憶體洩漏
+    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) != 0) {
+        pthread_mutex_lock(&w->list_lock);
+        list_remove_locked(w, full);
+        pthread_mutex_unlock(&w->list_lock);
+        destroy_connection(full);
+        return;
+    }
     ev.events = full->target_events; ev.data.ptr = full;
-    epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev);
+    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev) != 0) {
+        pthread_mutex_lock(&w->list_lock);
+        list_remove_locked(w, full);
+        pthread_mutex_unlock(&w->list_lock);
+        destroy_connection(full);
+        return;
+    }
 }
 
 static void handle_udp_session_full(int client_fd) {
@@ -428,13 +451,13 @@ static void handle_udp_session_full(int client_fd) {
     // poll() 以 pollfd 陣列管理，無此上限。
     struct pollfd fds[4];
 
-    while (server_running) {
+    while (atomic_load(&server_running)) {
         fds[0].fd = g_shutdown_pipe[0]; fds[0].events = POLLIN; fds[0].revents = 0;
         fds[1].fd = client_fd;          fds[1].events = POLLIN; fds[1].revents = 0;
         fds[2].fd = local_udp_fd;       fds[2].events = POLLIN; fds[2].revents = 0;
         fds[3].fd = remote_udp_fd;      fds[3].events = POLLIN; fds[3].revents = 0;
 
-        int res = poll(fds, 4, IDLE_TIMEOUT_SEC * 1000);
+        int res = poll(fds, 4, UDP_IDLE_TIMEOUT_SEC * 1000);
         if (res <= 0) break; // 超時或錯誤
 
         if (fds[0].revents) break; // shutdown pipe
@@ -554,7 +577,7 @@ static void handle_udp_tcp_session(int client_fd) {
     send(client_fd, resp, 10, MSG_NOSIGNAL);
 
     // 取消 handshake 階段的 5 秒讀超時；blocking socket 由 poll 決定何時讀寫
-    struct timeval tv = {IDLE_TIMEOUT_SEC, 0};
+    struct timeval tv = {UDP_IDLE_TIMEOUT_SEC, 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
 
@@ -569,13 +592,13 @@ static void handle_udp_tcp_session(int client_fd) {
 
     struct sockaddr_in6 src6; socklen_t sl = sizeof(src6);
 
-    while (server_running) {
+    while (atomic_load(&server_running)) {
         struct pollfd fds[3];
         fds[0].fd = g_shutdown_pipe[0]; fds[0].events = POLLIN; fds[0].revents = 0;
         fds[1].fd = client_fd;          fds[1].events = POLLIN; fds[1].revents = 0;
         fds[2].fd = remote_udp_fd;      fds[2].events = POLLIN; fds[2].revents = 0;
 
-        int res = poll(fds, 3, IDLE_TIMEOUT_SEC * 1000);
+        int res = poll(fds, 3, UDP_IDLE_TIMEOUT_SEC * 1000);
         if (res <= 0) break; // 超時或錯誤
         if (fds[0].revents) break; // shutdown pipe
 
@@ -671,21 +694,25 @@ static void handle_udp_tcp_session(int client_fd) {
 void socks5_server_set_auth(const char *user, const char *pass) {
     // 安全原則：必須「同時」設定帳號與密碼才啟用認證。
     // 任一欄位留空 = 不啟用認證，避免「空值放行任意輸入」的漏洞。
+    // [item2] 以 mutex 保護，避免與 handshake 執行緒的讀取競態
+    pthread_mutex_lock(&g_auth_lock);
     if (!user || !pass || !user[0] || !pass[0]) {
         g_auth_enabled = 0;
         g_auth_user[0] = '\0';
         g_auth_pass[0] = '\0';
-        return;
+    } else {
+        strncpy(g_auth_user, user, sizeof(g_auth_user) - 1);
+        strncpy(g_auth_pass, pass, sizeof(g_auth_pass) - 1);
+        g_auth_user[sizeof(g_auth_user) - 1] = '\0';
+        g_auth_pass[sizeof(g_auth_pass) - 1] = '\0';
+        g_auth_enabled = 1;
     }
-    strncpy(g_auth_user, user, sizeof(g_auth_user) - 1);
-    strncpy(g_auth_pass, pass, sizeof(g_auth_pass) - 1);
-    g_auth_user[sizeof(g_auth_user) - 1] = '\0';
-    g_auth_pass[sizeof(g_auth_pass) - 1] = '\0';
-    g_auth_enabled = 1;
+    pthread_mutex_unlock(&g_auth_lock);
 }
 
 // RFC 1929 username/password 子協商。成功回傳 0，失敗回傳 -1（連線將被關閉）
-static int do_auth_check(int client_fd, unsigned char *buf) {
+// [item2] 帳密以參數傳入（handshake 開始時的鎖內快照），避免讀取過程被修改
+static int do_auth_check(int client_fd, unsigned char *buf, const char *auth_user, const char *auth_pass) {
     unsigned char ulen, plen;
 
     if (recv(client_fd, buf, 2, MSG_WAITALL) != 2 || buf[0] != 0x01) return -1;
@@ -703,18 +730,148 @@ static int do_auth_check(int client_fd, unsigned char *buf) {
     const unsigned char *pass = buf + 258;
 
     // 帳號與密碼都必須完全相符（啟用認證時兩欄皆非空，因此不再允許空值放行）
-    int user_ok = (ulen == (unsigned char)strlen(g_auth_user)) &&
-                  memcmp(user, g_auth_user, ulen) == 0;
-    int pass_ok = (plen == (unsigned char)strlen(g_auth_pass)) &&
-                  memcmp(pass, g_auth_pass, plen) == 0;
+    int user_ok = (ulen == (unsigned char)strlen(auth_user)) &&
+                  memcmp(user, auth_user, ulen) == 0;
+    int pass_ok = (plen == (unsigned char)strlen(auth_pass)) &&
+                  memcmp(pass, auth_pass, plen) == 0;
     int ok = user_ok && pass_ok;
 
     send(client_fd, ok ? "\x01\x00" : "\x01\x01", 2, MSG_NOSIGNAL);
     return ok ? 0 : -1;
 }
 
-static void* handle_handshake(void* arg) {
-    int client_fd = *(int*)arg; free(arg);
+// ================= 執行緒池（item10 改良版） =================
+// 取代「每條連線 spawn 一條執行緒」的作法：
+//  - 固定執行緒數 + 有界佇列 + 縮小 stack（128KB），burst 時以「丟棄連線」替代建立執行緒
+//  - 分兩個池：
+//      g_handshake_pool：只服務「短命」的 SOCKS5 握手（單次最多 5 秒 timeout）
+//      g_udp_pool：      服務「長命」的 UDP session（單次最多 UDP_IDLE_TIMEOUT_SEC）
+//  - 關鍵原因：5G-Proxy-Client 的 tun2socks 對每個 UDP socket（DNS / QUIC 443）
+//    都開一條 session，若與握手共用執行緒，64 條很快被 UDP session 佔死
+//    → 所有 TCP 握手排隊逾時 =「伺服器拒絕服務」。
+#define HANDSHAKE_POOL_SIZE 64
+#define HANDSHAKE_QUEUE_SIZE 1024
+#define UDP_POOL_SIZE 96
+#define UDP_QUEUE_SIZE 512
+#define HANDSHAKE_STACK_SIZE (128 * 1024)
+
+typedef struct {
+    int fd;
+    int cmd; // 0 = 握手；0x03/0x04 = UDP session 型態
+} pool_job_t;
+
+typedef struct {
+    pool_job_t *jobs;
+    int cap, head, tail, count;
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+    int stop;
+    pthread_t *threads;
+    int nthreads;
+    void (*handler)(pool_job_t);
+} job_pool_t;
+
+static job_pool_t g_handshake_pool;
+static job_pool_t g_udp_pool;
+
+static void handle_handshake_fd(int client_fd);
+
+// 佇列放入：滿時回傳 -1（呼叫者負責關閉 fd），不阻塞 listener
+static int job_pool_enqueue(job_pool_t *p, int fd, int cmd) {
+    pthread_mutex_lock(&p->lock);
+    if (p->stop || p->count >= p->cap) {
+        pthread_mutex_unlock(&p->lock);
+        return -1;
+    }
+    p->jobs[p->tail].fd = fd;
+    p->jobs[p->tail].cmd = cmd;
+    p->tail = (p->tail + 1) % p->cap;
+    p->count++;
+    pthread_cond_signal(&p->not_empty);
+    pthread_mutex_unlock(&p->lock);
+    return 0;
+}
+
+static void* job_pool_worker(void* arg) {
+    job_pool_t *p = (job_pool_t *)arg;
+    // [item4] 執行緒永久綁定 JVM，取代每次 JNI 呼叫的 attach/detach
+    jni_attach_thread();
+    for (;;) {
+        pool_job_t job;
+        pthread_mutex_lock(&p->lock);
+        while (p->count == 0 && !p->stop) {
+            pthread_cond_wait(&p->not_empty, &p->lock);
+        }
+        if (p->count == 0) { // stop 且佇列已清空
+            pthread_mutex_unlock(&p->lock);
+            break;
+        }
+        job = p->jobs[p->head];
+        p->head = (p->head + 1) % p->cap;
+        p->count--;
+        pthread_cond_signal(&p->not_full);
+        pthread_mutex_unlock(&p->lock);
+
+        p->handler(job);
+    }
+    jni_detach_thread();
+    return NULL;
+}
+
+static void job_pool_init(job_pool_t *p, int nthreads, int cap, void (*handler)(pool_job_t)) {
+    p->jobs = malloc(sizeof(pool_job_t) * cap);
+    p->threads = malloc(sizeof(pthread_t) * nthreads);
+    p->cap = cap; p->head = 0; p->tail = 0; p->count = 0; p->stop = 0;
+    p->nthreads = nthreads;
+    p->handler = handler;
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_cond_init(&p->not_empty, NULL);
+    pthread_cond_init(&p->not_full, NULL);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    // 可 join（shutdown 時等待全部結束）；stack 縮小省記憶體
+    pthread_attr_setstacksize(&attr, HANDSHAKE_STACK_SIZE);
+    for (int i = 0; i < nthreads; i++) {
+        pthread_create(&p->threads[i], &attr, job_pool_worker, p);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+static void job_pool_shutdown(job_pool_t *p) {
+    pthread_mutex_lock(&p->lock);
+    p->stop = 1;
+    pthread_cond_broadcast(&p->not_empty);
+    pthread_mutex_unlock(&p->lock);
+
+    // 等待所有 worker 結束（進行中的握手最多 5 秒 timeout，
+    // UDP session 會經由 shutdown pipe 立即退出）
+    for (int i = 0; i < p->nthreads; i++) {
+        pthread_join(p->threads[i], NULL);
+    }
+    pthread_mutex_destroy(&p->lock);
+    pthread_cond_destroy(&p->not_empty);
+    pthread_cond_destroy(&p->not_full);
+    free(p->jobs);
+    free(p->threads);
+}
+
+static void handle_handshake_job(pool_job_t job) {
+    handle_handshake_fd(job.fd);
+}
+
+static void handle_udp_job(pool_job_t job) {
+    if (job.cmd == 0x04) {
+        handle_udp_tcp_session(job.fd);
+    } else {
+        handle_udp_session_full(job.fd);
+    }
+}
+
+// 由握手池 worker 呼叫：握手完成後 TCP 轉交 epoll worker，
+// UDP / UDP-in-TCP 則轉交專用 UDP session 池（避免長命 session 佔死握手執行緒）
+static void handle_handshake_fd(int client_fd) {
     unsigned char buf[1024]; 
     struct timeval tv = {5, 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
@@ -725,7 +882,18 @@ static void* handle_handshake(void* arg) {
     if (recv(client_fd, buf, nmethods, MSG_WAITALL) != nmethods) goto err;
 
     // 認證方式選擇：開啟認證時只接受 0x02 (user/pass)，否則只接受 0x00 (no auth)
-    int desired_method = g_auth_enabled ? 0x02 : 0x00;
+    // [item2] 在鎖內快照帳密，確保與 do_auth_check 使用同一份一致性資料
+    int desired_method;
+    char auth_user[256] = {0};
+    char auth_pass[256] = {0};
+    pthread_mutex_lock(&g_auth_lock);
+    desired_method = g_auth_enabled ? 0x02 : 0x00;
+    if (desired_method == 0x02) {
+        memcpy(auth_user, g_auth_user, sizeof(auth_user) - 1);
+        memcpy(auth_pass, g_auth_pass, sizeof(auth_pass) - 1);
+    }
+    pthread_mutex_unlock(&g_auth_lock);
+
     int method_offered = 0;
     for (int i = 0; i < nmethods; i++) {
         if (buf[i] == desired_method) { method_offered = 1; break; }
@@ -734,9 +902,9 @@ static void* handle_handshake(void* arg) {
         send(client_fd, "\x05\xff", 2, MSG_NOSIGNAL);
         goto err;
     }
-    if (g_auth_enabled) {
+    if (desired_method == 0x02) {
         send(client_fd, "\x05\x02", 2, MSG_NOSIGNAL);
-        if (do_auth_check(client_fd, buf) != 0) goto err;
+        if (do_auth_check(client_fd, buf, auth_user, auth_pass) != 0) goto err;
     } else {
         send(client_fd, "\x05\x00", 2, MSG_NOSIGNAL);
     }
@@ -756,10 +924,16 @@ static void* handle_handshake(void* arg) {
 
     if (cmd == 0x01) { // TCP
         tv.tv_sec = 0; setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-        if (atomic_load(&g_conn_count) >= MAX_CONCURRENT_CONNS) goto err;
+        // [item3] CAS 預佔連線數額度（在耗時的 connect 之前），失敗立即歸還，
+        // 避免多執行緒同時通過檢查導致超限
+        if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
+            atomic_fetch_sub(&g_conn_count, 1);
+            goto err;
+        }
 
         int target_fd = request_java_5g_socket(host, port, 0);
         if (target_fd < 0) {
+            atomic_fetch_sub(&g_conn_count, 1);
             unsigned char fail[10] = {0x05, 0x04, 0, 0x01, 0,0,0,0, 0,0}; 
             send(client_fd, fail, 10, MSG_NOSIGNAL); 
             goto err;
@@ -770,21 +944,20 @@ static void* handle_handshake(void* arg) {
         // 轉交給 Worker
         handoff_to_worker(client_fd, target_fd);
         
-        atomic_fetch_sub(&g_handshake_count, 1);
-        return NULL;
-    } else if (cmd == 0x03) { // UDP
-        handle_udp_session_full(client_fd);
-        atomic_fetch_sub(&g_handshake_count, 1);
-        return NULL; 
-    } else if (cmd == 0x04) { // UDP-in-TCP（自訂擴充）
-        handle_udp_tcp_session(client_fd);
-        atomic_fetch_sub(&g_handshake_count, 1);
-        return NULL; 
+        return;
+    } else if (cmd == 0x03 || cmd == 0x04) { // UDP / UDP-in-TCP
+        // [UDP 池] 轉交專用 UDP session 池；池滿時回 REP=0x04 讓客戶端
+        // 退避/關閉，不讓長命 UDP session 佔死握手執行緒池
+        if (job_pool_enqueue(&g_udp_pool, client_fd, cmd) != 0) {
+            unsigned char fail[10] = {0x05, 0x04, 0, 0x01, 0,0,0,0, 0,0};
+            send(client_fd, fail, 10, MSG_NOSIGNAL);
+            close(client_fd);
+        }
+        return;
     }
 err:
     close(client_fd);
-    atomic_fetch_sub(&g_handshake_count, 1);
-    return NULL;
+    return;
 }
 
 typedef struct {
@@ -831,6 +1004,10 @@ static void* listener_task(void* arg) {
         pthread_create(&workers[i].thread_id, NULL, worker_loop_safe, &workers[i]);
     }
 
+    // [執行緒池] 握手池（短命任務）+ UDP session 池（長命任務）
+    job_pool_init(&g_handshake_pool, HANDSHAKE_POOL_SIZE, HANDSHAKE_QUEUE_SIZE, handle_handshake_job);
+    job_pool_init(&g_udp_pool, UDP_POOL_SIZE, UDP_QUEUE_SIZE, handle_udp_job);
+
     g_listener_count = 0;
 
     // 本機 loopback（供健康檢查與本機使用，不對外暴露）
@@ -854,7 +1031,7 @@ static void* listener_task(void* arg) {
 
     if (g_listener_count == 0) {
         LOGE("沒有可綁定的 LAN 位址，SOCKS5 伺服器無法啟動");
-        server_running = 0;
+        atomic_store(&server_running, 0);
         if (g_shutdown_pipe[1] != -1) {
             char stop_sig = 1;
             write(g_shutdown_pipe[1], &stop_sig, 1);
@@ -863,7 +1040,7 @@ static void* listener_task(void* arg) {
     }
 
     struct pollfd pfds[MAX_LISTENERS + 1];
-    while (server_running) {
+    while (atomic_load(&server_running)) {
         pfds[0].fd = g_shutdown_pipe[0]; pfds[0].events = POLLIN; pfds[0].revents = 0;
         int n = 1;
         for (int i = 0; i < g_listener_count; i++) {
@@ -880,17 +1057,13 @@ static void* listener_task(void* arg) {
                 int cfd = accept(pfds[i].fd, NULL, NULL);
                 if (cfd < 0) break; // EAGAIN / 已關閉
 
-                if (atomic_load(&g_handshake_count) >= MAX_HANDSHAKE_THREADS) {
+                // [執行緒池] 放入握手池佇列；佇列滿（burst/攻擊）時丟棄連線，
+                // 小睡避免 accept 迴圈空轉，不再建立無上限的執行緒
+                if (job_pool_enqueue(&g_handshake_pool, cfd, 0) != 0) {
                     close(cfd);
                     usleep(10000);
                     continue;
                 }
-
-                atomic_fetch_add(&g_handshake_count, 1);
-                pthread_t t; int* p = malloc(sizeof(int)); *p = cfd;
-                pthread_attr_t attr; pthread_attr_init(&attr);
-                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                pthread_create(&t, &attr, handle_handshake, p); pthread_attr_destroy(&attr);
             }
         }
     }
@@ -912,12 +1085,16 @@ void socks5_server_set_bind_addrs(const char **addrs, int count) {
     }
 }
 
+// [item6] 供 JNI 健康檢查直接讀取運行旗標，取代每 10 秒開真實 TCP 連線
+int socks5_server_is_running(void) {
+    return atomic_load(&server_running);
+}
+
 int socks5_server_main_dynamic(int port) {
-    if (server_running) return -1;
+    if (atomic_load(&server_running)) return -1;
     signal(SIGPIPE, SIG_IGN);
-    server_running = 1;
+    atomic_store(&server_running, 1);
     atomic_store(&g_conn_count, 0);
-    atomic_store(&g_handshake_count, 0);
     ListenerArgs *args = malloc(sizeof(ListenerArgs));
     args->port = port;
     pthread_create(&listener_thread, NULL, listener_task, args);
@@ -925,8 +1102,8 @@ int socks5_server_main_dynamic(int port) {
 }
 
 void socks5_server_quit(void) {
-    if (!server_running) return;
-    server_running = 0;
+    if (!atomic_load(&server_running)) return;
+    atomic_store(&server_running, 0);
 
     // 關閉所有 listener，立即釋放綁定的埠號
     for (int i = 0; i < g_listener_count; i++) {
@@ -936,13 +1113,17 @@ void socks5_server_quit(void) {
 
     if (g_shutdown_pipe[1] != -1) {
         char stop_sig = 1;
-        for(int k=0; k<10; k++) write(g_shutdown_pipe[1], &stop_sig, 1);
+        // 寫足量喚醒所有 poller（listener + 96 UDP worker + 64 握手 worker + 4 轉發 worker）
+        for(int k=0; k<200; k++) write(g_shutdown_pipe[1], &stop_sig, 1);
     }
     pthread_join(listener_thread, NULL);
     for (int i = 0; i < WORKER_COUNT; i++) {
         pthread_join(workers[i].thread_id, NULL);
         pthread_mutex_destroy(&workers[i].list_lock); // 銷毀鎖
     }
+    // [執行緒池] 停止並回收執行緒池（先等 listener 停止接受，池內任務排空後退出）
+    job_pool_shutdown(&g_handshake_pool);
+    job_pool_shutdown(&g_udp_pool);
     if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
     if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
 }

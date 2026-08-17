@@ -177,36 +177,4 @@ class CellularNetworkManager(private val context: Context) {
     }
     
     fun currentNetwork(): Network? = cellularNetwork
-    
-    fun hasCellularNetwork(): Boolean {
-        return try {
-            val activeNetwork = connectivityManager.activeNetwork
-            val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork)
-            val hasCellular = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
-            val hasInternet = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-            hasCellular && hasInternet
-        } catch (e: Exception) {
-            android.util.Log.e("CellularNetwork", "Error checking cellular network", e)
-            false
-        }
-    }
-    
-    fun getCurrentNetworkInfo(): String {
-        return try {
-            val targetNetwork = cellularNetwork ?: connectivityManager.activeNetwork
-            val capabilities = connectivityManager.getNetworkCapabilities(targetNetwork)
-            buildString {
-                append("Active Network (Target): ${targetNetwork?.hashCode() ?: "None"}\n")
-                append("Is Using Locked Cellular: ${cellularNetwork != null}\n")
-                append("Has Cellular: ${capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true}\n")
-                append("Has WiFi: ${capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true}\n")
-                append("Has Internet: ${capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true}\n")
-                append("Downstream Bandwidth (Est): ${capabilities?.linkDownstreamBandwidthKbps ?: 0} kbps\n")
-                append("Upstream Bandwidth (Est): ${capabilities?.linkUpstreamBandwidthKbps ?: 0} kbps\n")
-            }
-        } catch (e: Exception) {
-            android.util.Log.e("CellularNetwork", "Error getting network info", e)
-            "Error: ${e.message}"
-        }
-    }
 }

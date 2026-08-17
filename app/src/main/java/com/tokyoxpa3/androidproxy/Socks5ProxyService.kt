@@ -243,7 +243,7 @@ class Socks5ProxyService : Service() {
                     while (isProxyRunning && !stopRequested) {
                         delay(10000)
                         if (stopRequested || !isProxyRunning) break
-                        if (NativeEngine.isLibraryLoaded() && !isNativeThreadAlive(port) && !isRestarting) {
+                        if (NativeEngine.isLibraryLoaded() && !isNativeThreadAlive() && !isRestarting) {
                              Log.e(TAG, "偵測到 Native 引擎異常停止，嘗試重啟...")
                              restartProxy(port)
                              break
@@ -463,9 +463,11 @@ class Socks5ProxyService : Service() {
         } catch (e: Exception) { -1 }
     }
 
-    private fun isNativeThreadAlive(port: Int): Boolean {
+    private fun isNativeThreadAlive(): Boolean {
+        // [item6] 直接讀 C 層 atomic 旗標，取代每 10 秒開一條真實 TCP 連線
+        // （舊做法每次都會 spawn 一條 handshake 執行緒，造成無謂開銷）
         return try {
-            java.net.Socket("127.0.0.1", port).use { true }
+            NativeEngine.isSocks5ServerRunning()
         } catch (e: Exception) {
             false
         }

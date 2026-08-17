@@ -21,3 +21,12 @@ target_link_libraries(androidproxy
     atomic
     m
 )
+
+# [item9] Release 最佳化：-O3 + 函式/資料區段分離 + 連結時清除未使用程式碼
+# 以 generator expression 限定只在 Release 生效，Debug 維持可除錯的 -O0
+target_compile_options(androidproxy PRIVATE
+    $<$<CONFIG:Release>:-O3;-ffunction-sections;-fdata-sections>
+)
+target_link_options(androidproxy PRIVATE
+    $<$<CONFIG:Release>:-Wl,--gc-sections>
+)

@@ -21,6 +21,7 @@ extern int socks5_server_main_dynamic(int port);
 extern void socks5_server_quit(void);
 extern void socks5_server_set_auth(const char *user, const char *pass);
 extern void socks5_server_set_bind_addrs(const char **addrs, int count);
+extern int socks5_server_is_running(void);
 
 static pthread_t g_server_thread;
 static int g_server_running = 0;
@@ -152,8 +153,9 @@ JNIEXPORT jstring JNICALL native_set_socks5_auth(JNIEnv *env, jobject thiz, jstr
     return (*env)->NewStringUTF(env, "OK");
 }
 
-JNIEXPORT jstring JNICALL native_test_native_5g(JNIEnv *env, jobject thiz, jint fd) {
-    return (*env)->NewStringUTF(env, "OK");
+// [item6] 零成本健康檢查：直接讀取 C 層的 atomic 運行旗標
+JNIEXPORT jboolean JNICALL native_is_socks5_server_running(JNIEnv *env, jobject thiz) {
+    return (jboolean)(socks5_server_is_running() ? 1 : 0);
 }
 
 static const JNINativeMethod gMethods[] = {
@@ -161,7 +163,7 @@ static const JNINativeMethod gMethods[] = {
     {"startSocks5Server", "(I[Ljava/lang/String;)Ljava/lang/String;", (void *)native_start_socks5_server},
     {"stopSocks5Server", "()Ljava/lang/String;", (void *)native_stop_socks5_server},
     {"setSocks5Auth", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *)native_set_socks5_auth},
-    {"testNative5G", "(I)Ljava/lang/String;", (void *)native_test_native_5g},
+    {"isSocks5ServerRunning", "()Z", (void *)native_is_socks5_server_running},
 };
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
