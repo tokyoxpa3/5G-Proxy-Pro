@@ -1,0 +1,5 @@
+- Fix: dedicated UDP session pool (96 threads) - UDP sessions from tun2socks clients (DNS/QUIC) can no longer occupy handshake threads and cause "server refusing service"
+- Fix: UDP session idle timeout reduced 300s -> 60s; UDP pool overflow now returns REP=0x04 gracefully instead of hanging
+- Concurrency: fixed next_worker_idx data race, auth globals race, and connection limit TOCTOU (CAS reservation)
+- Performance: BUFFER_SIZE 64KB, permanent JVM attach for pool workers, native isSocks5ServerRunning() health check
+- Build: R8 minify + shrinkResources for release, CMake -O3 with section GC

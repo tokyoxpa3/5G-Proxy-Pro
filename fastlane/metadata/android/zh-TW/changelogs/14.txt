@@ -1,0 +1,5 @@
+- 修正：UDP session 改走獨立執行緒池（96 條），tun2socks 客戶端的大量 UDP session（DNS/QUIC）不再佔死握手執行緒導致「伺服器拒絕服務」
+- 修正：UDP session 閒置逾時 300 秒縮短至 60 秒；UDP 池滿時回覆 REP=0x04 優雅拒絕，不再讓連線乾等
+- 並發安全：修復 next_worker_idx 資料競態、認證全域變數競態、連線數上限 TOCTOU（CAS 預佔）
+- 效能：BUFFER_SIZE 縮小至 64KB、執行緒池 worker 永久綁定 JVM、原生健康檢查取代每 10 秒 TCP 探測
+- 建置：Release 啟用 R8 minify + shrinkResources、CMake -O3 與 section GC
