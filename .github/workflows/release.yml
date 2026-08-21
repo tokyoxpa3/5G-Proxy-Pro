@@ -55,6 +55,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          gh release create "$TAG" --title "$TAG" --target "${GITHUB_SHA}" --notes "Reproducible F-Droid build" 2>/dev/null || true
           gh release upload "$TAG" "$APK" --clobber
         env:
           GH_TOKEN: ${{ github.token }}
