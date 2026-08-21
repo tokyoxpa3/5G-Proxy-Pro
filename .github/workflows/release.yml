@@ -50,6 +50,13 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
           "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$APK"
 
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
       - name: Upload APK to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         run: |
