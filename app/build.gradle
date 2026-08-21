@@ -34,8 +34,10 @@ android {
             debuggable true
         }
         release {
-            minifyEnabled true
-            shrinkResources true
+            // minify/shrink disabled for reproducible F-Droid builds
+            // (F-Droid CI builds without R8, so this must match)
+            minifyEnabled false
+            shrinkResources false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             // 若根目錄存在 keystore.properties 則以正式金鑰簽名（自行發布用），
             // 否則不簽名，供 F-Droid 等第三方使用自己的金鑰簽署。
