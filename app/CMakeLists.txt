@@ -6,6 +6,7 @@ set(CMAKE_C_STANDARD 11)
 
 # 設定編譯標誌
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -latomic")
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--build-id=none")
 
 # 修正：移除重複的 native-lib.cpp
 # 只編譯 jni_bridge.c (JNI 入口) 和 simple-socks5.c (代理核心)
