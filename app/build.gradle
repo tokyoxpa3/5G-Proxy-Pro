@@ -65,6 +65,11 @@ android {
     
     ndkVersion "26.3.11579264"
 
+    dependenciesInfo {
+        // don't embed dependency metadata signing block; F-Droid scanner rejects it
+        includeInApk = false
+    }
+
     lintOptions {
         abortOnError false
         checkReleaseBuilds false
