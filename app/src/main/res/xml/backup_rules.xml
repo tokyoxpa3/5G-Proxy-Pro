@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <exclude domain="sharedpref" path="device_preferences.xml"/>
+    <!-- proxy_config.xml 內含 SOCKS5 帳號密碼，絕不可進入雲端備份或 adb backup -->
+    <exclude domain="sharedpref" path="proxy_config.xml"/>
 </full-backup-content>

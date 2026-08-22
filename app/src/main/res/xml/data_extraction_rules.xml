@@ -4,4 +4,9 @@
         <exclude domain="sharedpref" />
         <exclude domain="database" />
     </cloud-backup>
+    <!-- 裝置移轉亦不攜帶任何 SharedPreferences（含 SOCKS5 帳密） -->
+    <device-transfer>
+        <exclude domain="sharedpref" />
+        <exclude domain="database" />
+    </device-transfer>
 </data-extraction-rules>

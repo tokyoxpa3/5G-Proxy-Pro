@@ -148,8 +148,10 @@ static void destroy_connection(full_conn_t *conn) {
     // 關閉 FDs
     if (conn->client_fd >= 0) { close(conn->client_fd); conn->client_fd = -1; }
     if (conn->target_fd >= 0) { 
+        // target fd 由 Java 端擁有：notifySocketClosed 內的 socket.close() 已關閉
+        // 底層 fd（detachFd 只解除 PFD 的擁有權），C 端不得再 close —— 
+        // 兩次 close 之間 fd 編號可能已被其他執行緒重用，會誤關無關連線
         release_java_socket(conn->target_fd); // JNI Call
-        close(conn->target_fd); 
         conn->target_fd = -1; 
     }
     
@@ -329,7 +331,7 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     if (!full) {
         // [item3] 連線數已在 handle_handshake 預佔（CAS），此路徑需歸還
         atomic_fetch_sub(&g_conn_count, 1);
-        close(client_fd); release_java_socket(target_fd); close(target_fd); return;
+        close(client_fd); release_java_socket(target_fd); return;
     }
 
     // [關鍵] 先完全初始化，再加入鏈表
@@ -550,8 +552,7 @@ static void handle_udp_session_full(int client_fd) {
     }
     
     if(udp_buf) free(udp_buf);
-    release_java_socket(remote_udp_fd); 
-    close(remote_udp_fd); 
+    release_java_socket(remote_udp_fd); // fd 由 Java 端關閉，C 端不得再 close
     close(local_udp_fd); 
     close(client_fd);
     atomic_fetch_sub(&g_conn_count, 1);
@@ -583,8 +584,7 @@ static void handle_udp_tcp_session(int client_fd) {
 
     unsigned char *datagram = malloc(BUFFER_SIZE + 64);
     if (!datagram) {
-        release_java_socket(remote_udp_fd);
-        close(remote_udp_fd);
+        release_java_socket(remote_udp_fd); // fd 由 Java 端關閉，C 端不得再 close
         close(client_fd);
         atomic_fetch_sub(&g_conn_count, 1);
         return;
@@ -644,7 +644,10 @@ static void handle_udp_tcp_session(int client_fd) {
         // 5G UDP → 封裝成 frame → client（單一 send 送出 長度欄 + datagram）
         if (fds[2].revents) {
             sl = sizeof(src6);
-            int off = 22; // 預留空間給 IPv6 Header
+            // 前方預留 24 bytes：2-byte frame 長度欄 + 22-byte IPv6 SOCKS5 UDP 標頭。
+            // 非 v4-mapped IPv6 來源時 start = off - 22 = 2，長度欄寫在 datagram[0..1]；
+            // 若只預留 22，會寫到 datagram[-2] 腐蝕 heap（malloc metadata）
+            int off = 2 + 22;
             ssize_t r = recvfrom(remote_udp_fd, datagram + off, BUFFER_SIZE - off, 0,
                                  (struct sockaddr*)&src6, &sl);
             if (r > 0) {
@@ -685,8 +688,7 @@ static void handle_udp_tcp_session(int client_fd) {
     }
 
     free(datagram);
-    release_java_socket(remote_udp_fd);
-    close(remote_udp_fd);
+    release_java_socket(remote_udp_fd); // fd 由 Java 端關閉，C 端不得再 close
     close(client_fd);
     atomic_fetch_sub(&g_conn_count, 1);
 }
@@ -1117,13 +1119,15 @@ void socks5_server_quit(void) {
         for(int k=0; k<200; k++) write(g_shutdown_pipe[1], &stop_sig, 1);
     }
     pthread_join(listener_thread, NULL);
+    // [執行緒池] 必須在銷毀 worker 的 list_lock 之前停止並排空執行緒池：
+    // 池內的握手任務仍會呼叫 handoff_to_worker 去 lock worker 的 list_lock，
+    // 若先 join/destroy worker 再排水，等同對已銷毀的 mutex 上鎖（UB）
+    job_pool_shutdown(&g_handshake_pool);
+    job_pool_shutdown(&g_udp_pool);
     for (int i = 0; i < WORKER_COUNT; i++) {
         pthread_join(workers[i].thread_id, NULL);
         pthread_mutex_destroy(&workers[i].list_lock); // 銷毀鎖
     }
-    // [執行緒池] 停止並回收執行緒池（先等 listener 停止接受，池內任務排空後退出）
-    job_pool_shutdown(&g_handshake_pool);
-    job_pool_shutdown(&g_udp_pool);
     if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
     if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
 }

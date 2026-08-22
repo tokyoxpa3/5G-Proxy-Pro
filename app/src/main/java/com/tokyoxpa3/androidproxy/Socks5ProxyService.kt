@@ -183,6 +183,9 @@ class Socks5ProxyService : Service() {
         
         serviceScope.launch {
             try {
+                // 啟動協程開始執行時可能已收到停止指令（stopProxy 的旗標先於本協程設定），
+                // 立即退出，避免把 UI 已顯示「已停止」的狀態又翻回運行中
+                if (stopRequested) { stopSelf(); return@launch }
                 isProxyRunning = true
                 val network = withTimeoutOrNull(15000) { networkManager.requestCellularNetwork() }
                 if (network == null) { failStop(getString(R.string.error_cellular_unavailable)); return@launch }
@@ -270,7 +273,7 @@ class Socks5ProxyService : Service() {
         proxyPaused = false
         isServiceRunning = false
         updateStatus(ProxyStatus.FAILED)
-        try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}
+        stopNativeEngineSafely()
         try { networkManager.releaseCellularNetwork() } catch (e: Exception) {}
         cellularNetwork = null
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -334,7 +337,7 @@ class Socks5ProxyService : Service() {
                 Log.w(TAG, "開始重建代理：停止舊代理並釋放舊 socket...")
                 isProxyRunning = false
                 proxyPaused = false
-                try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}
+                stopNativeEngineSafely()
                 activeSockets.values.forEach { 
                     if (it is Closeable) try { it.close() } catch (e: Exception) {} 
                 }
@@ -360,7 +363,7 @@ class Socks5ProxyService : Service() {
         if (!isProxyRunning) return
         isProxyRunning = false
         proxyPaused = true
-        try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}
+        stopNativeEngineSafely()
         activeSockets.values.forEach { 
             if (it is Closeable) try { it.close() } catch (e: Exception) {} 
         }
@@ -388,18 +391,40 @@ class Socks5ProxyService : Service() {
         }
     }
     
+    /**
+     * 序列化 native 引擎的停止：stopProxy 的協程（IO）、pauseProxy/restartProxy
+     * 與 onDestroy（主執行緒）可能同時呼叫，而 native_stop_socks5_server 本身
+     * 非執行緒安全（兩個執行緒同時通過 running 檢查會對同一 pthread double join）。
+     */
+    @Synchronized
+    private fun stopNativeEngineSafely() {
+        try {
+            NativeEngine.stopSocks5Server()
+        } catch (e: Exception) {
+            Log.e(TAG, "stopSocks5Server failed", e)
+        }
+    }
+
     private fun stopProxy() {
-        if (!isProxyRunning && !proxyPaused) return
-        // 同步設定停止旗標：watchdog / restart 邏輯會立即停止動作，
-        // 避免「使用者按下停止」與「自動重啟」競態造成殭屍 listener。
+        // 停止旗標必須在所有 guard 之前設定：isProxyRunning 要等啟動協程實際
+        // 開始執行才會為 true，若停止指令落在這個視窗內，早退 guard 會吞掉
+        // 停止意圖，代理在使用者按下停止後照常啟動。startProxy 的各個檢查點
+        // 會讀取此旗標自行退出。
         stopRequested = true
+        if (!isProxyRunning && !proxyPaused) {
+            // 服務可能是被本 STOP intent 建立的（先前早已停止）：直接收掉，
+            // 否則 onCreate 拿走的 wakelock 與服務本身永遠不會釋放
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
         isProxyRunning = false
         proxyPaused = false
         isServiceRunning = false
         updateStatus(ProxyStatus.STOPPED)
         serviceScope.launch {
             try {
-                NativeEngine.stopSocks5Server()
+                stopNativeEngineSafely()
                 networkManager.releaseCellularNetwork()
                 cellularNetwork = null
                 
@@ -474,13 +499,26 @@ class Socks5ProxyService : Service() {
     }
 
     override fun onDestroy() {
-        wakeLock?.let { if (it.isHeld) it.release() }
-        serviceScope.cancel()
         stopRequested = true
         isProxyRunning = false
         proxyPaused = false
         isServiceRunning = false
+        // 兜底清理：服務可能未經 ACTION_STOP_PROXY 就被銷毀（系統回收等），
+        // 之後 serviceScope 已取消、stopProxy 的清理協程不會再執行，
+        // 必須在此同步釋放 native 引擎與所有資源，否則殭屍 listener 會持續佔用埠號。
+        // 引擎停止後才可清空 onSocketClosed —— 排空期間 native 執行緒仍需靠它關 fd。
+        stopNativeEngineSafely()
+        NativeEngine.socketProvider = null
+        NativeEngine.onSocketClosed = null
+        activeSockets.values.forEach {
+            if (it is Closeable) try { it.close() } catch (e: Exception) {}
+        }
+        activeSockets.clear()
+        try { networkManager.releaseCellularNetwork() } catch (e: Exception) {}
+        cellularNetwork = null
         updateStatus(ProxyStatus.STOPPED)
+        serviceScope.cancel()
+        wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
     }
 }

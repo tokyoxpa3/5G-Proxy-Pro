@@ -1,0 +1,6 @@
+- 修正：UDP-in-TCP 轉送回覆 IPv6 封包時的堆記憶體損壞（frame 長度欄寫到緩衝區前方）
+- 修正：上游 socket 雙重關閉 —— native 端不再重複關閉已由 Java 關閉的 fd，消除負載下隨機出現的 EBADF／連線重置
+- 修正：關機順序 —— 執行緒池改為在 worker mutex 銷毀前排水完成，停止時不再出現未定義行為
+- 修正：啟動視窗內送達的停止指令不再被無聲忽略；對閒置服務發送 STOP 也不再殘留服務與 wakelock
+- 修正：onDestroy 現在執行完整清理（native 引擎、socket、網路請求、JNI 回呼），作為殭屍監聽器的最後一道防線
+- 安全：SOCKS5 帳號密碼排除於雲端備份、裝置移轉與 adb backup 之外

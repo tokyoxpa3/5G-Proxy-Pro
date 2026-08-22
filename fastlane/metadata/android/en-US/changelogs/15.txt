@@ -1,0 +1,6 @@
+- Fix: heap corruption on every IPv6 reply in UDP-in-TCP relay (frame length prefix was written 2 bytes before the buffer start)
+- Fix: double-close of upstream sockets - native side no longer closes fds already closed by Java, eliminating random EBADF/connection resets under load
+- Fix: shutdown order - thread pools are now drained before worker mutexes are destroyed, preventing undefined behavior when stopping under traffic
+- Fix: Stop requests arriving during startup are no longer silently ignored; STOP intents sent to an idle service no longer leave a leaked service + wakelock
+- Fix: onDestroy now performs full cleanup (native engine, sockets, network request, JNI callbacks) as a last line of defense against zombie listeners
+- Security: SOCKS5 credentials excluded from cloud backup, device transfer and adb backup
