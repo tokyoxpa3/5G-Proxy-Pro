@@ -48,11 +48,28 @@ class Socks5ProxyService : Service() {
         )
 
     private fun resolveWithCache(network: android.net.Network, host: String): List<java.net.InetAddress> {
+        // [關鍵修復] IP 字面值最優先處理（NetRedirector 等 redirector 只送 IP），
+        // 不查 DNS、不進快取 —— 與 v1.5 getAllByName 的字面值行為一致
+        parseIpLiteral(host)?.let { return listOf(it) }
+
         val key = host.lowercase()
         val now = System.currentTimeMillis()
         val hit = dnsCache[key]
         if (hit != null && hit.expiresAt > now) return hit.addresses
         if (dnsCache.size >= 256) dnsCache.clear()
+        // [穩定性修復] DNS 查詢優先走 DnsResolver API（API 29+）：
+        // 舊路徑 network.getAllByName() 是不可中斷的阻塞呼叫，行動網路 DNS 劣化時
+        // 4 個 socks5-dns 執行緒會全部卡死（future.cancel 無法中斷底層解析），
+        // 新查詢只能靠 DiscardPolicy 快速失敗 —— 表現即「代理突然連不上」。
+        // DnsResolver 內建逾時 + CancellationSignal 可真正取消，不留卡死執行緒。
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            val resolved = resolveWithDnsResolver(network, host)
+            if (resolved != null) {
+                return cacheDns(key, now, resolved)
+            }
+            // DnsResolver 逾時/失敗 → 負快取後直接返回，不再落到可能卡死的舊路徑
+            return cacheDns(key, now, emptyList())
+        }
         // 5G 網路劣化時 DNS 可能長時間無回應；加上 1 秒 timeout，
         // 避免 handshake 線程被 DNS 卡死（線程池全滿時新連線會被直接拒絕）。
         // 注意：不能加 @Synchronized —— 否則所有 handshake 線程會在鎖上串行排隊，
@@ -74,12 +91,81 @@ class Socks5ProxyService : Service() {
             if (hit != null) return hit.addresses
             emptyList()
         }
-        if (addresses.isNotEmpty()) {
-            dnsCache[key] = DnsEntry(addresses, now + 5 * 60 * 1000L)
+        return cacheDns(key, now, addresses)
+    }
+
+    /** 正/負結果寫入快取：正向 5 分鐘、負向 3 秒 */
+    private fun cacheDns(key: String, now: Long, addresses: List<java.net.InetAddress>): List<java.net.InetAddress> {
+        dnsCache[key] = if (addresses.isNotEmpty()) {
+            DnsEntry(addresses, now + 5 * 60 * 1000L)
         } else {
-            dnsCache[key] = DnsEntry(emptyList(), now + 3 * 1000L)
+            DnsEntry(emptyList(), now + 3 * 1000L)
         }
         return addresses
+    }
+
+    /**
+     * [關鍵修復] IP 字面值直接解析，絕不進 DNS 流程。
+     * redirector / proxifier 型客戶端（NetRedirector 等）攔截的是應用程式已建立的
+     * TCP 連線目的地，CONNECT 只會帶 IP 位址（ATYP 0x01/0x04）沒有網域；
+     * DnsResolver.query() / getAllByName 對字面值的行為不同 —— 前者把它當網域查詢
+     * 必然失敗（REP=4），後者會本地解析。此函式僅在確定是字面值時做本地剖析，
+     * hostname 一律回 null 交給正常 DNS 路徑。
+     */
+    private fun parseIpLiteral(host: String): java.net.InetAddress? {
+        val looksLikeIpv4 = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""").matches(host)
+        val looksLikeIpv6 = host.contains(':') // IPv6 字面值必含冒號；hostname 不可能
+        if (!looksLikeIpv4 && !looksLikeIpv6) return null
+        return try {
+            java.net.InetAddress.getByName(host) // 字面值僅本地剖析，不觸發 DNS
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 以 DnsResolver API 解析（API 29+）：系統內建重試/逾時，CancellationSignal
+     * 可真正取消底層查詢。回傳 null 代表不支援或查詢逾時（呼叫端自行決定 fallback）。
+     */
+    private fun resolveWithDnsResolver(network: android.net.Network, host: String): List<java.net.InetAddress>? {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val answer = java.util.concurrent.atomic.AtomicReference<List<java.net.InetAddress>>()
+        val signal = android.os.CancellationSignal()
+        try {
+            val callback = object : android.net.DnsResolver.Callback<List<java.net.InetAddress>> {
+                override fun onAnswer(res: List<java.net.InetAddress>, rcode: Int) {
+                    answer.set(res)
+                    latch.countDown()
+                }
+
+                override fun onError(error: android.net.DnsResolver.DnsException) {
+                    latch.countDown()
+                }
+            }
+            android.net.DnsResolver.getInstance().query(
+                network,
+                host,
+                android.net.DnsResolver.FLAG_NO_RETRY,
+                java.util.concurrent.Executor { r -> r.run() }, // callback 只做原子寫入 + countDown，可直接在原執行緒執行
+                signal,
+                callback
+            )
+        } catch (e: Exception) {
+            return null
+        }
+        // 最多等 2 秒；逾時就取消底層查詢（與 handshake 可接受延遲相符）
+        val done = try {
+            latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: InterruptedException) {
+            false
+        }
+        if (!done) {
+            signal.cancel()
+            return null
+        }
+        val res = answer.get() ?: return emptyList()
+        return res.filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
+            .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
     }
     
     companion object {
@@ -129,13 +215,17 @@ class Socks5ProxyService : Service() {
         val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
         wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "5GProxy::WakeLock").apply { acquire() }
         
-        NativeEngine.onSocketClosed = { fd -> 
+        // [根因修復 v2 2026-08-23] fromSocket()+detachFd() 是「dup」語意：同一個
+        // socket 描述存在兩個 fd —— 原生（Socket 內部持有）與交給 C 的副本。
+        // 實測只關任一邊都會讓描述存活成 CLOSE_WAIT 幽靈（留在 epoll 永久就緒，
+        // level-triggered 事件風暴 = 過去 SIGSEGV 的源頭）。
+        // 因此 C 端 finalize 會 close 自己的副本後呼叫本 callback，
+        // 這裡負責收掉原生引用（socket.close()）並清理 map。
+        NativeEngine.onSocketClosed = { fd ->
             val socket = activeSockets.remove(fd)
+            android.util.Log.i("FdAudit", "released fd=$fd hadEntry=${socket != null} map=${activeSockets.size}")
             if (socket is Closeable) {
-                try { 
-                    socket.close() 
-                } catch (e: Exception) {
-                }
+                try { socket.close() } catch (e: Exception) {}
             }
         }
     }
@@ -463,29 +553,80 @@ class Socks5ProxyService : Service() {
             else {
                 val addresses = resolveWithCache(network, host)
                 if (addresses.isEmpty()) return -1
-                var socket: java.net.Socket? = null
+                // [穩定性修復] 並行競速連線（Happy Eyeballs）：
+                // 行動網路不穩時，舊版「逐個位址序列嘗試」會把逾時疊加
+                // （例：2×3000ms IPv4 + 2×1500ms IPv6 = 9 秒，最終全部失敗 → REP=4），
+                // 且弱訊號下單一位址的 SYN 容易丟失。改為同時對所有位址發起連線，
+                // 最先成功者勝出、其餘立即關閉 —— 最壞延遲從「總和」變成「單次逾時」，
+                // 成功率大幅提升。
+                val winner = java.util.concurrent.atomic.AtomicReference<java.net.Socket>()
+                val loserSockets = java.util.concurrent.ConcurrentLinkedQueue<java.net.Socket>()
+                val latch = java.util.concurrent.CountDownLatch(1)
+                // [根因修復 2026-08-23] abandoned：主執行緒逾時放棄後，稍晚才連上的
+                // 「遲到勝者」必須自行關閉，否則成為無人持有的洩漏 socket
+                // （電信商 IPv4 黑洞期間每次逾時都會製造一個，長時間運行下
+                //   FDSize 衝上 16384 的元兇之一）
+                val abandoned = java.util.concurrent.atomic.AtomicBoolean(false)
+                val connectTimeout = 5000L
+                val overallDeadline = connectTimeout + 500L
+
                 for (addr in addresses) {
-                    val candidate = java.net.Socket()
-                    try {
-                        candidate.receiveBufferSize = 3 * 1024 * 1024
-                        candidate.sendBufferSize = 3 * 1024 * 1024
-                        candidate.tcpNoDelay = true
-                        network.bindSocket(candidate)
-                        val connectTimeout = if (addr is java.net.Inet4Address) 3000 else 1500
-                        candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout)
-                        socket = candidate
-                        break
-                    } catch (e: Exception) {
-                        try { candidate.close() } catch (e2: Exception) {}
+                    val t = Thread {
+                        val candidate = java.net.Socket()
+                        try {
+                            if (winner.get() != null || abandoned.get()) return@Thread
+                            candidate.receiveBufferSize = 3 * 1024 * 1024
+                            candidate.sendBufferSize = 3 * 1024 * 1024
+                            candidate.tcpNoDelay = true
+                            network.bindSocket(candidate)
+                            candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout.toInt())
+                            if (winner.compareAndSet(null, candidate)) {
+                                if (abandoned.get()) {
+                                    // 主執行緒已放棄：自己關閉並讓出勝者位（不 countDown）
+                                    try { candidate.close() } catch (e: Exception) {}
+                                    winner.compareAndSet(candidate, null)
+                                    return@Thread
+                                }
+                                latch.countDown()
+                            } else {
+                                try { candidate.close() } catch (e: Exception) {}
+                            }
+                        } catch (e: Exception) {
+                            try { candidate.close() } catch (e2: Exception) {}
+                            loserSockets.add(candidate) // 確保關閉（close 後 add 僅為防漏）
+                        }
                     }
+                    t.isDaemon = true
+                    t.start()
                 }
-                if (socket == null) return -1
+
+                val got = try {
+                    latch.await(overallDeadline, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (e: InterruptedException) {
+                    false
+                }
+                val socket = winner.get()
+                if (!got || socket == null) {
+                    // 全部失敗/逾時：標記放棄後短暫等待，收回「恰在旗標生效前
+                    // 贏得 CAS 的遲到勝者」（否則它成為無人持有的洩漏 socket）
+                    abandoned.set(true)
+                    Thread.sleep(50)
+                    winner.getAndSet(null)?.let {
+                        try { it.close() } catch (e: Exception) {}
+                        android.util.Log.i("FdAudit", "late winner closed")
+                    }
+                    return -1
+                }
                 val pfd = android.os.ParcelFileDescriptor.fromSocket(socket)
                 val fd = pfd.detachFd()
                 activeSockets[fd] = socket
+                android.util.Log.i("FdAudit", "created fd=$fd map=${activeSockets.size}")
                 fd
             }
-        } catch (e: Exception) { -1 }
+        } catch (e: Exception) {
+            android.util.Log.e("FdAudit", "createSocket exception: ${e.javaClass.simpleName}: ${e.message}")
+            -1
+        }
     }
 
     private fun isNativeThreadAlive(): Boolean {

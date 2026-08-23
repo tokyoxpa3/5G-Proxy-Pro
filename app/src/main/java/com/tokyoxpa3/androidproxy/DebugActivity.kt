@@ -186,7 +186,8 @@ class DebugActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 64, 48, 48)
             setBackgroundColor(0xFFF8F9FA.toInt())
-            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            // 高度為 WRAP_CONTENT：外層 ScrollView（setContentView 處）負責填滿與捲動
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
         
         // Header
@@ -221,7 +222,8 @@ class DebugActivity : Activity() {
                 setTypeface(null, android.graphics.Typeface.BOLD)
             }
             portInput = EditText(context).apply {
-                setText("1080")
+                // 還原上次使用的埠號（旋轉/重啟 Activity 不會退回預設 1080）
+                setText(getSharedPreferences("proxy_config", Context.MODE_PRIVATE).getString("proxy_port", "1080") ?: "1080")
                 inputType = android.text.InputType.TYPE_CLASS_NUMBER
                 gravity = Gravity.CENTER
                 setPadding(32, 24, 32, 24)
@@ -238,6 +240,20 @@ class DebugActivity : Activity() {
             addView(label)
             addView(portInput)
         }
+
+        // 埠號即時持久化（比照帳密欄位的 TextWatcher 模式），
+        // 旋轉螢幕或 Activity 重建後不會靜默改回 1080
+        portInput.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                val value = s?.toString()?.trim().orEmpty()
+                if (value.isNotEmpty()) {
+                    getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
+                        .edit().putString("proxy_port", value).apply()
+                }
+            }
+        })
 
         // Auth Config (可選帳密，留空 = 無認證)
         val authPrefs = getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
@@ -399,8 +415,15 @@ class DebugActivity : Activity() {
             setOnClickListener { testRawFiveGSpeed() }
         }
         rootLayout.addView(debugTools)
-        
-        setContentView(rootLayout)
+
+        // 包 ScrollView：橫向或小螢幕時內容高度超過可視區域，
+        // 沒有捲動能力時 mainButton 會落在折疊線之下完全無法點擊
+        val scrollView = ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(0xFFF8F9FA.toInt())
+        }
+        scrollView.addView(rootLayout)
+        setContentView(scrollView)
     }
     
     private fun createCard() = LinearLayout(this).apply {
