@@ -1,0 +1,3 @@
+- 修正：移除 release 版噪音日誌（採樣 finalize、STILL-OPEN fcntl 誤判）並以 NDEBUG 控管 stats
+- 移除不準確的開發者測速（單連線 10MB/8s 上限將 500Mbps 誤判為 <100Mbps，不值得消耗流量）
+- Fastlane：優化中英文描述與搜尋關鍵字，新增 2 張手機截圖（1220x2712，178 裝置）

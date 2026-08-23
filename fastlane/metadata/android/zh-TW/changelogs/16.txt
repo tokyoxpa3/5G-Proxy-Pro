@@ -1,0 +1,3 @@
+- 修正：以世代戳記的 immortal slot table 取代 heap 分配，徹底消除 UAF 崩潰類別
+- 修正：fromSocket() dup 語意的雙邊關閉，修復 target socket CLOSE_WAIT 洩漏（每條代理連線皆洩漏）
+- 修正：幽靈註冊清除器（inode 掃描）+ 晚贏者 racing socket 回收，附生命週期統計便於驗證

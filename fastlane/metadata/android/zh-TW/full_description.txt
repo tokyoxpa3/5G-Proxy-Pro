@@ -1,15 +1,27 @@
-將手機鎖定到蜂巢式（5G/4G）網路，並在區域網路（Wi-Fi、熱點分享或 USB 分享）上開放 SOCKS5 代理伺服器，讓同網路的其他裝置可以透過手機的行動網路上網。
+把 5G 手機變成筆電、平板的專屬 SOCKS5 代理。免 root 將手機的 5G/4G 流量透過 Wi-Fi、熱點或 USB 分享給同網路的其他裝置。
 
-代理引擎採用原生 C 實作（epoll 多路複用），支援 TCP（CONNECT）與 UDP（ASSOCIATE），相容 IPv4、IPv6 及網域名稱解析。所有連線透過 Network.bindSocket() 強制綁定到蜂巢網路。心跳機制保持行動連線不斷線，健康檢查在引擎異常時自動重啟。
+適合：外出用筆電共享手機的吃到飽 5G、繞過飯店/商場 Wi-Fi 限制、讓 IoT/開發板走行動網路、或取得真實行動 IP 測試。
+
+功能特色：
+- 免 root，原生 C 引擎（epoll）— 高速穩定，支援 1000 並發連線
+- TCP（CONNECT）+ UDP（ASSOCIATE/UDP-in-TCP 0x04），支援 IPv4、IPv6、網域
+- 全部流量以 Network.bindSocket() 強制走蜂巢網路，Wi-Fi 僅作區域網路
+- 僅綁定區域網路（Wi-Fi/熱點/USB + 本機迴環健康檢查），絕不暴露在行動網路
+- 可選帳密認證（RFC 1929）：兩欄皆填才啟用，留空為開放代理（僅在可信任區域網路使用）
+- 自動心跳與健康檢查（每 10 秒）異常自動重啟，真實狀態回報，前景服務通知（Android 13+ 需 POST_NOTIFICATIONS）
+- 顯示 Wi-Fi/熱點/USB/行動網路 IP
+
+使用方式：
+1. 設定埠號（預設 1080）與帳密，點一鍵開啟
+2. App 顯示 Wi-Fi/熱點/USB 的代理位址
+3. 在另一裝置將 SOCKS5 代理設為該位址:埠號
 
 安全性：
-- 監聽器只綁定 LAN 介面（Wi-Fi / 熱點分享 / USB 分享），絕不暴露在行動網路介面上。
-- 可選帳號密碼認證（RFC 1929）：只有同時填寫帳號與密碼才會啟用認證。留空即為開放代理，請僅在信任的區域網路中使用。
-- 前景服務通知會顯示代理狀態。
+- 監聽器僅綁定區域網路，永不對行動網路開放
+- 帳密排除於雲端/裝置轉移/adb 備份
 
-網路使用說明：
-- connectivitycheck.gstatic.com/generate_204 - 行動網路健康檢查
-- api.ipify.org - 在 App 中顯示行動網路對外 IP
-- 測速伺服器（Linode/OVH/Hetzner/Tele2/ThinkBroadband） - 僅在使用開發者測速按鈕時連線
+網路使用說明（僅在下列時機）：
+- connectivitycheck.gstatic.com/generate_204 — 行動網路健康檢查
+- api.ipify.org — 按重新整理時顯示行動網路對外 IP
 
-另附行動網路測速工具。
+開源（MIT），可重現建置。

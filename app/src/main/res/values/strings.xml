@@ -12,7 +12,6 @@
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: Fetching...</string>
     <string name="hotspot_ip_fetching">🛰️ Hotspot IP: Fetching...</string>
     <string name="cellular_ip_fetching">📲 5G IP: Fetching...</string>
-    <string name="btn_dev_speed_test">🛠️ Developer Speed Test</string>
     <string name="btn_stop_proxy">🛑 Stop Proxy Service</string>
     <string name="status_proxy_running">✅ 5G Proxy Running</string>
     <string name="status_starting">🚀 Starting Service...</string>
@@ -42,9 +41,6 @@
     <string name="usb_tether_ip_disabled">🔌 USB Tether: Not Enabled</string>
     <string name="btn_refresh_status">🔄 Refresh Status</string>
     <string name="status_refreshing">🔄 Refreshing...</string>
-    <string name="speed_test_running">🏁 Running 5G Speed Test...</string>
-    <string name="speed_test_result">✅ Speed: %1$s Mbps</string>
-    <string name="speed_test_failed">❌ Speed Test Failed</string>
     <string name="notification_proxying">🚀 5G SOCKS5 Proxying</string>
     <string name="notification_init_network">Initializing 5G Network...</string>
     <string name="notification_locked_format">Locked 5G - Listening Port %1$d</string>

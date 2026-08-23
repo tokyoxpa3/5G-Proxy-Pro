@@ -36,17 +36,8 @@ class DebugActivity : Activity() {
     private lateinit var mainButton: Button
     
     private var isRunning = false
-    private var isSpeedTestRunning = false
     private var pendingNotificationPermission = false
     private val REQUEST_NOTIFICATION_PERMISSION = 1002
-    private val speedTestUrls = listOf(
-        "https://speedtest.singapore.linode.com/100MB-singapore.bin",
-        "https://speedtest.tokyo2.linode.com/100MB-tokyo2.bin",
-        "https://proof.ovh.net/files/100Mb.dat",
-        "https://speed.hetzner.de/100MB.bin",
-        "https://speedtest.tele2.net/100MB.zip",
-        "https://ipv4.downloader.thinkbroad.com/100MB.zip"
-    )
     private val networkManager by lazy { CellularNetworkManager(this) }
     private val ipChecker by lazy { PublicIPChecker() }
     private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -408,13 +399,6 @@ class DebugActivity : Activity() {
         rootLayout.addView(mainButton)
         rootLayout.addView(ipCard)
         rootLayout.addView(refreshButton)
-        
-        val debugTools = Button(this).apply {
-            text = getString(R.string.btn_dev_speed_test)
-            textSize = 12f
-            setOnClickListener { testRawFiveGSpeed() }
-        }
-        rootLayout.addView(debugTools)
 
         // 包 ScrollView：橫向或小螢幕時內容高度超過可視區域，
         // 沒有捲動能力時 mainButton 會落在折疊線之下完全無法點擊
@@ -596,61 +580,5 @@ class DebugActivity : Activity() {
         }
     }
 
-    private fun testRawFiveGSpeed() {
-        if (isSpeedTestRunning) return
-        isSpeedTestRunning = true
-        activityScope.launch(Dispatchers.Main) {
-            val network = withContext(Dispatchers.IO) { networkManager.requestCellularNetwork(15000) }
-            if (network == null) {
-                statusText.text = getString(R.string.speed_test_failed)
-                isSpeedTestRunning = false
-                return@launch
-            }
-            statusText.text = getString(R.string.speed_test_running)
-            withContext(Dispatchers.IO) {
-                try {
-                    var success = false
-                    for (testUrl in speedTestUrls) {
-                        try {
-                            val url = java.net.URL(testUrl)
-                            val conn = network.openConnection(url) as java.net.HttpURLConnection
-                            conn.connectTimeout = 8000
-                            conn.readTimeout = 5000
-                            conn.instanceFollowRedirects = true
-                            var total = 0L
-                            var startTime = 0L
-                            conn.inputStream.use { input ->
-                                val buf = ByteArray(256 * 1024)
-                                while (true) {
-                                    val r = input.read(buf)
-                                    if (r == -1) break
-                                    if (startTime == 0L) startTime = System.currentTimeMillis()
-                                    total += r
-                                    if (startTime != 0L && System.currentTimeMillis() - startTime > 10000) break
-                                }
-                            }
-                            if (startTime == 0L) continue
-                            val elapsedSec = (System.currentTimeMillis() - startTime) / 1000.0
-                            if (elapsedSec > 0.0 && total > 0L) {
-                                val mbps = (total * 8.0 / 1024 / 1024) / elapsedSec
-                                val result = String.format("%.2f", mbps)
-                                withContext(Dispatchers.Main) {
-                                    statusText.text = getString(R.string.speed_test_result, result)
-                                }
-                                success = true
-                                break
-                            }
-                        } catch (e: Exception) {
-                        }
-                    }
-                    if (!success) {
-                        withContext(Dispatchers.Main) { statusText.text = getString(R.string.speed_test_failed) }
-                    }
-                } finally {
-                    isSpeedTestRunning = false
-                    networkManager.releaseCellularNetwork()
-                }
-            }
-        }
-    }
+
 }

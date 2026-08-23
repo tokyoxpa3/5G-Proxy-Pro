@@ -1,0 +1,3 @@
+- Fix: immortal conn slot table with generation-stamped epoll events eliminates UAF class entirely (no free/reuse of heap)
+- Fix: dual-close for fromSocket()-dup target fds fixes CLOSE_WAIT leak (was leaking every proxied connection as ghost registration)
+- Fix: ghost-registration purger with inode scan + late-winner racing socket recovery, lifecycle stats for verification

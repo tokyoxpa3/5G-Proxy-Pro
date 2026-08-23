@@ -1,1 +1,1 @@
-Locks your phone to the cellular (5G/4G) network and exposes a SOCKS5 proxy server over Wi-Fi, so other devices can route their traffic through the phone's cellular connection.
+Share your phone's 5G/4G over Wi-Fi via SOCKS5 proxy. No root, TCP/UDP, LAN-only.

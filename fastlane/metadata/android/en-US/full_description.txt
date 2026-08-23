@@ -1,26 +1,27 @@
-Locks your phone to the cellular (5G/4G) network and exposes a SOCKS5
-proxy server on your local area network (Wi-Fi, hotspot or USB tethering),
-so other devices can route their traffic through the phone's cellular
-connection.
+Turn your 5G phone into a private SOCKS5 proxy for your laptop, tablet and other devices. Share your unlimited 5G/4G data over Wi-Fi, hotspot or USB tethering — no root required.
 
-The proxy engine is a native C implementation (epoll-based) supporting TCP
-(CONNECT) and UDP (ASSOCIATE) with IPv4, IPv6 and domain addresses. All
-connections are bound to the cellular network via Network.bindSocket().
-A heartbeat keeps the cellular link alive, and a health check restarts the
-engine automatically if it fails.
+Perfect for: sharing 5G to a laptop on the go, bypassing hotel/café Wi-Fi limits, giving IoT or dev boards cellular access, or getting a real mobile IP for testing.
+
+Features:
+- No root, native C engine (epoll) — fast, stable, up to 1000 concurrent connections
+- TCP (CONNECT) + UDP (ASSOCIATE and UDP-in-TCP 0x04) with IPv4, IPv6 and domain names
+- All traffic forced over cellular via Network.bindSocket(); Wi-Fi is LAN only
+- LAN-only listener (Wi-Fi / hotspot / USB + loopback health check) — never exposed on cellular
+- Optional username/password auth (RFC 1929): set both to enable, empty = open proxy (use on trusted LAN only)
+- Auto heartbeat & health check (every 10s) with auto-restart, real status callback, foreground notification with POST_NOTIFICATIONS on Android 13+
+- Display of Wi-Fi / hotspot / USB / cellular IPs
+
+How to use:
+1. Set port (default 1080) and optional auth, tap Start
+2. App shows proxy address for Wi-Fi / hotspot / USB
+3. On your other device set SOCKS5 proxy to that address:port
 
 Security:
-- The listener only binds to LAN interfaces (Wi-Fi / hotspot / USB
-  tethering); it is never exposed on the cellular interface.
-- Optional username/password authentication (RFC 1929): auth is enabled
-  only when both fields are set. Leave them empty for an open proxy, and
-  only use it on trusted local networks.
-- A foreground service notification shows the proxy status.
+- Listener binds only to LAN interfaces, never to cellular
+- Credentials excluded from cloud / device transfer / adb backup
 
-Network usage:
-- connectivitycheck.gstatic.com/generate_204 - cellular health check
-- api.ipify.org - displays the cellular public IP in the app
-- Speed test servers (Linode/OVH/Hetzner/Tele2/ThinkBroadband) - only when
-  using the developer speed test button
+Network usage (only when stated):
+- connectivitycheck.gstatic.com/generate_204 — cellular health check
+- api.ipify.org — show cellular public IP on Refresh
 
-A cellular speed test tool is also included.
+Open source (MIT), reproducible builds.

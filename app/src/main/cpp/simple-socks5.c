@@ -401,22 +401,6 @@ static void conn_finalize(full_conn_t *conn) {
     pthread_mutex_unlock(&w->list_lock);
 
     // 關閉 FDs（close 會自動把 fd 從所屬 epoll 移除）
-    // [Slot 診斷] 取樣記錄 finalize 的 fd 對應（每秒最多 1 筆）+ fstat 取 inode，
-    // 用於比對「C 端關閉的 fd/inode」與「核心中殘留的 CLOSE_WAIT socket」
-    int diag_cfd = conn->client_fd, diag_tfd = conn->target_fd;
-    {
-        static atomic_int fin_last_sec = 0;
-        int prev = atomic_load(&fin_last_sec);
-        int nows = (int)time(NULL);
-        if (nows != prev && atomic_compare_exchange_strong(&fin_last_sec, &prev, nows)) {
-            unsigned long long ci = 0, ti = 0;
-            struct stat st;
-            if (diag_cfd >= 0 && fstat(diag_cfd, &st) == 0) ci = (unsigned long long)st.st_ino;
-            if (diag_tfd >= 0 && fstat(diag_tfd, &st) == 0) ti = (unsigned long long)st.st_ino;
-            LOGI("finalize slot=%u gen=%u cfd=%d(ino=%llu) tfd=%d(ino=%llu) widx=%d",
-                 conn->slot, conn->gen, diag_cfd, ci, diag_tfd, ti, conn->widx);
-        }
-    }
     if (conn->client_fd >= 0) { close(conn->client_fd); conn->client_fd = -1; }
     if (conn->target_fd >= 0) {
         // [根因修復 v2 2026-08-23] 實測（HyperOS/Android 15 單連線追蹤）：
@@ -429,19 +413,6 @@ static void conn_finalize(full_conn_t *conn) {
         close(conn->target_fd);
         release_java_socket(conn->target_fd); // Java 端 socket.close() 收掉原生 fd
         conn->target_fd = -1;
-    }
-    // [Slot 診斷] close 後驗證：fd 應變為 EBADF。若仍有效代表同一開啟描述
-    // 另有 dup 引用存在（核心不會真正釋放 socket）→ 直接證據
-    {
-        static atomic_int chk_last_sec = 0;
-        int prevc = atomic_load(&chk_last_sec);
-        int nowc = (int)time(NULL);
-        if (nowc != prevc && atomic_compare_exchange_strong(&chk_last_sec, &prevc, nowc)) {
-            int c_ok = (diag_cfd >= 0 && fcntl(diag_cfd, F_GETFL) != -1);
-            int t_ok = (diag_tfd >= 0 && fcntl(diag_tfd, F_GETFL) != -1);
-            if (c_ok || t_ok)
-                LOGE("STILL-OPEN after close: cfd=%d(%d) tfd=%d(%d)", diag_cfd, c_ok, diag_tfd, t_ok);
-        }
     }
 
     if (conn->c2t_buf) { free(conn->c2t_buf); conn->c2t_buf = NULL; }
@@ -631,9 +602,8 @@ static void* worker_loop_safe(void* arg) {
             pthread_mutex_unlock(&me->list_lock);
             last_check_time = now;
 
-            // [Slot 修復] 每 30 秒由 worker 0 輸出生命週期統計：
-            // 無 tombstone 的崩潰事後無法驗屍，改靠持續的 logcat 軌跡定位。
-            // stale_skip > 0 = 幽靈事件存在且被正確防禦（舊設計下即 SIGSEGV）
+            // [Slot 修復] 生命週期統計僅在 debug 版輸出（release 版不刷 logcat）
+#ifndef NDEBUG
             static time_t last_stats = 0;
             if (my_widx == 0 && now - last_stats >= 30) {
                 last_stats = now;
@@ -643,6 +613,7 @@ static void* worker_loop_safe(void* arg) {
                      (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
                      (long long)atomic_load(&g_st_exhausted), (long long)atomic_load(&g_st_ghost_purged));
             }
+#endif
         }
 
         // 3. 執行垃圾回收 (在鎖外，安全執行 JNI)
