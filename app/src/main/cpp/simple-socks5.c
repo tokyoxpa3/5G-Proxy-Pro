@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -14,11 +16,15 @@
 #include <signal.h>
 #include <android/log.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <time.h>
 
 extern void jni_attach_thread();
 extern void jni_detach_thread();
 extern int request_java_5g_socket(const char* host, int port, int is_udp);
+// [根因修復 v2] fromSocket() 是 dup 語意：C 與 Java 各持一個 fd 引用同一描述，
+// 釋放時必須「雙邊各關各的」——close() 關 C 的副本，release_java_socket() 讓
+// Java socket.close() 收掉原生引用。只關任一邊都會洩漏成 CLOSE_WAIT 幽靈。
 extern void release_java_socket(int fd);
 
 #define LOG_TAG "SimpleSocks5"
@@ -29,8 +35,11 @@ extern void release_java_socket(int fd);
 #define MAX_EVENTS 512
 #define WORKER_COUNT 4
 #define MAX_CONCURRENT_CONNS 1000 
+// [Slot 修復] 槽位總數必須 > MAX_CONCURRENT_CONNS（握手 CAS 預佔額度後才取槽）
+#define CONN_SLOT_COUNT 1088
 #define IDLE_TIMEOUT_SEC 300
 #define UDP_IDLE_TIMEOUT_SEC 60 
+#define CONN_MAGIC 0x5EEDF00Du   // 存活 conn 的驗證值；release 時毒化為 0
 
 static atomic_int g_conn_count = 0;
 static int g_shutdown_pipe[2] = {-1, -1};
@@ -41,31 +50,249 @@ static char g_auth_pass[256];
 static int g_auth_enabled = 0;
 
 typedef struct full_conn_t {
+    // [Slot 修復] epoll 事件不再攜帶 malloc 位址，改攜帶 (gen<<32 | slot_idx)。
+    // gen 為該槽位的世代編號，每次重新啟用時 +1；殘留事件的 gen 與現值不符
+    // 即為舊連線的幽靈事件，直接跳過。因為槽位記憶體永不釋放，讀取永遠安全，
+    // 「殘留事件撞上重用記憶體」的 UAF 在結構上不可能發生。
+    uint32_t magic;
     int client_fd;
     int target_fd;
-    unsigned char *c2t_buf; 
-    unsigned char *t2c_buf; 
+    unsigned char *c2t_buf;
+    unsigned char *t2c_buf;
     ssize_t c2t_len, c2t_off;
     ssize_t t2c_len, t2c_off;
-    int closed; // 標記是否已進入關閉流程
+    int closed; // 標記是否已進入關閉流程（由 list_lock 保護）
     int client_eof; // 客戶端已 FIN（半關閉）: 停止讀取但繼續轉發 target→client
     time_t eof_since; // client_eof 的起始時間（grace period 用）
     uint32_t client_events;
     uint32_t target_events;
-    
+
+    // [H2 修復] 引用計數：handoff（握手執行緒）與 worker 並發持有同一 conn，
+    // 任何一方都可能在另一方還在使用時決定銷毀；refs 歸零才真正釋放
+    atomic_int refs;
+    // [H2 修復] finalized 防護旗標：conn_finalize 只允許執行一次。
+    // 即使 refs 帳目因未來改動出錯，也絕不會二次退休 → double-free
+    atomic_int finalized;
+    // [H2 修復] 兩個 epoll_ctl ADD 都完成前，worker 必須忽略此 conn 的事件
+    // （ADD 進行中事件若提前送達，會與 handoff 的初始化競態）
+    atomic_int registered;
+
     time_t last_active;
     struct full_conn_t *next;
     struct full_conn_t *prev;
+    int widx; // [H2 修復] 擁有此 conn 的 worker 索引（退休鏈路由該 worker 的鎖保護）
+    // [Slot 修復] 槽位識別
+    int slot;              // 屬於哪個槽位（finalize 釋放槽位用）
+    uint32_t gen;          // 目前世代（事件驗證用）
+    uint64_t ep_u64;       // 寫入 epoll data.u64 的完整識別碼，MOD 時重用
 } full_conn_t;
 
 typedef struct {
     int epoll_fd;
     pthread_t thread_id;
-    full_conn_t *conn_list_head; 
-    pthread_mutex_t list_lock; // [關鍵修改] 保護鏈表結構的鎖
+    full_conn_t *conn_list_head;
+    pthread_mutex_t list_lock; // [關鍵] 保護鏈表結構的鎖
 } worker_t;
 
+// [H2 修復] workers 陣列必須宣告在槽位表之後：finalize/handoff 都會以
+// `w - workers` 計算 worker 索引（原先宣告在 132 行會導致編譯錯誤）
 static worker_t workers[WORKER_COUNT];
+
+// ================= [Slot 修復] 固定槽位表 =================
+// 舊退休機制（conn 進 retirement 鏈延遲 16 世代後 free）只能「機率性」防護：
+// 實測殘留事件仍可能在 >16 個迭代後送達，此時 free 過的記憶體已被重用，
+// 新 conn 若恰好落在同一 worker，magic/widx 全部通過 → 幽靈事件處理錯誤連線
+// （SEGV_ACCERR fault addr 0xb4...0058 = tagged heap 上 offset 0x58/refs 欄位）。
+//
+// 根本改法：所有 conn 本體放在靜態槽位表，**永不 malloc/free**。
+// epoll 事件攜帶 (gen<<32|slot)，gen 於槽位重用時遞增；幽靈事件 gen 不符即棄。
+// 記憶體永遠合法 → 讀取不可能 SEGV；世代檢查 → 不可能處理到錯的連線。
+static full_conn_t g_slots[CONN_SLOT_COUNT];
+static atomic_int g_slot_state[CONN_SLOT_COUNT]; // 1 = 使用中, 0 = 空閒
+static int g_free_slots[CONN_SLOT_COUNT];        // 空閒槽位堆疊
+static int g_free_slot_top = 0;
+static pthread_mutex_t g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// [Slot 修復] 生命週期統計：無 tombstone 的崩潰難以診斷，改由計數器 +
+// logcat 即時異常記錄提供證據（stale_skip > 0 代表確實存在幽靈事件）
+static atomic_llong g_st_acquired = 0, g_st_released = 0;
+static atomic_llong g_st_stale_skip = 0;   // gen 不符被跳過的事件數（關鍵指標）
+static atomic_llong g_st_bad_slot = 0;     // slot 越界 / 槽位未啟用
+static atomic_llong g_st_exhausted = 0;    // 槽位耗盡次數
+static atomic_llong g_st_double_fin = 0;   // 二次 finalize 嘗試
+static atomic_llong g_st_ghost_purged = 0; // 幽靈註冊被強制拔除次數
+
+// 取得空閒槽位並遞增世代。回傳 slot 索引，耗盡回傳 -1。
+// 只在 handoff_to_worker（握手池執行緒）呼叫。
+static int slot_acquire(void) {
+    pthread_mutex_lock(&g_slot_lock);
+    if (g_free_slot_top == 0) {
+        pthread_mutex_unlock(&g_slot_lock);
+        atomic_fetch_add(&g_st_exhausted, 1);
+        return -1;
+    }
+    int idx = g_free_slots[--g_free_slot_top];
+    uint32_t new_gen = ++g_slots[idx].gen; // 重用即換代：舊事件全部作廢
+    pthread_mutex_unlock(&g_slot_lock);
+
+    // 發佈前重置整個結構（取代 calloc 的歸零語意）；gen 已在鎖內更新須保留
+    memset(&g_slots[idx], 0, sizeof(full_conn_t));
+    g_slots[idx].gen = new_gen;
+    g_slots[idx].slot = idx;
+    atomic_store(&g_slot_state[idx], 1);
+    atomic_fetch_add(&g_st_acquired, 1);
+    return idx;
+}
+
+// 歸還槽位（conn_finalize 尾端呼叫；呼叫者不得再碰此 conn）
+static void slot_release(int idx) {
+    atomic_store(&g_slot_state[idx], 0);
+    pthread_mutex_lock(&g_slot_lock);
+    g_free_slots[g_free_slot_top++] = idx;
+    pthread_mutex_unlock(&g_slot_lock);
+    atomic_fetch_add(&g_st_released, 1);
+}
+
+static void slots_init(void) {
+    for (int i = 0; i < CONN_SLOT_COUNT; i++) {
+        // gen 單調遞增不重設：避免前一個服務週期的殘留事件（同 gen 值）在
+        // 重啟後誤配。初值 1：data.u64==0（slot0+gen0）保留給 shutdown pipe
+        if (g_slots[i].gen == 0) g_slots[i].gen = 1;
+        atomic_store(&g_slot_state[i], 0);
+        g_free_slots[i] = i;
+    }
+    g_free_slot_top = CONN_SLOT_COUNT;
+}
+
+// [Slot 診斷] 卡死事件追蹤：同一 u64 被連續跳過 N 次代表某個 fd 卡在 epoll 裡
+// （正常殘留事件只出現一兩次就消失）。用小雜湊表記錄，門檻到達時大聲記 log。
+#define STUCK_TRACK_SLOTS 512
+#define STUCK_TRACK_MASK (STUCK_TRACK_SLOTS - 1)
+typedef struct { uint64_t u64; long long count; time_t last_log; int used; } stuck_ent_t;
+static stuck_ent_t g_stuck[STUCK_TRACK_SLOTS];
+
+// [幽靈清除器] 記錄每個註冊戳記對應的 fd 對。當某戳記的殘留事件超過門檻
+//（代表其底層 fd 因任何未知路徑仍開著且永久就緒），直接對兩個記錄的 fd 做
+// EPOLL_CTL_DEL —— 無論洩漏根源為何，熱迴圈都會被切斷（DEL 對已關閉/未註冊
+// 的 fd 只是無害失敗）。環形覆寫，只需涵蓋近期註冊。
+#define STAMP_RING_SIZE 4096
+#define STAMP_RING_MASK (STAMP_RING_SIZE - 1)
+typedef struct {
+    uint64_t u64;
+    int client_fd;
+    int target_fd;
+    int widx;
+    unsigned long long c_ino, t_ino;   // 註冊當下的 inode（跨 dup 引用比對用）
+} stamp_ent_t;
+static stamp_ent_t g_stamp_ring[STAMP_RING_SIZE];
+static atomic_int g_stamp_ring_pos = 0;
+static pthread_mutex_t g_stamp_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void stamp_record(uint64_t u64, int client_fd, int target_fd, int widx) {
+    struct stat st;
+    unsigned long long ci = 0, ti = 0;
+    if (client_fd >= 0 && fstat(client_fd, &st) == 0) ci = ((unsigned long long)st.st_dev << 32) | st.st_ino;
+    if (target_fd >= 0 && fstat(target_fd, &st) == 0) ti = ((unsigned long long)st.st_dev << 32) | st.st_ino;
+    pthread_mutex_lock(&g_stamp_lock);
+    int pos = atomic_fetch_add(&g_stamp_ring_pos, 1) & STAMP_RING_MASK;
+    g_stamp_ring[pos].u64 = u64;
+    g_stamp_ring[pos].client_fd = client_fd;
+    g_stamp_ring[pos].target_fd = target_fd;
+    g_stamp_ring[pos].widx = widx;
+    g_stamp_ring[pos].c_ino = ci;
+    g_stamp_ring[pos].t_ino = ti;
+    pthread_mutex_unlock(&g_stamp_lock);
+}
+
+// [幽靈清除器 v2] epoll 註冊錨定在「開啟描述」而非 fd 編號：若 conn 的 C 端副本
+// 已關閉但另一個 dup 引用（如 Java 端原生 fd）仍存活，DEL(舊編號) 會 ENOENT，
+// 幽靈註冊繼續發事件。因此這裡改以「inode 反查」：掃描 /proc/self/fd 找出
+// 仍指向同一描述的任何 fd 編號，對其執行 DEL —— 無論倖存引用是誰都拔得掉。
+static int stamp_purge(uint64_t u64) {
+    int found = 0;
+    unsigned long long cino = 0, tino = 0;
+    int cfd = -1, tfd = -1;
+    struct epoll_event ev;
+    pthread_mutex_lock(&g_stamp_lock);
+    for (int i = 0; i < STAMP_RING_SIZE; i++) {
+        if (g_stamp_ring[i].u64 == u64) {
+            cino = g_stamp_ring[i].c_ino; tino = g_stamp_ring[i].t_ino;
+            cfd = g_stamp_ring[i].client_fd; tfd = g_stamp_ring[i].target_fd;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_stamp_lock);
+    if (!found) return 0;
+
+    // 直接編號先試（多數情況描述已死、編號未重用）
+    for (int w = 0; w < WORKER_COUNT; w++) {
+        if (cfd >= 0) epoll_ctl(workers[w].epoll_fd, EPOLL_CTL_DEL, cfd, &ev);
+        if (tfd >= 0) epoll_ctl(workers[w].epoll_fd, EPOLL_CTL_DEL, tfd, &ev);
+    }
+
+    // [節流] inode 掃描成本高（opendir + 每個 fd fstat），全域每 200ms 限一次；
+    // 幽靈事件在掃描前仍會被 gen/state 檢查擋下，只是延後拔除，正確性不受影響
+    static atomic_llong g_last_scan_ms = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    long long prev_ms = atomic_load(&g_last_scan_ms);
+    if (now_ms - prev_ms < 200) return 1;
+    if (!atomic_compare_exchange_strong(&g_last_scan_ms, &prev_ms, now_ms)) return 1;
+
+    // inode 反查：掃 /proc/self/fd，對每個數值 fd 做 fstat 比對 dev:ino
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return 1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int n = atoi(de->d_name);
+        if (n < 0) continue;
+        struct stat st2;
+        if (fstat(n, &st2) != 0) continue;
+        unsigned long long id = ((unsigned long long)st2.st_dev << 32) | st2.st_ino;
+        if ((cino && id == cino) || (tino && id == tino)) {
+            for (int w = 0; w < WORKER_COUNT; w++)
+                epoll_ctl(workers[w].epoll_fd, EPOLL_CTL_DEL, n, &ev);
+        }
+    }
+    closedir(d);
+    return 1;
+}
+
+#define GHOST_PURGE_THRESHOLD 5000
+
+static void stuck_track(int my_widx, int epoll_fd, uint64_t u64, const char *why,
+                        uint32_t egen, uint32_t gennow, uint32_t magicv, int widx_v,
+                        uint32_t ev, time_t now) {
+    stuck_ent_t *e = &g_stuck[(u64 >> 13) & STUCK_TRACK_MASK];
+    if (!e->used || e->u64 != u64) {
+        // 槽被別的 u64 佔走或首次：直接重置（碰撞時統計略低估可接受）
+        e->u64 = u64; e->count = 0; e->used = 1; e->last_log = 0;
+    }
+    e->count++;
+    long long c = e->count;
+    if ((c == 32 || c == 200 || c == 1000 || c == 5000 || c == 25000 ||
+         (c > 25000 && (c % 50000) == 0)) && now - e->last_log >= 1) {
+        e->last_log = now;
+        LOGE("STUCK %s u64=%llx slot=%u gen_evt=%u gen_now=%u magic=%x widx=%d events=%x count=%lld",
+             why, (unsigned long long)u64, (uint32_t)(u64 & 0xFFFFFFFFu),
+             egen, gennow, magicv, widx_v, ev, c);
+    }
+    // [幽靈清除器] 同一戳記殘留過多 = 底層 fd 未被正常回收且永久就緒，
+    // 主動從所有 worker 的 epoll 拔除，杜絕熱迴圈（fd 本體留給洩漏追蹤）
+    if (c == GHOST_PURGE_THRESHOLD || (c > GHOST_PURGE_THRESHOLD && (c % GHOST_PURGE_THRESHOLD) == 0)) {
+        int purged = stamp_purge(u64);
+        if (purged) {
+            atomic_fetch_add(&g_st_ghost_purged, 1);
+            LOGE("GHOST PURGED u64=%llx slot=%u after %lld residual events",
+                 (unsigned long long)u64, (uint32_t)(u64 & 0xFFFFFFFFu), c);
+            e->count = 0; // 重置計數，若又出現代表另有來源
+        }
+    }
+}
+
 static atomic_int server_running = 0;
 static pthread_t listener_thread;
 static atomic_int next_worker_idx = 0;
@@ -131,50 +358,122 @@ static void update_conn_events(int epoll_fd, full_conn_t *full) {
     if (full->t2c_len == 0) t_ev |= EPOLLIN;
     if (full->c2t_len > 0)  t_ev |= EPOLLOUT;
 
+    // [Slot 修復] 事件攜帶 (gen<<32|slot)，MOD 時必須重用同一識別碼
     if (full->client_events != c_ev) {
-        struct epoll_event ev; ev.events = c_ev; ev.data.ptr = full;
+        struct epoll_event ev; ev.events = c_ev; ev.data.u64 = full->ep_u64;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, full->client_fd, &ev) == 0) full->client_events = c_ev;
     }
     if (full->target_events != t_ev) {
-        struct epoll_event ev; ev.events = t_ev; ev.data.ptr = full;
+        struct epoll_event ev; ev.events = t_ev; ev.data.u64 = full->ep_u64;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, full->target_fd, &ev) == 0) full->target_events = t_ev;
     }
 }
 
-// 銷毀連線的輔助函數 (必須在無鎖狀態下調用，因為含 JNI)
-static void destroy_connection(full_conn_t *conn) {
-    if (!conn) return;
-    
-    // 關閉 FDs
-    if (conn->client_fd >= 0) { close(conn->client_fd); conn->client_fd = -1; }
-    if (conn->target_fd >= 0) { 
-        // target fd 由 Java 端擁有：notifySocketClosed 內的 socket.close() 已關閉
-        // 底層 fd（detachFd 只解除 PFD 的擁有權），C 端不得再 close —— 
-        // 兩次 close 之間 fd 編號可能已被其他執行緒重用，會誤關無關連線
-        release_java_socket(conn->target_fd); // JNI Call
-        conn->target_fd = -1; 
+// [H2 修復] 引用計數輔助：refs 歸零的一方負責銷毀。fd 與緩衝立即釋放，
+// conn 槽位標記為空閒（[Slot 修復] 本體記憶體永不釋放，無退休鏈）。
+// 注意呼叫方：conn->closed 必須已為 1（殘留事件讀到 closed=1 會 skip）
+//
+// [H2 修復 v2] refs 語意簡化為「base ref = 1」：slot_acquire 後由 handoff 設定，
+// 任何路徑恰好 unref 一次。
+// 成功路徑：handoff 不扣、worker 扣（step-3 垃圾回收）→ 1→0 finalize。
+// add_failed（handoff 搶到鎖）：handoff 扣一次 → 1→0 finalize。
+// add_failed（worker 先收集）：worker 扣一次，handoff 不扣 → 1→0 finalize。
+// 緩衝失敗：handoff 扣一次 → 1→0 finalize。
+static void conn_finalize(full_conn_t *conn) {
+    // finalized 防護：任何殘留的重複 unref 都不得二次 finalize
+    if (atomic_exchange(&conn->finalized, 1) != 0) {
+        atomic_fetch_add(&g_st_double_fin, 1);
+        LOGE("WARN: conn_finalize called twice slot=%d gen=%u", conn->slot, conn->gen);
+        return; // 防止二次釋放槽位 / 二次關閉 fd
     }
-    
-    // 釋放記憶體
+
+    // 防禦性：若 conn 仍掛在 worker 鏈表上（理論上不該發生），先移除再釋放，
+    // 確保 conn 不會在鏈表中被重用（timeout 掃描會讀到不一致的 next/prev）。
+    // magic 毒化在同一個鎖內、移除之後執行：
+    // 保證「已毒化卻仍在鏈表上」的狀態不存在（掃描不會撞見半釋放的 conn）
+    worker_t *w = &workers[conn->widx];
+    pthread_mutex_lock(&w->list_lock);
+    if (conn->next || conn->prev || w->conn_list_head == conn) {
+        list_remove_locked(w, conn);
+        LOGI("conn_finalize: removed still-linked conn slot=%d from worker %d", conn->slot, conn->widx);
+    }
+    conn->magic = 0;
+    pthread_mutex_unlock(&w->list_lock);
+
+    // 關閉 FDs（close 會自動把 fd 從所屬 epoll 移除）
+    // [Slot 診斷] 取樣記錄 finalize 的 fd 對應（每秒最多 1 筆）+ fstat 取 inode，
+    // 用於比對「C 端關閉的 fd/inode」與「核心中殘留的 CLOSE_WAIT socket」
+    int diag_cfd = conn->client_fd, diag_tfd = conn->target_fd;
+    {
+        static atomic_int fin_last_sec = 0;
+        int prev = atomic_load(&fin_last_sec);
+        int nows = (int)time(NULL);
+        if (nows != prev && atomic_compare_exchange_strong(&fin_last_sec, &prev, nows)) {
+            unsigned long long ci = 0, ti = 0;
+            struct stat st;
+            if (diag_cfd >= 0 && fstat(diag_cfd, &st) == 0) ci = (unsigned long long)st.st_ino;
+            if (diag_tfd >= 0 && fstat(diag_tfd, &st) == 0) ti = (unsigned long long)st.st_ino;
+            LOGI("finalize slot=%u gen=%u cfd=%d(ino=%llu) tfd=%d(ino=%llu) widx=%d",
+                 conn->slot, conn->gen, diag_cfd, ci, diag_tfd, ti, conn->widx);
+        }
+    }
+    if (conn->client_fd >= 0) { close(conn->client_fd); conn->client_fd = -1; }
+    if (conn->target_fd >= 0) {
+        // [根因修復 v2 2026-08-23] 實測（HyperOS/Android 15 單連線追蹤）：
+        // ParcelFileDescriptor.fromSocket() 是「DUP」語意 —— 同一個 socket
+        // 開啟描述存在兩個 fd：原生 fd（java.net.Socket 內部持有）與 detachFd()
+        // 交給 C 的副本。只關任一個，另一個都會讓描述存活成 CLOSE_WAIT，
+        // 留在 epoll 永久就緒 → level-triggered 事件風暴 → 舊設計下殘留事件
+        // 撞重用記憶體 = SIGSEGV 的真正源頭。
+        // 因此必須雙邊各關各的：C 關自己的副本，並通知 Java 關 Socket（原生）。
+        close(conn->target_fd);
+        release_java_socket(conn->target_fd); // Java 端 socket.close() 收掉原生 fd
+        conn->target_fd = -1;
+    }
+    // [Slot 診斷] close 後驗證：fd 應變為 EBADF。若仍有效代表同一開啟描述
+    // 另有 dup 引用存在（核心不會真正釋放 socket）→ 直接證據
+    {
+        static atomic_int chk_last_sec = 0;
+        int prevc = atomic_load(&chk_last_sec);
+        int nowc = (int)time(NULL);
+        if (nowc != prevc && atomic_compare_exchange_strong(&chk_last_sec, &prevc, nowc)) {
+            int c_ok = (diag_cfd >= 0 && fcntl(diag_cfd, F_GETFL) != -1);
+            int t_ok = (diag_tfd >= 0 && fcntl(diag_tfd, F_GETFL) != -1);
+            if (c_ok || t_ok)
+                LOGE("STILL-OPEN after close: cfd=%d(%d) tfd=%d(%d)", diag_cfd, c_ok, diag_tfd, t_ok);
+        }
+    }
+
     if (conn->c2t_buf) { free(conn->c2t_buf); conn->c2t_buf = NULL; }
     if (conn->t2c_buf) { free(conn->t2c_buf); conn->t2c_buf = NULL; }
-    
-    free(conn);
+
     atomic_fetch_sub(&g_conn_count, 1);
+    int slot = conn->slot;
+    slot_release(slot); // [Slot 修復] 槽位回到空閒堆疊；本體記憶體永不釋放
+}
+
+static void conn_unref(full_conn_t *conn) {
+    if (!conn) return;
+    if (atomic_fetch_sub(&conn->refs, 1) == 1) {
+        conn_finalize(conn);
+    }
 }
 
 static void* worker_loop_safe(void* arg) {
     jni_attach_thread();
     worker_t *me = (worker_t*)arg;
+    int my_widx = (int)(me - workers); // 自身 worker 索引，用於殘留事件防禦
     struct epoll_event events[MAX_EVENTS];
     
     // 垃圾回收佇列 (用於在鎖外釋放資源)
     full_conn_t *garbage_list[MAX_EVENTS]; 
     int garbage_count = 0;
+    // [H2 修復] 退出路徑的批次回收佇列（宣告在頂端：goto exit_worker 會跳過標籤後宣告）
+    full_conn_t *collected[MAX_EVENTS];
 
     time_t last_check_time = time(NULL);
 
-    struct epoll_event stop_ev; stop_ev.events = EPOLLIN; stop_ev.data.ptr = NULL;
+    struct epoll_event stop_ev; stop_ev.events = EPOLLIN; stop_ev.data.u64 = 0;
     epoll_ctl(me->epoll_fd, EPOLL_CTL_ADD, g_shutdown_pipe[0], &stop_ev);
 
     while (atomic_load(&server_running)) {
@@ -184,10 +483,44 @@ static void* worker_loop_safe(void* arg) {
 
         // 1. 處理 I/O 事件
         for (int i = 0; i < nfds; i++) {
-            if (events[i].data.ptr == NULL) goto exit_worker; // Shutdown pipe event
-            
-            full_conn_t *full = (full_conn_t *)events[i].data.ptr;
-            if (full->closed) continue; // 已經標記刪除的忽略
+            if (events[i].data.u64 == 0) goto exit_worker; // Shutdown pipe event
+
+            // [Slot 修復] 事件解碼：低 32 位 = 槽位索引，高 32 位 = 事件發生時的世代。
+            // 槽位記憶體永不釋放，以下所有讀取都安全；世代不符 = 幽靈事件（殘留），
+            // 直接跳過 —— 不可能處理到已被重用的連線。
+            uint32_t sidx = (uint32_t)(events[i].data.u64 & 0xFFFFFFFFu);
+            uint32_t egen = (uint32_t)(events[i].data.u64 >> 32);
+            if (sidx >= CONN_SLOT_COUNT) {
+                // [Slot 診斷] 速率限制：每 worker 每秒最多 1 筆，避免熱迴圈灌爆 logcat
+                static time_t last_bad_log[WORKER_COUNT] = {0};
+                if (now - last_bad_log[my_widx] >= 1) {
+                    last_bad_log[my_widx] = now;
+                    LOGE("bad_slot idx=%llu raw_u64=%llx events=%x", (unsigned long long)sidx,
+                         (unsigned long long)events[i].data.u64, events[i].events);
+                }
+                atomic_fetch_add(&g_st_bad_slot, 1);
+                continue;
+            }
+            full_conn_t *full = &g_slots[sidx];
+            if (!atomic_load(&g_slot_state[sidx])) {
+                stuck_track(my_widx, me->epoll_fd, events[i].data.u64, "inactive", egen,
+                            g_slots[sidx].gen, g_slots[sidx].magic, g_slots[sidx].widx,
+                            events[i].events, now);
+                atomic_fetch_add(&g_st_bad_slot, 1);
+                continue;
+            }
+            if (egen != full->gen || full->magic != CONN_MAGIC) {
+                // 幽靈事件：正常情況下 gen 遞增後舊事件全部失效。此計數 > 0 證明
+                // 殘留事件確實存在且被正確防禦（舊設計下這正是 SIGSEGV 來源）
+                stuck_track(my_widx, me->epoll_fd, events[i].data.u64, "stale", egen,
+                            full->gen, full->magic, full->widx, events[i].events, now);
+                atomic_fetch_add(&g_st_stale_skip, 1);
+                continue;
+            }
+            if (full->widx != my_widx) continue;
+            // [H2 修復] closed 或尚未完成 epoll 註冊的連線一律跳過：
+            // handoff 的兩個 ADD 完成前，事件提前送達會與初始化競態
+            if (full->closed || !atomic_load(&full->registered)) continue;
 
             full->last_active = now;
             uint32_t ev = events[i].events;
@@ -276,7 +609,10 @@ static void* worker_loop_safe(void* arg) {
                 // 2. client 已半關閉且超過 2 秒 grace period（target 的 keep-alive
                 //    連線不會發 FIN，事件迴圈不會再觸發，必須靠這裡回收，
                 //    否則 CLOSE_WAIT 堆積消耗 fd）
-                if (!curr->closed && (now - curr->last_active > IDLE_TIMEOUT_SEC ||
+                // magic 檢查：已毒化（finalize 進行中）的 conn 不收集，
+                // finalize 的防禦移除會負責把它解開，避免雙重移除
+                if (curr->magic == CONN_MAGIC && !curr->closed && atomic_load(&curr->registered) &&
+                    (now - curr->last_active > IDLE_TIMEOUT_SEC ||
                     (curr->client_eof && now - curr->eof_since >= 2))) {
                     curr->closed = 1;
                     list_remove_locked(me, curr);
@@ -284,7 +620,7 @@ static void* worker_loop_safe(void* arg) {
                     else {
                         // 桶滿：先鎖外銷毀已收集的垃圾騰出空間，再收下這條連線
                         pthread_mutex_unlock(&me->list_lock);
-                        for (int g = 0; g < garbage_count; g++) destroy_connection(garbage_list[g]);
+                        for (int g = 0; g < garbage_count; g++) conn_unref(garbage_list[g]);
                         garbage_count = 0;
                         pthread_mutex_lock(&me->list_lock);
                         garbage_list[garbage_count++] = curr;
@@ -294,28 +630,59 @@ static void* worker_loop_safe(void* arg) {
             }
             pthread_mutex_unlock(&me->list_lock);
             last_check_time = now;
+
+            // [Slot 修復] 每 30 秒由 worker 0 輸出生命週期統計：
+            // 無 tombstone 的崩潰事後無法驗屍，改靠持續的 logcat 軌跡定位。
+            // stale_skip > 0 = 幽靈事件存在且被正確防禦（舊設計下即 SIGSEGV）
+            static time_t last_stats = 0;
+            if (my_widx == 0 && now - last_stats >= 30) {
+                last_stats = now;
+                LOGI("stats: conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld",
+                     atomic_load(&g_conn_count),
+                     (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
+                     (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
+                     (long long)atomic_load(&g_st_exhausted), (long long)atomic_load(&g_st_ghost_purged));
+            }
         }
 
         // 3. 執行垃圾回收 (在鎖外，安全執行 JNI)
+        //    [H2 修復] unref 放下 worker 的參考；handoff 仍持有的連線不會在此釋放
         for (int i = 0; i < garbage_count; i++) {
-            destroy_connection(garbage_list[i]);
+            conn_unref(garbage_list[i]);
         }
     }
 
 exit_worker:
-    // 清理剩餘連線
-    pthread_mutex_lock(&me->list_lock);
-    full_conn_t *curr = me->conn_list_head;
-    while(curr) {
-        full_conn_t *next = curr->next;
-        destroy_connection(curr);
-        curr = next;
+    // 清理剩餘連線（退出時執行緒池已先排水，沒有並發的 handoff 競爭；
+    // JNI release_java_socket 在鎖外呼叫同樣安全：Java 端只碰 ConcurrentHashMap）。
+    // [H2 修復] 鎖內只做「取出 + 標記 closed」，conn_unref 一律移到鎖外：
+    // conn_unref → conn_finalize 會再鎖同一個 list_lock，
+    // 在鎖內呼叫等同對自己持有的非遞迴 mutex 重複上鎖（shutdown 死鎖）。
+    // 鏈表可能超過 MAX_EVENTS 條，故以批次取出（每批鎖一次、鎖外 unref）。
+    for (;;) {
+        int n = 0;
+        pthread_mutex_lock(&me->list_lock);
+        full_conn_t *curr = me->conn_list_head;
+        while (curr && n < MAX_EVENTS) {
+            full_conn_t *next = curr->next;
+            // 一律先解除鏈接（維持鏈表一致，不留孤兒節點）；
+            // 已毒化（finalize 進行中）的 conn 不收集不 unref —— 它正由
+            // finalize 流程擁有與釋放，重複 unref 會破壞帳目
+            list_remove_locked(me, curr);
+            if (curr->magic == CONN_MAGIC) {
+                curr->closed = 1;
+                collected[n++] = curr;
+            }
+            curr = next;
+        }
+        me->conn_list_head = curr;
+        pthread_mutex_unlock(&me->list_lock);
+        for (int i = 0; i < n; i++) conn_unref(collected[i]);
+        if (n < MAX_EVENTS) break;
     }
-    me->conn_list_head = NULL;
-    pthread_mutex_unlock(&me->list_lock);
 
     // 銷毀事件迴圈中途退出時尚未處理的垃圾
-    for (int g = 0; g < garbage_count; g++) destroy_connection(garbage_list[g]);
+    for (int g = 0; g < garbage_count; g++) conn_unref(garbage_list[g]);
 
     close(me->epoll_fd);
     jni_detach_thread();
@@ -326,59 +693,85 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     // [item1] next_worker_idx 以 atomic 取用，避免多個 handshake 執行緒的資料競態
     int idx = atomic_fetch_add(&next_worker_idx, 1) % WORKER_COUNT;
     worker_t *w = &workers[idx];
+    int removed_worker_ref = 0; // add_failed 回滾用（C 不允許 label 後直接宣告）
 
-    full_conn_t *full = calloc(1, sizeof(full_conn_t));
-    if (!full) {
-        // [item3] 連線數已在 handle_handshake 預佔（CAS），此路徑需歸還
+    // [Slot 修復] 從固定槽位表取一槽（本體永不釋放）；耗盡時拒絕連線。
+    // g_conn_count 已由 handle_handshake 預佔，此路徑需歸還
+    int slot = slot_acquire();
+    if (slot < 0) {
         atomic_fetch_sub(&g_conn_count, 1);
-        close(client_fd); release_java_socket(target_fd); return;
+        close(client_fd); close(target_fd); release_java_socket(target_fd); return;
     }
+    full_conn_t *full = &g_slots[slot];
 
-    // [關鍵] 先完全初始化，再加入鏈表
-    full->client_fd = client_fd; 
+    // [H2 修復 v2] refs = 1（base ref），由 worker 的鏈表成員身分持有。
+    // 不額外加 worker 參考、handoff 成功也不扣 —— 每條 conn 恰好 unref 一次，
+    // 使 over-unref（refs→負數）在結構上不可能。
+    atomic_store(&full->refs, 1);
+    atomic_store(&full->registered, 0);
+    atomic_store(&full->finalized, 0);
+    full->widx = idx; // 提早設定：緩衝失敗路徑的 conn_finalize 會依此找對應 worker
+    full->magic = CONN_MAGIC; // 標記為有效 conn（release 時毒化回 0）
+    // [Slot 修復] epoll 事件識別碼：gen 已於 slot_acquire 遞增，幽靈事件必不符
+    full->ep_u64 = ((uint64_t)full->gen << 32) | (uint32_t)slot;
+
+    full->client_fd = client_fd;
     full->target_fd = target_fd;
-    full->c2t_buf = malloc(BUFFER_SIZE); 
+    full->c2t_buf = malloc(BUFFER_SIZE);
     full->t2c_buf = malloc(BUFFER_SIZE);
-    // [item3] 任一緩衝配置失敗即整條回收（destroy_connection 會關閉 fd、
-    // 釋放記憶體並歸還連線數額度），避免 c2t_buf 成功但 t2c_buf 失敗時洩漏
+    // [item3] 任一緩衝配置失敗即整條回收（conn_finalize 會關閉 fd、
+    // 歸還槽位與連線數額度），避免 c2t_buf 成功但 t2c_buf 失敗時洩漏。
+    // 此時 worker 尚未持有參考，unref 即真正釋放
     if (!full->c2t_buf || !full->t2c_buf) {
-        destroy_connection(full);
+        conn_unref(full);
         return;
     }
     full->last_active = time(NULL);
     full->closed = 0;
-    
+    full->client_eof = 0;
+    full->eof_since = 0;
+    full->c2t_len = 0; full->c2t_off = 0;
+    full->t2c_len = 0; full->t2c_off = 0;
+
     set_nonblocking(client_fd); set_nonblocking(target_fd);
     optimize_socket(client_fd); optimize_socket(target_fd);
-    
-    // [item3] g_conn_count 已由 handle_handshake 預佔，此處不再重複累加
 
     full->client_events = EPOLLIN | EPOLLRDHUP;
     full->target_events = EPOLLIN | EPOLLRDHUP;
 
-    // [關鍵] 加鎖修改鏈表 (這是 Listener 線程，與 Worker 線程競爭的地方)
+    // [H2 修復] 先入鏈表，再做兩個 epoll ADD。
+    // ADD 完成前 registered=0：worker 的事件處理與 timeout 掃描都會跳過
+    // 未註冊的 conn，銷毀只會發生在下列兩個路徑之一，closed 旗標 + list_lock
+    // 保證 list_remove 只執行一次
     pthread_mutex_lock(&w->list_lock);
     list_add_locked(w, full);
     pthread_mutex_unlock(&w->list_lock);
 
     struct epoll_event ev;
-    ev.events = full->client_events; ev.data.ptr = full;
-    // [item7] epoll_ctl ADD 失敗時立即回收，避免 fd/記憶體洩漏
-    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) != 0) {
-        pthread_mutex_lock(&w->list_lock);
+    ev.events = full->client_events; ev.data.u64 = full->ep_u64;
+    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) != 0) goto add_failed;
+    ev.events = full->target_events; ev.data.u64 = full->ep_u64;
+    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev) != 0) goto add_failed;
+    // client_fd 已 ADD 成功的情境：close 時核心會自動把它從 epoll 移除，無需 DEL
+
+    stamp_record(full->ep_u64, client_fd, target_fd, idx); // [幽靈清除器] 記錄戳記→fd 對應
+    atomic_store(&full->registered, 1); // 事件從此可交付 worker
+    // [H2 修復 v2] 成功路徑不再扣 ref：conn 的 base ref（=1）由 worker 持有，
+    // 待 worker 日後垃圾回收時 unref（1→0）→ finalize
+    return;
+
+add_failed:
+    // [H2 修復 v2] 回滾只扣一次：搶到 list_remove 的一方扣掉 base ref（1→0 finalize）。
+    // 若 worker 已先收集（closed=1、已移除鏈表），worker 的 step-3 會負責扣，
+    // handoff 此處完全不扣 —— 確保每條 conn 恰好 unref 一次
+    pthread_mutex_lock(&w->list_lock);
+    if (!full->closed) {
+        full->closed = 1;
         list_remove_locked(w, full);
-        pthread_mutex_unlock(&w->list_lock);
-        destroy_connection(full);
-        return;
+        removed_worker_ref = 1;
     }
-    ev.events = full->target_events; ev.data.ptr = full;
-    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev) != 0) {
-        pthread_mutex_lock(&w->list_lock);
-        list_remove_locked(w, full);
-        pthread_mutex_unlock(&w->list_lock);
-        destroy_connection(full);
-        return;
-    }
+    pthread_mutex_unlock(&w->list_lock);
+    if (removed_worker_ref) conn_unref(full); // 扣 base ref（1→0）→ conn_finalize
 }
 
 static void handle_udp_session_full(int client_fd) {
@@ -552,7 +945,7 @@ static void handle_udp_session_full(int client_fd) {
     }
     
     if(udp_buf) free(udp_buf);
-    release_java_socket(remote_udp_fd); // fd 由 Java 端關閉，C 端不得再 close
+    close(remote_udp_fd); release_java_socket(remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
     close(local_udp_fd); 
     close(client_fd);
     atomic_fetch_sub(&g_conn_count, 1);
@@ -584,7 +977,7 @@ static void handle_udp_tcp_session(int client_fd) {
 
     unsigned char *datagram = malloc(BUFFER_SIZE + 64);
     if (!datagram) {
-        release_java_socket(remote_udp_fd); // fd 由 Java 端關閉，C 端不得再 close
+        close(remote_udp_fd); release_java_socket(remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
         close(client_fd);
         atomic_fetch_sub(&g_conn_count, 1);
         return;
@@ -688,7 +1081,7 @@ static void handle_udp_tcp_session(int client_fd) {
     }
 
     free(datagram);
-    release_java_socket(remote_udp_fd); // fd 由 Java 端關閉，C 端不得再 close
+    close(remote_udp_fd); release_java_socket(remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
     close(client_fd);
     atomic_fetch_sub(&g_conn_count, 1);
 }
@@ -999,6 +1392,9 @@ static void* listener_task(void* arg) {
     if (pipe(g_shutdown_pipe) < 0) return NULL;
     set_nonblocking(g_shutdown_pipe[0]); set_nonblocking(g_shutdown_pipe[1]);
 
+    // [Slot 修復] 每次啟動重建空閒槽位堆疊（gen 延續遞增，跨重啟仍不混淆）
+    slots_init();
+
     for (int i = 0; i < WORKER_COUNT; i++) {
         workers[i].epoll_fd = epoll_create1(0);
         workers[i].conn_list_head = NULL;
@@ -1097,6 +1493,11 @@ int socks5_server_main_dynamic(int port) {
     signal(SIGPIPE, SIG_IGN);
     atomic_store(&server_running, 1);
     atomic_store(&g_conn_count, 0);
+    // [Slot 修復] 每個服務週期重置統計，logcat 軌跡對應當次執行
+    atomic_store(&g_st_acquired, 0); atomic_store(&g_st_released, 0);
+    atomic_store(&g_st_stale_skip, 0); atomic_store(&g_st_bad_slot, 0);
+    atomic_store(&g_st_exhausted, 0); atomic_store(&g_st_double_fin, 0);
+    atomic_store(&g_st_ghost_purged, 0);
     ListenerArgs *args = malloc(sizeof(ListenerArgs));
     args->port = port;
     pthread_create(&listener_thread, NULL, listener_task, args);
@@ -1128,6 +1529,11 @@ void socks5_server_quit(void) {
         pthread_join(workers[i].thread_id, NULL);
         pthread_mutex_destroy(&workers[i].list_lock); // 銷毀鎖
     }
+    // [Slot 修復] 槽位為靜態記憶體，關閉時無需釋放；下次啟動 slots_init() 重建
+    LOGI("server stopped: acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld double_fin=%lld",
+         (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
+         (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
+         (long long)atomic_load(&g_st_exhausted), (long long)atomic_load(&g_st_double_fin));
     if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
     if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
 }

@@ -26,3 +26,11 @@ captures/
 # APK outputs
 *.apk
 *.aab
+# Working notes & diagnostics (local only)
+NEXT_SESSION_PROMPT.md
+ui_now.xml
+tools/ui.xml
+tools/s20ui.xml
+tools/monitor_log_*.csv
+tools/__pycache__/
+tools/apk_extract/
