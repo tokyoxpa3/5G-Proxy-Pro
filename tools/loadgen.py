@@ -17,6 +17,13 @@ stats = {"ok": 0, "fail": 0}
 lock = threading.Lock()
 stop_flag = threading.Event()
 
+# 輪替目標：避免單一目標的 rate-limit（429）污染測試結果
+# （google 會對非瀏覽器 UA 回 403，故不採用）
+TARGETS = [
+    (b"www.example.com", b"GET / HTTP/1.0\r\nHost: www.example.com\r\n\r\n"),
+    (b"neverssl.com", b"GET / HTTP/1.0\r\nHost: neverssl.com\r\n\r\n"),
+]
+
 
 def recv_exact(sock, n):
     buf = b""
@@ -36,27 +43,30 @@ def worker(wid):
             s.sendall(b"\x05\x01\x00")
             assert recv_exact(s, 2) == b"\x05\x00"
             # CONNECT by DOMAIN: proxy side does DNS + IPv6/IPv4 fallback
-            host = b"api.ipify.org"
-            req = bytes([5, 1, 0, 3, len(host)]) + host + struct.pack(">H", 80)
-            s.sendall(req)
+            host, req = TARGETS[wid % len(TARGETS)]
+            sreq = bytes([5, 1, 0, 3, len(host)]) + host + struct.pack(">H", 80)
+            s.sendall(sreq)
             resp = recv_exact(s, 10)
             if resp[1] != 0:
                 raise ConnectionError("REP=%d" % resp[1])
-            s.sendall(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\n\r\n")
+            s.sendall(req)
             data = b""
             while True:
                 chunk = s.recv(4096)
                 if not chunk:
                     break
                 data += chunk
-            if b"200" not in data.split(b"\r\n", 1)[0]:
-                raise ConnectionError("http fail")
+            status = data.split(b"\r\n", 1)[0]
+            # 2xx/3xx 都算成功（429/5xx 視為目標端問題）
+            if not (status.startswith(b"HTTP/") and (b" 2" in status[:15] or b" 3" in status[:15])):
+                raise ConnectionError("http fail: %r" % status[:40])
             s.close()
             with lock:
                 stats["ok"] += 1
-        except Exception:
+        except Exception as e:
             with lock:
                 stats["fail"] += 1
+                stats.setdefault("last_err", str(e))
             time.sleep(0.1)
 
 
@@ -71,7 +81,7 @@ def main():
     stop_flag.set()
     for t in threads:
         t.join(timeout=10)
-    print("FINAL ok=%d fail=%d" % (stats["ok"], stats["fail"]))
+    print("FINAL ok=%d fail=%d last_err=%s" % (stats["ok"], stats["fail"], stats.get("last_err", "-")))
 
 
 if __name__ == "__main__":
