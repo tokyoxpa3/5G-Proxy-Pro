@@ -82,4 +82,18 @@
     <string name="error_no_lan_interface">找不到可綁定的 LAN 介面（請先開啟 Wi-Fi、熱點或 USB 分享）</string>
     <string name="error_cellular_unavailable">5G 網路不可用</string>
     <string name="error_native_start">原生伺服器啟動失敗: %1$s</string>
+
+    <string name="btn_self_test">🧪 自我檢測</string>
+    <string name="btn_copy_diagnostics">📋 複製診斷報告</string>
+    <string name="self_test_running">⏳ 檢測代理中...</string>
+    <string name="self_test_not_running">請先啟動代理</string>
+    <string name="self_test_step_connect_socket">TCP 連線</string>
+    <string name="self_test_step_greeting">SOCKS5 握手</string>
+    <string name="self_test_step_auth">認證</string>
+    <string name="self_test_step_connect">CONNECT 隧道</string>
+    <string name="self_test_step_data">資料回流</string>
+    <string name="self_test_pass">✅ 自我檢測通過</string>
+    <string name="self_test_fail">❌ 自我檢測失敗</string>
+    <string name="diagnostics_title">5G Proxy Pro 診斷報告</string>
+    <string name="diagnostics_copied">診斷報告已複製到剪貼簿</string>
 </resources>

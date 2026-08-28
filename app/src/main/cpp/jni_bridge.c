@@ -22,6 +22,7 @@ extern void socks5_server_quit(void);
 extern void socks5_server_set_auth(const char *user, const char *pass);
 extern void socks5_server_set_bind_addrs(const char **addrs, int count);
 extern int socks5_server_is_running(void);
+extern int socks5_server_get_stats(char *out, size_t out_len);
 
 static pthread_t g_server_thread;
 static int g_server_running = 0;
@@ -158,12 +159,20 @@ JNIEXPORT jboolean JNICALL native_is_socks5_server_running(JNIEnv *env, jobject 
     return (jboolean)(socks5_server_is_running() ? 1 : 0);
 }
 
+// [自檢/診斷] 讀取 native 引擎即時統計（App 內「複製診斷報告」用）
+JNIEXPORT jstring JNICALL native_get_socks5_stats(JNIEnv *env, jobject thiz) {
+    char buf[512];
+    socks5_server_get_stats(buf, sizeof(buf));
+    return (*env)->NewStringUTF(env, buf);
+}
+
 static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
     {"startSocks5Server", "(I[Ljava/lang/String;)Ljava/lang/String;", (void *)native_start_socks5_server},
     {"stopSocks5Server", "()Ljava/lang/String;", (void *)native_stop_socks5_server},
     {"setSocks5Auth", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *)native_set_socks5_auth},
     {"isSocks5ServerRunning", "()Z", (void *)native_is_socks5_server_running},
+    {"getSocks5Stats", "()Ljava/lang/String;", (void *)native_get_socks5_stats},
 };
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {

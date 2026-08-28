@@ -86,4 +86,18 @@ Also set this App\'s battery saver to \"No restrictions\".</string>
     <string name="error_no_lan_interface">No LAN interface found (enable Wi-Fi, hotspot or USB tethering first)</string>
     <string name="error_cellular_unavailable">5G network unavailable</string>
     <string name="error_native_start">Native server failed: %1$s</string>
+
+    <string name="btn_self_test">🧪 Self Test</string>
+    <string name="btn_copy_diagnostics">📋 Copy Diagnostics</string>
+    <string name="self_test_running">⏳ Testing proxy...</string>
+    <string name="self_test_not_running">Start the proxy first</string>
+    <string name="self_test_step_connect_socket">TCP Connect</string>
+    <string name="self_test_step_greeting">SOCKS5 Greeting</string>
+    <string name="self_test_step_auth">Auth</string>
+    <string name="self_test_step_connect">CONNECT</string>
+    <string name="self_test_step_data">Data Relay</string>
+    <string name="self_test_pass">✅ Self test passed</string>
+    <string name="self_test_fail">❌ Self test failed</string>
+    <string name="diagnostics_title">5G Proxy Pro Diagnostics</string>
+    <string name="diagnostics_copied">Diagnostics copied to clipboard</string>
 </resources>

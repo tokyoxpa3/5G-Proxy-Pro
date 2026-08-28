@@ -8,9 +8,13 @@ import android.content.pm.PackageManager
 import android.net.Network
 import android.net.ConnectivityManager
 import android.net.wifi.WifiManager
+import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import kotlinx.coroutines.*
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import android.content.Intent
 import android.content.Context
 import android.content.ClipData
@@ -34,6 +38,9 @@ class DebugActivity : Activity() {
     private lateinit var authUserInput: EditText
     private lateinit var authPassInput: EditText
     private lateinit var mainButton: Button
+    private lateinit var selfTestButton: Button
+    private lateinit var copyDiagnosticsButton: Button
+    private lateinit var selfTestResultText: TextView
     
     private var isRunning = false
     private var pendingNotificationPermission = false
@@ -398,6 +405,55 @@ class DebugActivity : Activity() {
         rootLayout.addView(passLayout)
         rootLayout.addView(mainButton)
         rootLayout.addView(ipCard)
+
+        // Diagnostics Card（自我檢測 + 複製診斷報告）
+        val diagCard = createCard().apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 24
+            }
+
+            selfTestButton = Button(context).apply {
+                text = getString(R.string.btn_self_test)
+                textSize = 16f
+                setTextColor(Color.WHITE)
+                background = createButtonDrawable(0xFF17A2B8.toInt())
+                setPadding(0, 24, 0, 24)
+                setOnClickListener { runSelfTest() }
+            }
+            addView(selfTestButton)
+
+            copyDiagnosticsButton = Button(context).apply {
+                text = getString(R.string.btn_copy_diagnostics)
+                textSize = 14f
+                setTextColor(0xFF6200EE.toInt())
+                background = GradientDrawable().apply {
+                    setColor(Color.WHITE)
+                    cornerRadius = 12f
+                    setStroke(2, 0xFF6200EE.toInt())
+                }
+                setPadding(0, 24, 0, 24)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = 16
+                }
+                setOnClickListener { copyDiagnostics() }
+            }
+            addView(copyDiagnosticsButton)
+
+            selfTestResultText = TextView(context).apply {
+                textSize = 14f
+                setTextColor(0xFF495057.toInt())
+                setPadding(0, 16, 0, 0)
+                visibility = View.GONE
+            }
+            addView(selfTestResultText)
+        }
+        rootLayout.addView(diagCard)
         rootLayout.addView(refreshButton)
 
         // 包 ScrollView：橫向或小螢幕時內容高度超過可視區域，
@@ -529,6 +585,103 @@ class DebugActivity : Activity() {
         // 以 Service 實際回報的狀態更新，不依賴 Activity 本地猜測
         onProxyStatusChanged(Socks5ProxyService.currentStatus)
     }
+
+    private fun runSelfTest() {
+        if (!Socks5ProxyService.isServiceRunning) {
+            selfTestResultText.text = getString(R.string.self_test_not_running)
+            selfTestResultText.setTextColor(0xFFDC3545.toInt())
+            selfTestResultText.visibility = View.VISIBLE
+            return
+        }
+
+        val port = portInput.text.toString().toIntOrNull() ?: 1080
+        val prefs = getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
+        val authUser = prefs.getString("auth_user", "") ?: ""
+        val authPass = prefs.getString("auth_pass", "") ?: ""
+
+        selfTestButton.isEnabled = false
+        selfTestButton.text = getString(R.string.self_test_running)
+        selfTestResultText.visibility = View.VISIBLE
+        selfTestResultText.text = ""
+
+        activityScope.launch {
+            val result = SelfTest.run(port, authUser, authPass)
+            selfTestButton.isEnabled = true
+            selfTestButton.text = getString(R.string.btn_self_test)
+
+            val sb = StringBuilder()
+            sb.append(getString(if (result.overallPass) R.string.self_test_pass else R.string.self_test_fail))
+                .append("\n\n")
+            for (step in result.steps) {
+                val label = when (step.kind) {
+                    SelfTest.StepKind.CONNECT_SOCKET -> getString(R.string.self_test_step_connect_socket)
+                    SelfTest.StepKind.GREETING -> getString(R.string.self_test_step_greeting)
+                    SelfTest.StepKind.AUTH -> getString(R.string.self_test_step_auth)
+                    SelfTest.StepKind.CONNECT -> getString(R.string.self_test_step_connect)
+                    SelfTest.StepKind.DATA -> getString(R.string.self_test_step_data)
+                }
+                sb.append(if (step.pass) "✅ " else "❌ ").append(label)
+                    .append(": ").append(step.detail).append("\n")
+            }
+            selfTestResultText.text = sb.toString().trimEnd()
+            selfTestResultText.setTextColor(if (result.overallPass) 0xFF28A745.toInt() else 0xFFDC3545.toInt())
+        }
+    }
+
+    private fun copyDiagnostics() {
+        val report = buildDiagnosticsReport()
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText("Diagnostics", report)
+        clipboard.setPrimaryClip(clip)
+        Toast.makeText(this, getString(R.string.diagnostics_copied), Toast.LENGTH_SHORT).show()
+    }
+
+    private fun buildDiagnosticsReport(): String {
+        val sb = StringBuilder()
+        sb.append("===== ").append(getString(R.string.diagnostics_title)).append(" =====\n")
+        sb.append("Time: ")
+            .append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()))
+            .append("\n")
+        try {
+            sb.append("Version: ")
+                .append(packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown")
+                .append("\n")
+        } catch (e: Exception) {
+            sb.append("Version: unknown\n")
+        }
+
+        val statusName = when (Socks5ProxyService.currentStatus) {
+            Socks5ProxyService.ProxyStatus.STARTING -> "STARTING"
+            Socks5ProxyService.ProxyStatus.RUNNING -> "RUNNING"
+            Socks5ProxyService.ProxyStatus.RESTARTING -> "RESTARTING"
+            Socks5ProxyService.ProxyStatus.PAUSED -> "PAUSED"
+            Socks5ProxyService.ProxyStatus.STOPPED -> "STOPPED"
+            Socks5ProxyService.ProxyStatus.FAILED -> "FAILED"
+        }
+        sb.append("Status: ").append(statusName).append("\n")
+        Socks5ProxyService.lastErrorMessage?.let { sb.append("LastError: ").append(it).append("\n") }
+
+        val port = portInput.text.toString().toIntOrNull() ?: 1080
+        sb.append("Port: ").append(port).append("\n")
+        val prefs = getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
+        val user = prefs.getString("auth_user", "") ?: ""
+        val pass = prefs.getString("auth_pass", "") ?: ""
+        val authOn = user.isNotEmpty() && pass.isNotEmpty()
+        sb.append("Auth: ").append(
+            if (authOn) "enabled (user=$user, pass=${mask(pass)})" else "disabled"
+        ).append("\n")
+
+        sb.append(wifiIPText.text).append("\n")
+        sb.append(hotspotIPText.text).append("\n")
+        sb.append(usbTetherIPText.text).append("\n")
+        sb.append(cellularIPText.text).append("\n")
+
+        sb.append("NativeStats: ").append(NativeEngine.safeGetStats()).append("\n")
+        return sb.toString()
+    }
+
+    private fun mask(s: String): String =
+        if (s.length <= 2) "*" else s.take(1) + "*".repeat(s.length - 2) + s.takeLast(1)
 
     private fun updateNetworkStatus() {
         activityScope.launch {

@@ -1459,6 +1459,23 @@ int socks5_server_is_running(void) {
     return atomic_load(&server_running);
 }
 
+// [自檢/診斷] 供 JNI 讀取即時生命週期統計（App 內「複製診斷報告」用），
+// 格式與 worker 的 30 秒 log 一致；server 未啟動時回傳 "not running"。
+int socks5_server_get_stats(char *out, size_t out_len) {
+    if (!out || out_len == 0) return -1;
+    if (!atomic_load(&server_running)) {
+        snprintf(out, out_len, "not running");
+        return 0;
+    }
+    snprintf(out, out_len,
+             "conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld",
+             atomic_load(&g_conn_count),
+             (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
+             (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
+             (long long)atomic_load(&g_st_exhausted), (long long)atomic_load(&g_st_ghost_purged));
+    return 0;
+}
+
 int socks5_server_main_dynamic(int port) {
     if (atomic_load(&server_running)) return -1;
     signal(SIGPIPE, SIG_IGN);

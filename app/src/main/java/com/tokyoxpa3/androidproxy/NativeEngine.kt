@@ -46,4 +46,14 @@ object NativeEngine {
     external fun stopSocks5Server(): String
     external fun setSocks5Auth(user: String, pass: String): String
     external fun isSocks5ServerRunning(): Boolean
+    external fun getSocks5Stats(): String
+
+    // [自檢/診斷] 安全讀取 native 統計；程式庫未載入時回傳說明字串
+    fun safeGetStats(): String {
+        return if (libraryLoaded) {
+            try { getSocks5Stats() } catch (e: Exception) { "stats unavailable" }
+        } else {
+            "native library not loaded"
+        }
+    }
 }
