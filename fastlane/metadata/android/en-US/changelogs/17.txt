@@ -1,3 +1,4 @@
+- Add in-app SOCKS5 self-test + one-click diagnostics report (TCP connect → handshake → auth → CONNECT → data relay, step-by-step pass/fail)
 - Fix: remove noisy release diagnostics (sampled finalize log, STILL-OPEN fcntl false-positive) and gate stats with NDEBUG
 - Remove inaccurate Developer Speed Test (single HTTP 10MB/8s cap underreports 500Mbps as <100Mbps, not worth metered data cost)
 - Fastlane: optimized short/full descriptions for search and added 2 phone screenshots per locale (1220x2712, on 178 device)

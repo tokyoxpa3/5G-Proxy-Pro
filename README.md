@@ -20,7 +20,7 @@
 - 🛡️ **原生引擎健康檢查** — 每 10 秒驗證 SOCKS5 伺服器存活，異常自動重啟；內建停止旗標，不會與「使用者按下停止」競態造成殭屍監聽
 - 📢 **真實狀態回報** — Service 透過 callback 回報實際狀態（啟動中/運行中/暫停/重建中/已停止/失敗），UI 不靠猜測
 - 🔔 **通知權限** — Android 13+ 啟動前會請求 `POST_NOTIFICATIONS`，前景服務通知正常顯示
-- 📊 **開發者測速工具** — 綁定 5G 網路的原始下載測速（多伺服器自動切換）
+- 🧪 **內建 SOCKS5 自我檢測 + 一鍵診斷報告** — 走完整代理路徑（TCP 連線 → SOCKS5 握手 → 認證 → CONNECT → 資料回流），逐步標示 pass/fail，精確定位故障步驟，並可一鍵複製診斷報告
 - 📶 顯示 Wi-Fi 內網 IP / 熱點分享 IP / 5G 公網 IP，附「刷新狀態」按鈕、上次退出原因（低記憶體、崩潰等）
 
 ---
@@ -125,7 +125,7 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 AndroidProxy/
 ├── app/src/main/
 │   ├── java/com/tokyoxpa3/androidproxy/
-│   │   ├── DebugActivity.kt          # 主介面 + 測速 + 熱點 IP 顯示
+│   │   ├── DebugActivity.kt          # 主介面 + 自我檢測 + 熱點 IP 顯示
 │   │   ├── Socks5ProxyService.kt    # 前台服務：鎖定 5G、啟動 C 引擎
 │   │   ├── NativeEngine.kt          # JNI 橋接（socketProvider 回呼）
 │   │   ├── PowerPermissionHelper.kt # 各品牌電池最佳化白名單引導
@@ -200,7 +200,6 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 - App 僅於「鎖定蜂巢狀網路」的狀態下運作，若沒有蜂巢狀訊號（無 SIM 卡）服務將無法啟動。
 - 代理監聽器只綁定 LAN 介面與本機 loopback；若同時想從 VPN 隧道存取代理，請改用熱點分享或 USB 分享。
 - 專案包含 `local.properties`（SDK 路徑）與 `.gradle/`、`build/`、`.cxx/` 等產生目錄，這些已被 `.gitignore` 忽略，不會上傳。
-- 測速功能使用多個公網測速伺服器（Linode 新加坡/東京、OVH 等），某些電信運營商可能對國際頻寬限制而測速偏低。
 
 ## 網路使用說明
 
@@ -210,7 +209,7 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 |---|---|---|
 | 原生引擎健康檢查 | `connectivitycheck.gstatic.com`（透過 5G） | 每 10 秒，驗證伺服器存活 |
 | 公網 IP 顯示 | `api.ipify.org` | 按下「刷新狀態」時 |
-| 開發者測速（僅開發用途） | Linode 新加坡/東京、OVH 等測速伺服器 | 僅在點擊測速按鈕時 |
+| 自我檢測 | example.com（透過 5G 代理） | 僅在點擊「自我檢測」時 |
 
 所有代理流量（客戶端透過 SOCKS5 轉送）都經由鎖定的蜂巢式網路介面輸出。
 
