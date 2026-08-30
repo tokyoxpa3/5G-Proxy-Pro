@@ -745,40 +745,102 @@ add_failed:
     if (removed_worker_ref) conn_unref(full); // 扣 base ref（1→0）→ conn_finalize
 }
 
+// [IPv6 支援] 判斷兩個 sockaddr 的 IP 是否相同，v4 與 v4-mapped v6 視為相同。
+// 雙棧 UDP socket 收到的 IPv4 來源會以 v4-mapped (::ffff:a.b.c.d) 形式呈現，
+// 必須正規化後才能與控制連線的對端位址比對。
+static int same_ip(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+    if (a->ss_family == AF_INET && b->ss_family == AF_INET) {
+        return ((const struct sockaddr_in *)a)->sin_addr.s_addr ==
+               ((const struct sockaddr_in *)b)->sin_addr.s_addr;
+    }
+    struct in6_addr xa, ya;
+    memset(&xa, 0, sizeof(xa));
+    memset(&ya, 0, sizeof(ya));
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *x = (const struct sockaddr_in *)a;
+        memcpy(&xa.s6_addr[12], &x->sin_addr, 4);
+        xa.s6_addr[10] = 0xff; xa.s6_addr[11] = 0xff; // ::ffff:a.b.c.d
+    } else if (a->ss_family == AF_INET6) {
+        xa = ((const struct sockaddr_in6 *)a)->sin6_addr;
+    }
+    if (b->ss_family == AF_INET) {
+        const struct sockaddr_in *y = (const struct sockaddr_in *)b;
+        memcpy(&ya.s6_addr[12], &y->sin_addr, 4);
+        ya.s6_addr[10] = 0xff; ya.s6_addr[11] = 0xff;
+    } else if (b->ss_family == AF_INET6) {
+        ya = ((const struct sockaddr_in6 *)b)->sin6_addr;
+    }
+    return memcmp(&xa, &ya, sizeof(struct in6_addr)) == 0;
+}
+
 static void handle_udp_session_full(int client_fd) {
     atomic_fetch_add(&g_conn_count, 1);
 
-    int local_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in local_addr = {0};
-    local_addr.sin_family = AF_INET; 
-    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind(local_udp_fd, (struct sockaddr*)&local_addr, sizeof(local_addr));
-    
-    socklen_t addr_len = sizeof(local_addr);
-    getsockname(local_udp_fd, (struct sockaddr*)&local_addr, &addr_len);
+    // [IPv6 支援] 標準 UDP ASSOCIATE 的本地 relay socket 改為雙棧：綁定 ::
+    //（IPV6_V6ONLY=0），IPv4 封包會以 v4-mapped 形式送達，IPv6 客戶端也能走
+    // 標準 UDP relay（先前 AF_INET-only 會讓 IPv6 客戶端整段靜默失敗），
+    // 與 TCP 路徑的 IPv6 支援對齊。
+    int local_udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    int local_is_v6 = (local_udp_fd >= 0);
+    if (!local_is_v6) {
+        // 極端環境沒有 IPv6 時回退 IPv4-only（行為同改動前）
+        local_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    }
+    if (local_udp_fd < 0) {
+        close(client_fd);
+        atomic_fetch_sub(&g_conn_count, 1);
+        return;
+    }
+    if (local_is_v6) {
+        int v6only = 0;
+        setsockopt(local_udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+        struct sockaddr_in6 a6 = {0};
+        a6.sin6_family = AF_INET6; /* sin6_addr 全 0 = :: */
+        bind(local_udp_fd, (struct sockaddr*)&a6, sizeof(a6));
+    } else {
+        struct sockaddr_in a4 = {0};
+        a4.sin_family = AF_INET;
+        a4.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind(local_udp_fd, (struct sockaddr*)&a4, sizeof(a4));
+    }
 
+    struct sockaddr_storage local_ss; socklen_t local_len = sizeof(local_ss);
+    getsockname(local_udp_fd, (struct sockaddr*)&local_ss, &local_len);
+    unsigned short p = (local_ss.ss_family == AF_INET6)
+        ? ntohs(((struct sockaddr_in6*)&local_ss)->sin6_port)
+        : ntohs(((struct sockaddr_in*)&local_ss)->sin_port);
+
+    // 回覆的 BND.ADDR 取控制連線的本地（伺服器端）位址：客戶端把 UDP 封包送往
+    // 這個位址。客戶端走 IPv6（且非 v4-mapped）時以 ATYP=0x04 回覆。
+    unsigned char resp[22] = {0};
+    resp[0] = 0x05; resp[1] = 0x00; resp[2] = 0x00;
+    int resp_len = 10;
     struct sockaddr_storage ss; socklen_t slen = sizeof(ss);
-    unsigned char resp[10] = {0x05, 0x00, 0, 0x01, 0,0,0,0, 0,0};
-    
-    // 取得客戶端的原始目標地址 (為了回覆做準備)
     if (getsockname(client_fd, (struct sockaddr*)&ss, &slen) == 0) {
         if (ss.ss_family == AF_INET) {
-            struct sockaddr_in *s4 = (struct sockaddr_in *)&ss; 
+            struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
+            resp[3] = 0x01; /* ATYP IPv4 */
             memcpy(&resp[4], &s4->sin_addr, 4);
         } else if (ss.ss_family == AF_INET6) {
-             struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
-            if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) 
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
+            if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+                resp[3] = 0x01;
                 memcpy(&resp[4], &s6->sin6_addr.s6_addr[12], 4);
+            } else {
+                resp[3] = 0x04; /* ATYP IPv6 */
+                memcpy(&resp[4], &s6->sin6_addr, 16);
+                resp_len = 22;
+            }
         }
     }
-    
-    // 填入 Server 端綁定的 UDP Port
-    unsigned short p = ntohs(local_addr.sin_port); 
-    resp[8] = p >> 8; 
-    resp[9] = p & 0xFF;
-    
+    if (resp_len == 22) {
+        resp[20] = p >> 8; resp[21] = p & 0xFF;
+    } else {
+        resp[8] = p >> 8; resp[9] = p & 0xFF;
+    }
+
     // 1. 發送 SOCKS5 UDP 握手成功回覆
-    send(client_fd, resp, 10, MSG_NOSIGNAL);
+    send(client_fd, resp, resp_len, MSG_NOSIGNAL);
 
     // 2. 請求 Java 層建立 5G UDP Socket
     int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
@@ -790,24 +852,15 @@ static void handle_udp_session_full(int client_fd) {
     }
 
     // 記錄控制連線的對端位址：UDP relay 只接受來自此用戶端的封包，
-    // 且回覆一律送回此位址，避免被其他裝置竄改轉送目標
-    struct sockaddr_storage peer_ss;
+    // 且回覆一律送回此位址，避免被其他裝置竄改轉送目標。
+    // [IPv6 支援] 以 sockaddr_storage 保存完整對端位址（v4 或 v6），
+    // 來源驗證時用 same_ip() 把 v4-mapped 正規化後比對。
+    struct sockaddr_storage peer_ss = {0};
     socklen_t peer_ss_len = sizeof(peer_ss);
-    struct sockaddr_in peer4 = {0};
-    if (getpeername(client_fd, (struct sockaddr*)&peer_ss, &peer_ss_len) == 0) {
-        if (peer_ss.ss_family == AF_INET) {
-            memcpy(&peer4, &peer_ss, sizeof(peer4));
-        } else if (peer_ss.ss_family == AF_INET6) {
-            struct sockaddr_in6 *p6 = (struct sockaddr_in6 *)&peer_ss;
-            if (IN6_IS_ADDR_V4MAPPED(&p6->sin6_addr)) {
-                peer4.sin_family = AF_INET;
-                memcpy(&peer4.sin_addr, &p6->sin6_addr.s6_addr[12], 4);
-            }
-        }
-    }
+    getpeername(client_fd, (struct sockaddr*)&peer_ss, &peer_ss_len);
 
     unsigned char *udp_buf = malloc(BUFFER_SIZE + 64);
-    struct sockaddr_in client_src_addr = {0}; 
+    struct sockaddr_storage client_src_addr = {0};
     socklen_t client_src_len = 0;
     
     // [關鍵修正] 使用 poll() 取代 select()/FD_SET：
@@ -835,12 +888,17 @@ static void handle_udp_session_full(int client_fd) {
 
         // 收到 Client 的 UDP 封包 -> 轉發給 5G
         if (fds[2].revents) {
-            struct sockaddr_in tmp; socklen_t tlen = sizeof(tmp);
+            struct sockaddr_storage tmp; socklen_t tlen = sizeof(tmp);
             ssize_t r = recvfrom(local_udp_fd, udp_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
             if (r > 3 && udp_buf[2] == 0) { // SOCKS5 UDP Header 至少 4 bytes (RSV+FRAG+ATYP)，FRAG 須為 0
                 // 來源驗證：只接受控制連線同來源 IP 的封包 (允許多個 UDP 來源 port)
-                if (peer4.sin_family != AF_INET || tmp.sin_addr.s_addr != peer4.sin_addr.s_addr) {
-                    LOGE("UDP relay: 拒絕未授權來源封包 %s:%u", inet_ntoa(tmp.sin_addr), ntohs(tmp.sin_port));
+                if (!same_ip(&tmp, &peer_ss)) {
+                    char src_ip[INET6_ADDRSTRLEN] = "?";
+                    if (tmp.ss_family == AF_INET)
+                        inet_ntop(AF_INET, &((struct sockaddr_in*)&tmp)->sin_addr, src_ip, sizeof(src_ip));
+                    else if (tmp.ss_family == AF_INET6)
+                        inet_ntop(AF_INET6, &((struct sockaddr_in6*)&tmp)->sin6_addr, src_ip, sizeof(src_ip));
+                    LOGE("UDP relay: 拒絕未授權來源封包 %s", src_ip);
                 } else {
                     client_src_addr = tmp; 
                     client_src_len = tlen;
@@ -999,7 +1057,9 @@ static void handle_udp_tcp_session(int client_fd) {
                                (struct sockaddr*)dst, dlen2) < 0) {
                         LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
                     } else {
+#ifndef NDEBUG
                         LOGI("UDP-in-TCP: client→5G frame dlen=%d hlen=%d payload=%d", dlen, hlen, dlen - hlen);
+#endif
                     }
                 }
             }
@@ -1015,7 +1075,9 @@ static void handle_udp_tcp_session(int client_fd) {
             ssize_t r = recvfrom(remote_udp_fd, datagram + off, BUFFER_SIZE - off, 0,
                                  (struct sockaddr*)&src6, &sl);
             if (r > 0) {
+#ifndef NDEBUG
                 LOGI("UDP-in-TCP: 5G→client datagram r=%zd", r);
+#endif
                 int start = 0;
                 if (src6.sin6_family == AF_INET) {
                     struct sockaddr_in *s4 = (struct sockaddr_in *)&src6;
