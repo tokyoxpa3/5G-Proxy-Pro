@@ -46,16 +46,17 @@ object SelfTest {
                 val output = socket.getOutputStream()
                 val authEnabled = authUser.isNotEmpty() && authPass.isNotEmpty()
 
-                // 1. SOCKS5 握手（greeting）
-                val method = if (authEnabled) 0x02 else 0x00
-                output.write(byteArrayOf(0x05, 0x01, method.toByte()))
+                // 1. SOCKS5 握手（greeting）；組封包與驗回覆抽至 Socks5ClientProtocol
+                val method = if (authEnabled) Socks5ClientProtocol.METHOD_USER_PASS else Socks5ClientProtocol.METHOD_NO_AUTH
+                output.write(Socks5ClientProtocol.greetingRequest(authEnabled))
                 output.flush()
                 try {
                     val resp = ByteArray(2)
                     readFully(input, resp)
-                    if (resp[0].toInt() != 0x05 || (resp[1].toInt() and 0xff) != method) {
+                    if (!Socks5ClientProtocol.validMethodReply(resp, method)) {
+                        val chosen = if (resp.size >= 2) resp[1].toInt() and 0xff else -1
                         steps.add(Step(StepKind.GREETING, false,
-                            "server chose method ${resp[1].toInt() and 0xff}, expected $method"))
+                            "server chose method $chosen, expected $method"))
                         return@withContext Result(steps, false)
                     }
                     steps.add(Step(StepKind.GREETING, true,
@@ -67,20 +68,12 @@ object SelfTest {
 
                 // 2. RFC1929 帳密認證（僅在啟用認證時）
                 if (authEnabled) {
-                    val userBytes = authUser.toByteArray(Charsets.UTF_8)
-                    val passBytes = authPass.toByteArray(Charsets.UTF_8)
-                    val req = ByteArray(3 + userBytes.size + passBytes.size)
-                    req[0] = 0x01
-                    req[1] = userBytes.size.toByte()
-                    System.arraycopy(userBytes, 0, req, 2, userBytes.size)
-                    req[2 + userBytes.size] = passBytes.size.toByte()
-                    System.arraycopy(passBytes, 0, req, 3 + userBytes.size, passBytes.size)
-                    output.write(req)
+                    output.write(Socks5ClientProtocol.authRequest(authUser, authPass))
                     output.flush()
                     try {
                         val resp = ByteArray(2)
                         readFully(input, resp)
-                        if (resp[0].toInt() != 0x01 || resp[1].toInt() != 0x00) {
+                        if (!Socks5ClientProtocol.validAuthReply(resp)) {
                             steps.add(Step(StepKind.AUTH, false, "auth rejected (01 ${resp[1].toInt() and 0xff})"))
                             return@withContext Result(steps, false)
                         }
@@ -92,27 +85,17 @@ object SelfTest {
                 }
 
                 // 3. CONNECT 建立隧道（ATYP=0x03 網域，順帶測 DNS）
-                val hostBytes = TEST_HOST.toByteArray(Charsets.US_ASCII)
-                val req = ByteArray(4 + 1 + hostBytes.size + 2)
-                req[0] = 0x05
-                req[1] = 0x01            // CMD = CONNECT
-                req[2] = 0x00            // RSV
-                req[3] = 0x03            // ATYP = domain
-                req[4] = hostBytes.size.toByte()
-                System.arraycopy(hostBytes, 0, req, 5, hostBytes.size)
-                req[5 + hostBytes.size] = ((TEST_PORT shr 8) and 0xff).toByte()
-                req[6 + hostBytes.size] = (TEST_PORT and 0xff).toByte()
-                output.write(req)
+                output.write(Socks5ClientProtocol.connectRequest(TEST_HOST, TEST_PORT))
                 output.flush()
                 try {
                     val header = ByteArray(4)
                     readFully(input, header)
-                    if (header[0].toInt() != 0x05) {
+                    val rep = Socks5ClientProtocol.connectReplyRep(header)
+                    if (rep < 0) {
                         steps.add(Step(StepKind.CONNECT, false, "bad VER ${header[0].toInt() and 0xff}"))
                         return@withContext Result(steps, false)
                     }
-                    val rep = header[1].toInt() and 0xff
-                    if (rep != 0x00) {
+                    if (rep != Socks5ClientProtocol.REP_SUCCESS) {
                         steps.add(Step(StepKind.CONNECT, false, "REP=$rep (${repName(rep)})"))
                         return@withContext Result(steps, false)
                     }

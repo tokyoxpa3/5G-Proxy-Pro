@@ -33,3 +33,50 @@ int socks5_validate_request_header(const unsigned char *req) {
 int socks5_is_supported_cmd(int cmd) {
     return cmd == 0x01 || cmd == 0x03 || cmd == 0x04;
 }
+
+int socks5_udp_parse(const unsigned char *dgram, size_t len,
+                     unsigned char *atyp, const unsigned char **addr, unsigned char port[2]) {
+    if (len < 4) return -1; /* 至少 RSV(2)+FRAG(1)+ATYP(1) */
+    if (dgram[0] != 0 || dgram[1] != 0) return -1; /* RSV 須為 0（RFC 1928） */
+    if (dgram[2] != 0) return -1;                 /* FRAG 須為 0 */
+    unsigned char t = dgram[3];
+    if (t == SOCKS5_ATYP_IPV4) {
+        if (len < 10) return -1; /* 表頭 4+addr(4)+port(2) */
+        if (atyp) *atyp = t;
+        if (addr) *addr = dgram + 4;
+        if (port) memcpy(port, dgram + 8, 2);
+        return 10;
+    }
+    if (t == SOCKS5_ATYP_IPV6) {
+        if (len < 22) return -1; /* 表頭 4+addr(16)+port(2) */
+        if (atyp) *atyp = t;
+        if (addr) *addr = dgram + 4;
+        if (port) memcpy(port, dgram + 20, 2);
+        return 22;
+    }
+    return -1; /* DOMAIN 或其他 ATYP：UDP datagram 不允許 */
+}
+
+int socks5_udp_encode(unsigned char *out, int is_v6, const unsigned char *addr, const unsigned char port[2]) {
+    out[0] = 0; out[1] = 0; out[2] = 0; /* RSV(2) + FRAG(1) */
+    if (!is_v6) {
+        out[3] = SOCKS5_ATYP_IPV4;
+        memcpy(out + 4, addr, 4);
+        memcpy(out + 8, port, 2);
+        return 10;
+    }
+    out[3] = SOCKS5_ATYP_IPV6;
+    memcpy(out + 4, addr, 16);
+    memcpy(out + 20, port, 2);
+    return 22;
+}
+
+void socks5_addr_normalize(const unsigned char *src, int is_v6, unsigned char *out16) {
+    memset(out16, 0, 16);
+    if (!is_v6) {
+        out16[10] = 0xff; out16[11] = 0xff; /* ::ffff:a.b.c.d */
+        memcpy(out16 + 12, src, 4);
+    } else {
+        memcpy(out16, src, 16);
+    }
+}
