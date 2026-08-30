@@ -88,4 +88,69 @@ class HappyEyeballsTest {
         assertNull(winner.get())
         assertEquals(1, l.count) // 未 countDown
     }
+
+    @Test
+    fun orderIpv6FirstPutsIpv6BeforeIpv4Stably() {
+        val input = listOf("v4-a", "v6-a", "v4-b", "v6-b")
+        val out = HappyEyeballs.orderIpv6First(input) { it.startsWith("v6") }
+        assertEquals(listOf("v6-a", "v6-b", "v4-a", "v4-b"), out)
+    }
+
+    @Test
+    fun raceStaggersDeferredAndSkipsWhenAlreadyWon() {
+        // 首選家族（IPv6）立即連線並勝出；延後家族（IPv4）排入 scheduler（延遲=staggerMs），
+        // 到點觸發時因已有勝者，attempt 前置檢查直接 no-op，不再對 IPv4 連線。
+        val winner = ref<String>(null)
+        val l = latch()
+        val connected = ArrayList<String>()
+        val delayed = ArrayList<() -> Unit>()
+        val delayMs = java.util.concurrent.atomic.AtomicReference<Long?>()
+
+        HappyEyeballs.race(
+            first = listOf("v6-a"),
+            deferred = listOf("v4-a"),
+            staggerMs = 250L,
+            winner = winner, abandoned = flag(false), latch = l,
+            dispatch = { it() }, // 同步執行，模擬立即提交
+            scheduler = { ms, run -> delayMs.set(ms); delayed.add(run) },
+            connect = { addr -> connected.add(addr); if (addr == "v6-a") "win" else null },
+            close = {}
+        )
+
+        assertEquals(listOf("v6-a"), connected) // 首選家族立即連線並勝出
+        assertEquals(250L, delayMs.get())        // 延後家族以 250ms 排入
+        assertEquals("win", winner.get())
+        assertEquals(0, l.count)                 // 勝者已 countDown
+
+        delayed[0].invoke()                       // 延後時間到，觸發 IPv4
+        assertEquals(listOf("v6-a"), connected)   // 已有人勝出 → v4-a 未連線
+    }
+
+    @Test
+    fun raceConnectsDeferredWhenFirstFamilyHasNoWinner() {
+        // 首選家族全部嘗試但無人勝出；延後家族到點後接手並勝出。
+        val winner = ref<String>(null)
+        val l = latch()
+        val connected = ArrayList<String>()
+        val delayed = ArrayList<() -> Unit>()
+
+        HappyEyeballs.race(
+            first = listOf("v6-a"),
+            deferred = listOf("v4-a"),
+            staggerMs = 250L,
+            winner = winner, abandoned = flag(false), latch = l,
+            dispatch = { it() },
+            scheduler = { _, run -> delayed.add(run) },
+            connect = { addr -> connected.add(addr); if (addr == "v4-a") "win" else null },
+            close = {}
+        )
+
+        assertEquals(listOf("v6-a"), connected) // v6-a 嘗試但未勝出
+        assertNull(winner.get())
+
+        delayed[0].invoke()                       // IPv4 接手
+        assertEquals(listOf("v6-a", "v4-a"), connected)
+        assertEquals("win", winner.get())
+        assertEquals(0, l.count)
+    }
 }
