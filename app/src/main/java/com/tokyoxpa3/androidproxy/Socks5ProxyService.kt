@@ -38,7 +38,9 @@ class Socks5ProxyService : Service() {
 
     private class DnsEntry(val addresses: List<java.net.InetAddress>, val expiresAt: Long)
     private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, DnsEntry>()
-    private val dnsCacheLock = Any()
+    // [single-flight] 正在解析中的 host → latch；併發查詢同一網域時僅 leader 實際查詢，
+    // 其餘執行緒等待後讀快取，避免 tun2socks/QUIC 下重複發 DnsResolver.query()。
+    private val dnsInFlight = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CountDownLatch>()
     private val dnsExecutor = java.util.concurrent.ThreadPoolExecutor(
             4, 4,
             0L, java.util.concurrent.TimeUnit.MILLISECONDS,
@@ -56,6 +58,32 @@ class Socks5ProxyService : Service() {
         val now = System.currentTimeMillis()
         val hit = dnsCache[key]
         if (hit != null && hit.expiresAt > now) return hit.addresses
+
+        // [single-flight] 同一 host 的併發解析只讓一個執行緒實際查詢。
+        // putIfAbsent 成功者為 leader 負責查詢並寫快取；其餘執行緒看到既有 latch
+        // 即為 follower，等待 leader 完成後直接讀快取。
+        // tun2socks / QUIC 場景下多個 handshake 執行緒常同時解析同一網域，
+        // 舊行為會各自發 DnsResolver.query()（重複查詢 + 可能重複負快取）。
+        val leaderLatch = java.util.concurrent.CountDownLatch(1)
+        val existing = dnsInFlight.putIfAbsent(key, leaderLatch)
+        if (existing != null) {
+            // follower：等待 leader 完成（有界，避免 leader 卡死時連帶卡住）
+            try {
+                existing.await(3, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+            }
+            return dnsCache[key]?.addresses ?: emptyList()
+        }
+        try {
+            return doResolve(network, host, key, now, hit)
+        } finally {
+            dnsInFlight.remove(key, leaderLatch)
+            leaderLatch.countDown()
+        }
+    }
+
+    /** 實際 DNS 解析（僅由 single-flight 的 leader 呼叫），解析後寫入快取 */
+    private fun doResolve(network: android.net.Network, host: String, key: String, now: Long, hit: DnsEntry?): List<java.net.InetAddress> {
         if (dnsCache.size >= 256) dnsCache.clear()
         // [穩定性修復] DNS 查詢優先走 DnsResolver API（API 29+）：
         // 舊路徑 network.getAllByName() 是不可中斷的阻塞呼叫，行動網路 DNS 劣化時
@@ -72,9 +100,6 @@ class Socks5ProxyService : Service() {
         }
         // 5G 網路劣化時 DNS 可能長時間無回應；加上 1 秒 timeout，
         // 避免 handshake 線程被 DNS 卡死（線程池全滿時新連線會被直接拒絕）。
-        // 注意：不能加 @Synchronized —— 否則所有 handshake 線程會在鎖上串行排隊，
-        // 每次 DNS 超時 1 秒 × N = 最後一個線程要等 N 秒，等於拒絕服務。
-        // dnsCache 是 ConcurrentHashMap 已線程安全，重複解析同一個 host 無害。
         // 失敗（超時/無結果）也負快取 3 秒，避免測速風暴下同一 host 反覆卡住握手線程。
         val addresses = try {
             val future = dnsExecutor.submit<List<java.net.InetAddress>> {
