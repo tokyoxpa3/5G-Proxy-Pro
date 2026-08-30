@@ -13,6 +13,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--build-id=none"
 set(SOURCE_FILES
     src/main/cpp/jni_bridge.c
     src/main/cpp/simple-socks5.c
+    src/main/cpp/socks5_protocol.c
 )
 
 add_library(androidproxy SHARED

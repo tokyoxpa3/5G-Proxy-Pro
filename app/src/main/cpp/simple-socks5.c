@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "socks5_protocol.h"
+
 extern void jni_attach_thread();
 extern void jni_detach_thread();
 extern int request_java_5g_socket(const char* host, int port, int is_udp);
@@ -1154,15 +1156,9 @@ static int do_auth_check(int client_fd, unsigned char *buf, const char *auth_use
     // 密碼也使用獨立緩衝區（允許 plen == 0：設定的密碼為空時，客戶端可不送密碼）
     if (plen > 0 && recv(client_fd, buf + 258, plen, MSG_WAITALL) != plen) return -1;
 
-    const unsigned char *user = buf + 2;
-    const unsigned char *pass = buf + 258;
-
-    // 帳號與密碼都必須完全相符（啟用認證時兩欄皆非空，因此不再允許空值放行）
-    int user_ok = (ulen == (unsigned char)strlen(auth_user)) &&
-                  memcmp(user, auth_user, ulen) == 0;
-    int pass_ok = (plen == (unsigned char)strlen(auth_pass)) &&
-                  memcmp(pass, auth_pass, plen) == 0;
-    int ok = user_ok && pass_ok;
+    // 帳號與密碼都必須完全相符（啟用認證時兩欄皆非空，因此不再允許空值放行）。
+    // 比對邏輯抽至 socks5_check_credentials（純函式，可 host 單元測試）
+    int ok = socks5_check_credentials(buf + 2, ulen, buf + 258, plen, auth_user, auth_pass);
 
     send(client_fd, ok ? "\x01\x00" : "\x01\x01", 2, MSG_NOSIGNAL);
     return ok ? 0 : -1;
@@ -1322,11 +1318,7 @@ static void handle_handshake_fd(int client_fd) {
     }
     pthread_mutex_unlock(&g_auth_lock);
 
-    int method_offered = 0;
-    for (int i = 0; i < nmethods; i++) {
-        if (buf[i] == desired_method) { method_offered = 1; break; }
-    }
-    if (!method_offered) {
+    if (!socks5_method_offered(buf, nmethods, desired_method)) {
         send(client_fd, "\x05\xff", 2, MSG_NOSIGNAL);
         goto err;
     }
@@ -1337,11 +1329,12 @@ static void handle_handshake_fd(int client_fd) {
         send(client_fd, "\x05\x00", 2, MSG_NOSIGNAL);
     }
 
-    if (recv(client_fd, buf, 4, MSG_WAITALL) != 4 || buf[0] != 0x05) goto err;
+    if (recv(client_fd, buf, 4, MSG_WAITALL) != 4) goto err;
+    // [RFC 1928] VER=0x05、RSV=0x00、ATYP∈{0x01,0x03,0x04} 的合法性驗證
+    // 抽至 socks5_validate_request_header（純函式，可 host 單元測試）；
+    // 任何一項不符即協定違規、直接關閉（先前漏查 RSV = s2_connect 的 WARN 來源）。
+    if (socks5_validate_request_header(buf) != 0) goto err;
     int cmd = buf[1];
-    // [RFC 1928] RSV 欄位必須為 0x00；非零即協定違規，直接關閉。
-    // 先前未檢查，導致 RSV!=0 的請求照常建立隧道（s2_connect 的 WARN 來源）。
-    if (buf[2] != 0x00) goto err;
     // ... 解析 host/port ...
     char host[256] = {0};
     int port = 0;
@@ -1376,7 +1369,7 @@ static void handle_handshake_fd(int client_fd) {
         handoff_to_worker(client_fd, target_fd);
         
         return;
-    } else if (cmd == 0x03 || cmd == 0x04) { // UDP / UDP-in-TCP
+    } else if (socks5_is_supported_cmd(cmd)) { // UDP / UDP-in-TCP (0x03 / 0x04)
         // [UDP 池] 轉交專用 UDP session 池；池滿時回 REP=0x04 讓客戶端
         // 退避/關閉，不讓長命 UDP session 佔死握手執行緒池
         if (job_pool_enqueue(&g_udp_pool, client_fd, cmd) != 0) {

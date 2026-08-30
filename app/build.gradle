@@ -81,3 +81,47 @@ dependencies {
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
     testImplementation 'junit:junit:4.13.2'
 }
+
+// [原生協定測試] 用 host C 編譯器編譯並執行純 SOCKS5 協定解析的單元測試。
+// socks5_protocol.c 零 Android/JNI/socket 依賴，可在 CI(Linux gcc) 與開發機(MinGW) 直接跑。
+// 找不到編譯器時以警告跳過（不影響無工具鏈環境的一般建置）。
+def cprotoCc = ['cc', 'gcc', 'clang'].find { c ->
+    try { new ProcessBuilder(c, '--version').redirectErrorStream(true).start().waitFor() == 0 }
+    catch (Exception e) { false }
+}
+
+tasks.register('cProtocolTest') {
+    group = 'verification'
+    description = 'Compile and run pure SOCKS5 protocol parsing unit tests on the host C compiler.'
+    onlyIf {
+        if (cprotoCc == null) {
+            logger.warn('cProtocolTest skipped: no C compiler (cc/gcc/clang) found')
+            return false
+        }
+        return true
+    }
+    doLast {
+        def src = file('src/main/cpp/socks5_protocol.c')
+        def tst = file('src/test/cpp/socks5_protocol_test.c')
+        def out = new File("${buildDir}/tmp/cproto/socks5_protocol_test")
+        out.parentFile.mkdirs()
+        project.exec {
+            commandLine cprotoCc, '-std=c11', '-Wall', '-Wextra',
+                '-I', file('src/main/cpp').absolutePath,
+                '-o', out.absolutePath,
+                src.absolutePath, tst.absolutePath
+        }
+        project.exec {
+            commandLine out.absolutePath
+        }
+    }
+}
+
+// 讓既有 `./gradlew test` 一併執行原生協定測試（CI 的 release 前測試步驟會自動涵蓋）。
+// 用 configureEach 延後綁定：AGP 的 `test` 生命週期任務在 android 區塊評估後才註冊，
+// 太早用 tasks.named('test') 會在此時點查無此任務而失敗。
+tasks.configureEach {
+    if (name == 'test') {
+        dependsOn 'cProtocolTest'
+    }
+}
