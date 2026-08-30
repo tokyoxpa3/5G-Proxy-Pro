@@ -223,7 +223,7 @@ class Socks5ProxyService : Service() {
         // 這裡負責收掉原生引用（socket.close()）並清理 map。
         NativeEngine.onSocketClosed = { fd ->
             val socket = activeSockets.remove(fd)
-            android.util.Log.i("FdAudit", "released fd=$fd hadEntry=${socket != null} map=${activeSockets.size}")
+            android.util.Log.d("FdAudit", "released fd=$fd hadEntry=${socket != null} map=${activeSockets.size}")
             if (socket is Closeable) {
                 try { socket.close() } catch (e: Exception) {}
             }
@@ -620,7 +620,7 @@ class Socks5ProxyService : Service() {
                 val pfd = android.os.ParcelFileDescriptor.fromSocket(socket)
                 val fd = pfd.detachFd()
                 activeSockets[fd] = socket
-                android.util.Log.i("FdAudit", "created fd=$fd map=${activeSockets.size}")
+                android.util.Log.d("FdAudit", "created fd=$fd map=${activeSockets.size}")
                 fd
             }
         } catch (e: Exception) {

@@ -34,3 +34,8 @@ tools/s20ui.xml
 tools/monitor_log_*.csv
 tools/__pycache__/
 tools/apk_extract/
+
+# Agent/IDE scratch + one-off MR automation (hardcoded token path / MR id)
+.zcode/
+tools/mr_note.py
+tools/update_fdroiddata.py
