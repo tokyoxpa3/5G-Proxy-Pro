@@ -36,11 +36,9 @@ class Socks5ProxyService : Service() {
 
     private val activeSockets = java.util.concurrent.ConcurrentHashMap<Int, Any>()
 
-    private class DnsEntry(val addresses: List<java.net.InetAddress>, val expiresAt: Long)
-    private val dnsCache = java.util.concurrent.ConcurrentHashMap<String, DnsEntry>()
-    // [single-flight] 正在解析中的 host → latch；併發查詢同一網域時僅 leader 實際查詢，
-    // 其餘執行緒等待後讀快取，避免 tun2socks/QUIC 下重複發 DnsResolver.query()。
-    private val dnsInFlight = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CountDownLatch>()
+    // DNS 快取 + single-flight 的純協調邏輯抽離到 DnsCache（可單元測試）；
+    // 服務層只注入實際的網路查詢。
+    private val dnsCache = DnsCache()
     private val dnsExecutor = java.util.concurrent.ThreadPoolExecutor(
             4, 4,
             0L, java.util.concurrent.TimeUnit.MILLISECONDS,
@@ -63,56 +61,28 @@ class Socks5ProxyService : Service() {
     private fun resolveWithCache(network: android.net.Network, host: String): List<java.net.InetAddress> {
         // [關鍵修復] IP 字面值最優先處理（NetRedirector 等 redirector 只送 IP），
         // 不查 DNS、不進快取 —— 與 v1.5 getAllByName 的字面值行為一致
-        parseIpLiteral(host)?.let { return listOf(it) }
-
+        IpLiteral.parse(host)?.let { return listOf(it) }
         val key = host.lowercase()
-        val now = System.currentTimeMillis()
-        val hit = dnsCache[key]
-        if (hit != null && hit.expiresAt > now) return hit.addresses
-
-        // [single-flight] 同一 host 的併發解析只讓一個執行緒實際查詢。
-        // putIfAbsent 成功者為 leader 負責查詢並寫快取；其餘執行緒看到既有 latch
-        // 即為 follower，等待 leader 完成後直接讀快取。
-        // tun2socks / QUIC 場景下多個 handshake 執行緒常同時解析同一網域，
-        // 舊行為會各自發 DnsResolver.query()（重複查詢 + 可能重複負快取）。
-        val leaderLatch = java.util.concurrent.CountDownLatch(1)
-        val existing = dnsInFlight.putIfAbsent(key, leaderLatch)
-        if (existing != null) {
-            // follower：等待 leader 完成（有界，避免 leader 卡死時連帶卡住）
-            try {
-                existing.await(3, java.util.concurrent.TimeUnit.SECONDS)
-            } catch (_: InterruptedException) {
-            }
-            return dnsCache[key]?.addresses ?: emptyList()
-        }
-        try {
-            return doResolve(network, host, key, now, hit)
-        } finally {
-            dnsInFlight.remove(key, leaderLatch)
-            leaderLatch.countDown()
+        return dnsCache.lookup(key, System.currentTimeMillis()) {
+            doResolve(network, host)
         }
     }
 
-    /** 實際 DNS 解析（僅由 single-flight 的 leader 呼叫），解析後寫入快取 */
-    private fun doResolve(network: android.net.Network, host: String, key: String, now: Long, hit: DnsEntry?): List<java.net.InetAddress> {
-        if (dnsCache.size >= 256) dnsCache.clear()
+    /** 實際 DNS 查詢（僅在快取未命中時由 single-flight 的 leader 呼叫） */
+    private fun doResolve(network: android.net.Network, host: String): List<java.net.InetAddress> {
         // [穩定性修復] DNS 查詢優先走 DnsResolver API（API 29+）：
         // 舊路徑 network.getAllByName() 是不可中斷的阻塞呼叫，行動網路 DNS 劣化時
         // 4 個 socks5-dns 執行緒會全部卡死（future.cancel 無法中斷底層解析），
         // 新查詢只能靠 DiscardPolicy 快速失敗 —— 表現即「代理突然連不上」。
         // DnsResolver 內建逾時 + CancellationSignal 可真正取消，不留卡死執行緒。
         if (android.os.Build.VERSION.SDK_INT >= 29) {
-            val resolved = resolveWithDnsResolver(network, host)
-            if (resolved != null) {
-                return cacheDns(key, now, resolved)
-            }
-            // DnsResolver 逾時/失敗 → 負快取後直接返回，不再落到可能卡死的舊路徑
-            return cacheDns(key, now, emptyList())
+            // 逾時/失敗 → 回空清單，交由 DnsCache 負快取 3 秒
+            return resolveWithDnsResolver(network, host) ?: emptyList()
         }
         // 5G 網路劣化時 DNS 可能長時間無回應；加上 1 秒 timeout，
         // 避免 handshake 線程被 DNS 卡死（線程池全滿時新連線會被直接拒絕）。
-        // 失敗（超時/無結果）也負快取 3 秒，避免測速風暴下同一 host 反覆卡住握手線程。
-        val addresses = try {
+        // 失敗（超時/無結果）也回空清單，交由 DnsCache 負快取 3 秒。
+        return try {
             val future = dnsExecutor.submit<List<java.net.InetAddress>> {
                 network.getAllByName(host)
                     .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
@@ -124,38 +94,7 @@ class Socks5ProxyService : Service() {
                 future.cancel(true)
             }
         } catch (e: Exception) {
-            if (hit != null) return hit.addresses
             emptyList()
-        }
-        return cacheDns(key, now, addresses)
-    }
-
-    /** 正/負結果寫入快取：正向 5 分鐘、負向 3 秒 */
-    private fun cacheDns(key: String, now: Long, addresses: List<java.net.InetAddress>): List<java.net.InetAddress> {
-        dnsCache[key] = if (addresses.isNotEmpty()) {
-            DnsEntry(addresses, now + 5 * 60 * 1000L)
-        } else {
-            DnsEntry(emptyList(), now + 3 * 1000L)
-        }
-        return addresses
-    }
-
-    /**
-     * [關鍵修復] IP 字面值直接解析，絕不進 DNS 流程。
-     * redirector / proxifier 型客戶端（NetRedirector 等）攔截的是應用程式已建立的
-     * TCP 連線目的地，CONNECT 只會帶 IP 位址（ATYP 0x01/0x04）沒有網域；
-     * DnsResolver.query() / getAllByName 對字面值的行為不同 —— 前者把它當網域查詢
-     * 必然失敗（REP=4），後者會本地解析。此函式僅在確定是字面值時做本地剖析，
-     * hostname 一律回 null 交給正常 DNS 路徑。
-     */
-    private fun parseIpLiteral(host: String): java.net.InetAddress? {
-        val looksLikeIpv4 = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""").matches(host)
-        val looksLikeIpv6 = host.contains(':') // IPv6 字面值必含冒號；hostname 不可能
-        if (!looksLikeIpv4 && !looksLikeIpv6) return null
-        return try {
-            java.net.InetAddress.getByName(host) // 字面值僅本地剖析，不觸發 DNS
-        } catch (e: Exception) {
-            null
         }
     }
 
@@ -566,45 +505,6 @@ class Socks5ProxyService : Service() {
         }
     }
     
-    /**
-     * [Happy Eyeballs] 單一位址的連線嘗試，交由共享 connectExecutor 並行執行。
-     * 最先成功者經由 winner CAS 勝出並 countDown latch；其餘（含遲到者）自行關閉。
-     */
-    private fun attemptConnect(
-        addr: java.net.InetAddress,
-        port: Int,
-        network: android.net.Network,
-        connectTimeoutMs: Int,
-        winner: java.util.concurrent.atomic.AtomicReference<java.net.Socket>,
-        abandoned: java.util.concurrent.atomic.AtomicBoolean,
-        latch: java.util.concurrent.CountDownLatch,
-        loserSockets: java.util.concurrent.ConcurrentLinkedQueue<java.net.Socket>
-    ) {
-        val candidate = java.net.Socket()
-        try {
-            if (winner.get() != null || abandoned.get()) return
-            candidate.receiveBufferSize = 3 * 1024 * 1024
-            candidate.sendBufferSize = 3 * 1024 * 1024
-            candidate.tcpNoDelay = true
-            network.bindSocket(candidate)
-            candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeoutMs)
-            if (winner.compareAndSet(null, candidate)) {
-                if (abandoned.get()) {
-                    // 主執行緒已放棄：自己關閉並讓出勝者位（不 countDown）
-                    try { candidate.close() } catch (e: Exception) {}
-                    winner.compareAndSet(candidate, null)
-                    return
-                }
-                latch.countDown()
-            } else {
-                try { candidate.close() } catch (e: Exception) {}
-            }
-        } catch (e: Exception) {
-            try { candidate.close() } catch (e2: Exception) {}
-            loserSockets.add(candidate) // 確保關閉（close 後 add 僅為防漏）
-        }
-    }
-
     private fun createSocketBoundToNetwork(host: String, port: Int, isUdp: Boolean): Int {
         val network = cellularNetwork ?: return -1
         return try {
@@ -647,7 +547,24 @@ class Socks5ProxyService : Service() {
 
                 for (addr in addresses) {
                     connectExecutor.execute {
-                        attemptConnect(addr, port, network, connectTimeout.toInt(), winner, abandoned, latch, loserSockets)
+                        HappyEyeballs.attempt(winner, abandoned, latch,
+                            connect = {
+                                val candidate = java.net.Socket()
+                                try {
+                                    candidate.receiveBufferSize = 3 * 1024 * 1024
+                                    candidate.sendBufferSize = 3 * 1024 * 1024
+                                    candidate.tcpNoDelay = true
+                                    network.bindSocket(candidate)
+                                    candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout.toInt())
+                                    candidate
+                                } catch (e: Exception) {
+                                    try { candidate.close() } catch (e2: Exception) {}
+                                    loserSockets.add(candidate)
+                                    null
+                                }
+                            },
+                            close = { s -> try { s.close() } catch (e: Exception) {} }
+                        )
                     }
                 }
 
