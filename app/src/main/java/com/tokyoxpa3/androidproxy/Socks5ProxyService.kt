@@ -57,6 +57,11 @@ class Socks5ProxyService : Service() {
             { r -> Thread(r, "socks5-connect").apply { isDaemon = true } },
             java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy()
         )
+    // [偵測落檔] 生命週期計數器滾動落檔：把異常信號（acquired/released/stale_skip/
+    // bad_slot/purged）以緩慢節奏寫進檔案，取代揮發性 logcat——release 版也有、
+    // 重開機不消失，平常不用管，出問題時翻檔案即有痕跡。
+    private val engineStatsFile by lazy { java.io.File(filesDir, "engine_stats.log") }
+    private val statsTimeFormat = java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
 
     private fun resolveWithCache(network: android.net.Network, host: String): List<java.net.InetAddress> {
         // [關鍵修復] IP 字面值最優先處理（NetRedirector 等 redirector 只送 IP），
@@ -150,6 +155,9 @@ class Socks5ProxyService : Service() {
         const val ACTION_START_PROXY = "START_PROXY"
         const val ACTION_STOP_PROXY = "STOP_PROXY"
         const val EXTRA_PORT = "PROXY_PORT"
+        // [偵測落檔] 生命週期計數器滾動落檔上限（超過則砍半保留最新）
+        private const val STATS_LOG_MAX_BYTES = 64L * 1024
+        private const val STATS_LOG_KEEP_BYTES = 32L * 1024
         @Volatile var isServiceRunning = false
 
         @Volatile var currentStatus = ProxyStatus.STOPPED
@@ -316,6 +324,15 @@ class Socks5ProxyService : Service() {
                              restartProxy(port)
                              break
                         }
+                    }
+                }
+
+                // [偵測落檔] 每 5 分鐘把生命週期計數器 snapshot 落檔（release 版也有）
+                launch {
+                    while (isProxyRunning && !stopRequested) {
+                        delay(5 * 60 * 1000L)
+                        if (stopRequested || !isProxyRunning) break
+                        appendEngineStatsToFile()
                     }
                 }
 
@@ -489,6 +506,7 @@ class Socks5ProxyService : Service() {
         updateStatus(ProxyStatus.STOPPED)
         serviceScope.launch {
             try {
+                appendEngineStatsToFile() // 停止前記錄最後一筆 stats
                 stopNativeEngineSafely()
                 networkManager.releaseCellularNetwork()
                 cellularNetwork = null
@@ -505,6 +523,28 @@ class Socks5ProxyService : Service() {
         }
     }
     
+    /**
+     * [偵測落檔] 把 native 引擎的生命週期計數器 snapshot 寫進滾動檔案。
+     * 每 5 分鐘與停止前各寫一次；檔案超過上限時砍半保留最新，避免長期使用無限長大。
+     */
+    @Synchronized
+    private fun appendEngineStatsToFile() {
+        if (!NativeEngine.isLibraryLoaded()) return
+        val stats = NativeEngine.safeGetStats()
+        if (stats == "not running" || stats == "native library not loaded" || stats == "stats unavailable") return
+        val line = "${statsTimeFormat.format(java.util.Date())} $stats\n"
+        try {
+            engineStatsFile.appendText(line)
+            if (engineStatsFile.length() > STATS_LOG_MAX_BYTES) {
+                val content = engineStatsFile.readText()
+                val keep = maxOf(0, content.length - STATS_LOG_KEEP_BYTES.toInt())
+                engineStatsFile.writeText(content.substring(keep))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "engine stats 落檔失敗", e)
+        }
+    }
+
     private fun createSocketBoundToNetwork(host: String, port: Int, isUdp: Boolean): Int {
         val network = cellularNetwork ?: return -1
         return try {
@@ -616,6 +656,7 @@ class Socks5ProxyService : Service() {
         // 之後 serviceScope 已取消、stopProxy 的清理協程不會再執行，
         // 必須在此同步釋放 native 引擎與所有資源，否則殭屍 listener 會持續佔用埠號。
         // 引擎停止後才可清空 onSocketClosed —— 排空期間 native 執行緒仍需靠它關 fd。
+        appendEngineStatsToFile() // 停止前記錄最後一筆 stats
         stopNativeEngineSafely()
         NativeEngine.socketProvider = null
         NativeEngine.onSocketClosed = null
