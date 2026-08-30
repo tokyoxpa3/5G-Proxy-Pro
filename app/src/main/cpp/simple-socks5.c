@@ -749,30 +749,45 @@ add_failed:
 
 // [IPv6 支援] 判斷兩個 sockaddr 的 IP 是否相同，v4 與 v4-mapped v6 視為相同。
 // 雙棧 UDP socket 收到的 IPv4 來源會以 v4-mapped (::ffff:a.b.c.d) 形式呈現，
-// 必須正規化後才能與控制連線的對端位址比對。
+// 必須正規化後才能與控制連線的對端位址比對。位址正規化（v4 → ::ffff:a.b.c.d）
+// 抽至 socks5_addr_normalize（純函式，host 可測），此處只做 sockaddr 解包。
 static int same_ip(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
-    if (a->ss_family == AF_INET && b->ss_family == AF_INET) {
-        return ((const struct sockaddr_in *)a)->sin_addr.s_addr ==
-               ((const struct sockaddr_in *)b)->sin_addr.s_addr;
+    const unsigned char *pa, *pb;
+    int a6 = (a->ss_family == AF_INET6);
+    int b6 = (b->ss_family == AF_INET6);
+    pa = a6 ? (const unsigned char *)&((const struct sockaddr_in6 *)a)->sin6_addr
+            : (const unsigned char *)&((const struct sockaddr_in *)a)->sin_addr;
+    pb = b6 ? (const unsigned char *)&((const struct sockaddr_in6 *)b)->sin6_addr
+            : (const unsigned char *)&((const struct sockaddr_in *)b)->sin_addr;
+    unsigned char na[16], nb[16];
+    socks5_addr_normalize(pa, a6, na);
+    socks5_addr_normalize(pb, b6, nb);
+    return memcmp(na, nb, 16) == 0;
+}
+
+// 由 socks5_udp_parse 解出的 (atyp, addr, port) 組回 sockaddr_storage，供 sendto 使用。
+// atyp 由 parse 保證為 0x01/0x04；addr 為 4B（v4）或 16B（v6），port[2] 為原始網路序位元組。
+static int build_sockaddr(unsigned char atyp, const unsigned char *addr, const unsigned char port[2],
+                          struct sockaddr_storage *out, socklen_t *out_len) {
+    if (atyp == SOCKS5_ATYP_IPV4) {
+        struct sockaddr_in *s = (struct sockaddr_in *)out;
+        memset(s, 0, sizeof(*s));
+        s->sin_family = AF_INET;
+        memcpy(&s->sin_addr, addr, 4);
+        memcpy(&s->sin_port, port, 2);
+        *out_len = sizeof(*s);
+        return 0;
     }
-    struct in6_addr xa, ya;
-    memset(&xa, 0, sizeof(xa));
-    memset(&ya, 0, sizeof(ya));
-    if (a->ss_family == AF_INET) {
-        const struct sockaddr_in *x = (const struct sockaddr_in *)a;
-        memcpy(&xa.s6_addr[12], &x->sin_addr, 4);
-        xa.s6_addr[10] = 0xff; xa.s6_addr[11] = 0xff; // ::ffff:a.b.c.d
-    } else if (a->ss_family == AF_INET6) {
-        xa = ((const struct sockaddr_in6 *)a)->sin6_addr;
+    if (atyp == SOCKS5_ATYP_IPV6) {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)out;
+        memset(s, 0, sizeof(*s));
+        s->sin6_family = AF_INET6;
+        memcpy(&s->sin6_addr, addr, 16);
+        memcpy(&s->sin6_port, port, 2);
+        *out_len = sizeof(*s);
+        return 0;
     }
-    if (b->ss_family == AF_INET) {
-        const struct sockaddr_in *y = (const struct sockaddr_in *)b;
-        memcpy(&ya.s6_addr[12], &y->sin_addr, 4);
-        ya.s6_addr[10] = 0xff; ya.s6_addr[11] = 0xff;
-    } else if (b->ss_family == AF_INET6) {
-        ya = ((const struct sockaddr_in6 *)b)->sin6_addr;
-    }
-    return memcmp(&xa, &ya, sizeof(struct in6_addr)) == 0;
+    return -1;
 }
 
 static void handle_udp_session_full(int client_fd) {
@@ -892,50 +907,33 @@ static void handle_udp_session_full(int client_fd) {
         if (fds[2].revents) {
             struct sockaddr_storage tmp; socklen_t tlen = sizeof(tmp);
             ssize_t r = recvfrom(local_udp_fd, udp_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
-            if (r > 3 && udp_buf[2] == 0) { // SOCKS5 UDP Header 至少 4 bytes (RSV+FRAG+ATYP)，FRAG 須為 0
-                // 來源驗證：只接受控制連線同來源 IP 的封包 (允許多個 UDP 來源 port)
-                if (!same_ip(&tmp, &peer_ss)) {
+            if (r > 3) {
+                // 解析 SOCKS5 UDP 表頭（RSV/FRAG/ATYP 驗證抽至 socks5_udp_parse，host 可測）
+                unsigned char atyp; const unsigned char *addr; unsigned char port[2];
+                int hlen = socks5_udp_parse(udp_buf, (size_t)r, &atyp, &addr, port);
+                if (hlen > 0 && !same_ip(&tmp, &peer_ss)) {
+                    // 來源驗證：只接受控制連線同來源 IP 的封包 (允許多個 UDP 來源 port)
                     char src_ip[INET6_ADDRSTRLEN] = "?";
                     if (tmp.ss_family == AF_INET)
                         inet_ntop(AF_INET, &((struct sockaddr_in*)&tmp)->sin_addr, src_ip, sizeof(src_ip));
                     else if (tmp.ss_family == AF_INET6)
                         inet_ntop(AF_INET6, &((struct sockaddr_in6*)&tmp)->sin6_addr, src_ip, sizeof(src_ip));
                     LOGE("UDP relay: 拒絕未授權來源封包 %s", src_ip);
-                } else {
+                } else if (hlen > 0) {
                     client_src_addr = tmp; 
                     client_src_len = tlen;
                     
-                    int hlen = 0; 
-                    void* dst = NULL; 
-                    socklen_t dlen = 0;
-                    struct sockaddr_in d4; 
-                    struct sockaddr_in6 d6;
-                    
-                    // 解析 SOCKS5 UDP Header
-                    if (udp_buf[3] == 0x01) { // IPv4
-                        hlen = 10; 
-                        d4.sin_family=AF_INET; 
-                        memcpy(&d4.sin_addr,&udp_buf[4],4); 
-                        memcpy(&d4.sin_port,&udp_buf[8],2); 
-                        dst=&d4; dlen=sizeof(d4);
-                    } else if (udp_buf[3] == 0x04) { // IPv6
-                        hlen = 22; 
-                        d6.sin6_family=AF_INET6; 
-                        memcpy(&d6.sin6_addr,&udp_buf[4],16); 
-                        memcpy(&d6.sin6_port,&udp_buf[20],2); 
-                        dst=&d6; dlen=sizeof(d6);
-                    }
-                    
-                    if (dst && r > hlen) {
-                        if (sendto(remote_udp_fd, udp_buf+hlen, r-hlen, 0, (struct sockaddr*)dst, dlen) < 0) {
+                    struct sockaddr_storage dst_ss; socklen_t dlen;
+                    if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && r > hlen) {
+                        if (sendto(remote_udp_fd, udp_buf+hlen, r-hlen, 0, (struct sockaddr*)&dst_ss, dlen) < 0) {
                             LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
                         }
-                    } else {
-                        LOGE("UDP relay: 無法解析 SOCKS5 UDP Header (atyp=%u, len=%zd)", udp_buf[3], r);
                     }
+                } else if (udp_buf[2] != 0) {
+                    LOGE("UDP relay: 收到 FRAG!=0 的 UDP 封包，已丟棄");
                 }
-            } else if (r > 3) {
-                LOGE("UDP relay: 收到 FRAG!=0 的 UDP 封包，已丟棄");
+                // hlen<=0 且 FRAG==0：RSV!=0 或 ATYP 不合法（如 DOMAIN），靜默丟棄，
+                // 與 TCP 路徑對 RSV 的驗證一致（commit 30ebb59）
             }
         }
         
@@ -948,29 +946,22 @@ static void handle_udp_session_full(int client_fd) {
             ssize_t r = recvfrom(remote_udp_fd, udp_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
 
             if (r > 0) {
-                int start = 0;
-                // 判斷來源地址類型;雙棧 socket 收到 IPv4 來源時會是 v4-mapped，一律輸出 IPv4 ATYP
+                // 判斷來源地址類型;雙棧 socket 收到 IPv4 來源時會是 v4-mapped，一律輸出 IPv4 ATYP。
+                // 表頭封裝抽至 socks5_udp_encode（純函式，host 可測）。
+                const unsigned char *addr; int is_v6;
                 if (src6.sin6_family == AF_INET) {
-                    struct sockaddr_in *s4 = (struct sockaddr_in *)&src6;
-                    start = off - 10;
-                    memset(&udp_buf[start], 0, 3); // RSV (2 bytes) + FRAG (1 byte)
-                    udp_buf[start+3] = 0x01; // ATYP IPv4
-                    memcpy(&udp_buf[start+4], &s4->sin_addr, 4);
-                    memcpy(&udp_buf[start+8], &s4->sin_port, 2);
+                    addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr;
+                    is_v6 = 0;
                 } else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) {
-                    start = off - 10;
-                    memset(&udp_buf[start], 0, 3); // RSV + FRAG
-                    udp_buf[start+3] = 0x01; // ATYP IPv4
-                    memcpy(&udp_buf[start+4], &src6.sin6_addr.s6_addr[12], 4); // v4-mapped 尾 4 bytes
-                    memcpy(&udp_buf[start+8], &src6.sin6_port, 2);
+                    addr = (const unsigned char *)&src6.sin6_addr.s6_addr[12]; // v4-mapped 尾 4 bytes
+                    is_v6 = 0;
                 } else {
-                    start = off - 22;
-                    memset(&udp_buf[start], 0, 3); // RSV + FRAG
-                    udp_buf[start+3] = 0x04; // ATYP IPv6
-                    memcpy(&udp_buf[start+4], &src6.sin6_addr, 16);
-                    memcpy(&udp_buf[start+20], &src6.sin6_port, 2);
+                    addr = (const unsigned char *)&src6.sin6_addr;
+                    is_v6 = 1;
                 }
-                sendto(local_udp_fd, udp_buf + start, r + (off - start), 0, (struct sockaddr*)&client_src_addr, client_src_len);
+                int hlen = socks5_udp_encode(udp_buf + off - (is_v6 ? 22 : 10), is_v6, addr, (const unsigned char *)&src6.sin6_port);
+                int start = off - hlen;
+                sendto(local_udp_fd, udp_buf + start, r + hlen, 0, (struct sockaddr*)&client_src_addr, client_src_len);
             }
         }
     }
@@ -1034,29 +1025,14 @@ static void handle_udp_tcp_session(int client_fd) {
             if (dlen < 4 || dlen > BUFFER_SIZE) break; // 協定違規
             if (recv(client_fd, datagram, dlen, MSG_WAITALL) != dlen) break;
 
-            // 解析 SOCKS5 UDP datagram（RSV=0, FRAG=0）
-            if (datagram[0] == 0 && datagram[1] == 0 && datagram[2] == 0) {
-                int hlen = 0;
-                void *dst = NULL;
-                socklen_t dlen2 = 0;
-                struct sockaddr_in d4;
-                struct sockaddr_in6 d6;
-                if (datagram[3] == 0x01 && dlen >= 10) { // IPv4
-                    hlen = 10;
-                    d4.sin_family = AF_INET;
-                    memcpy(&d4.sin_addr, datagram + 4, 4);
-                    memcpy(&d4.sin_port, datagram + 8, 2);
-                    dst = &d4; dlen2 = sizeof(d4);
-                } else if (datagram[3] == 0x04 && dlen >= 22) { // IPv6
-                    hlen = 22;
-                    d6.sin6_family = AF_INET6;
-                    memcpy(&d6.sin6_addr, datagram + 4, 16);
-                    memcpy(&d6.sin6_port, datagram + 20, 2);
-                    dst = &d6; dlen2 = sizeof(d6);
-                }
-                if (dst && dlen > hlen) {
+            // 解析 SOCKS5 UDP datagram（RSV=0、FRAG=0、ATYP 驗證抽至 socks5_udp_parse）
+            unsigned char atyp; const unsigned char *addr; unsigned char port[2];
+            int hlen = socks5_udp_parse(datagram, (size_t)dlen, &atyp, &addr, port);
+            if (hlen > 0) {
+                struct sockaddr_storage dst_ss; socklen_t dlen2;
+                if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen2) == 0 && dlen > hlen) {
                     if (sendto(remote_udp_fd, datagram + hlen, dlen - hlen, 0,
-                               (struct sockaddr*)dst, dlen2) < 0) {
+                               (struct sockaddr*)&dst_ss, dlen2) < 0) {
                         LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
                     } else {
 #ifndef NDEBUG
@@ -1080,28 +1056,21 @@ static void handle_udp_tcp_session(int client_fd) {
 #ifndef NDEBUG
                 LOGI("UDP-in-TCP: 5G→client datagram r=%zd", r);
 #endif
-                int start = 0;
+                // 表頭封裝抽至 socks5_udp_encode（純函式，host 可測）
+                const unsigned char *addr; int is_v6;
                 if (src6.sin6_family == AF_INET) {
-                    struct sockaddr_in *s4 = (struct sockaddr_in *)&src6;
-                    start = off - 10;
-                    memset(&datagram[start], 0, 3); // RSV + FRAG
-                    datagram[start+3] = 0x01;       // ATYP IPv4
-                    memcpy(&datagram[start+4], &s4->sin_addr, 4);
-                    memcpy(&datagram[start+8], &s4->sin_port, 2);
+                    addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr;
+                    is_v6 = 0;
                 } else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) {
-                    start = off - 10;
-                    memset(&datagram[start], 0, 3);
-                    datagram[start+3] = 0x01;
-                    memcpy(&datagram[start+4], &src6.sin6_addr.s6_addr[12], 4);
-                    memcpy(&datagram[start+8], &src6.sin6_port, 2);
+                    addr = (const unsigned char *)&src6.sin6_addr.s6_addr[12];
+                    is_v6 = 0;
                 } else {
-                    start = off - 22;
-                    memset(&datagram[start], 0, 3);
-                    datagram[start+3] = 0x04;       // ATYP IPv6
-                    memcpy(&datagram[start+4], &src6.sin6_addr, 16);
-                    memcpy(&datagram[start+20], &src6.sin6_port, 2);
+                    addr = (const unsigned char *)&src6.sin6_addr;
+                    is_v6 = 1;
                 }
-                int dlen = r + (off - start);
+                int hlen = socks5_udp_encode(datagram + off - (is_v6 ? 22 : 10), is_v6, addr, (const unsigned char *)&src6.sin6_port);
+                int start = off - hlen;
+                int dlen = r + hlen;
                 datagram[start - 2] = (unsigned char)(dlen >> 8);
                 datagram[start - 1] = (unsigned char)(dlen & 0xFF);
                 int total = dlen + 2;

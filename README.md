@@ -125,17 +125,24 @@ adb install -r app\build\outputs\apk\debug\app-debug.apk
 AndroidProxy/
 ├── app/src/main/
 │   ├── java/com/tokyoxpa3/androidproxy/
-│   │   ├── DebugActivity.kt          # 主介面 + 自我檢測 + 熱點 IP 顯示
-│   │   ├── Socks5ProxyService.kt    # 前台服務：鎖定 5G、啟動 C 引擎
-│   │   ├── NativeEngine.kt          # JNI 橋接（socketProvider 回呼）
-│   │   ├── PowerPermissionHelper.kt # 各品牌電池最佳化白名單引導
+│   │   ├── DebugActivity.kt           # 主介面 + 自我檢測 + 熱點 IP 顯示
+│   │   ├── Socks5ProxyService.kt     # 前台服務：鎖定 5G、啟動 C 引擎
+│   │   ├── NativeEngine.kt           # JNI 橋接（socketProvider 回呼）
+│   │   ├── SelfTest.kt               # 內建自我檢測（走完整代理路徑）
+│   │   ├── Socks5ClientProtocol.kt   # 自我檢測用的 SOCKS5 客戶端協定（純函式）
+│   │   ├── DnsCache.kt               # DNS 快取 + single-flight（純協調邏輯）
+│   │   ├── HappyEyeballs.kt          # RFC 8305 連線競速（純決策邏輯）
+│   │   ├── IpLiteral.kt              # IP 字面值判斷（不觸發 DNS）
+│   │   ├── PowerPermissionHelper.kt  # 各品牌電池最佳化白名單引導
 │   │   └── network/
 │   │       ├── CellularNetworkManager.kt  # requestNetwork() 鎖定與釋放
 │   │       ├── PublicIPChecker.kt         # 5G 公網 IP 查詢
 │   │       └── HotspotManager.kt          # 熱點分享 IP 偵測
 │   └── cpp/
-│       ├── jni_bridge.c       # JNI 註冊、Java↔C 呼叫橋樑
-│       ├── simple-socks5.c    # epoll SOCKS5 引擎（TCP/UDP）
+│       ├── jni_bridge.c         # JNI 註冊、Java↔C 呼叫橋樑
+│       ├── simple-socks5.c      # epoll SOCKS5 引擎（TCP/UDP）
+│       ├── socks5_protocol.h    # 純協定解析/封裝宣告（TCP 握手 + UDP datagram，host 可測）
+│       ├── socks5_protocol.c    # 純協定解析/封裝實作（零 socket 依賴）
 │       └── CMakeLists.txt
 ```
 
