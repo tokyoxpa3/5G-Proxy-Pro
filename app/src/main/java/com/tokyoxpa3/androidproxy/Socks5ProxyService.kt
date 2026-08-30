@@ -36,6 +36,13 @@ class Socks5ProxyService : Service() {
 
     private val activeSockets = java.util.concurrent.ConcurrentHashMap<Int, Any>()
 
+    // [FdAudit 降噪] 逐連線的 created/released 日誌只在 debug 版輸出；release 版只保留
+    // 異常訊號（released untracked / late winner）。以 FLAG_DEBUGGABLE 判斷，
+    // 不依賴 BuildConfig，確保 F-Droid 以自身工具鏈重編時行為一致。
+    private val isDebuggable by lazy {
+        (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    }
+
     // DNS 快取 + single-flight 的純協調邏輯抽離到 DnsCache（可單元測試）；
     // 服務層只注入實際的網路查詢。
     private val dnsCache = DnsCache()
@@ -46,6 +53,13 @@ class Socks5ProxyService : Service() {
             { r -> Thread(r, "socks5-dns").apply { isDaemon = true } },
             java.util.concurrent.ThreadPoolExecutor.DiscardPolicy()
         )
+    // [DNS 背壓] 並發解析上限：API 29+ 的 DnsResolver 路徑會在呼叫它的握手執行緒上
+    // 以 latch.await 阻塞最多 2 秒，且不受 dnsExecutor（4 執行緒）節流。行動網路 DNS
+    // 劣化時若不設限，64 個握手執行緒會全數卡在 DNS 等待，accept 進來的新連線只能排隊。
+    // 超過上限的解析直接失敗（回空 → DnsCache 負快取 → REP=host unreachable），把
+    // 「代理整段卡死」收斂成「超額連線快速失敗」，與 dnsExecutor 的 DiscardPolicy 精神
+    // 一致。16 對個人 5G 分享的短暫並發綽綽有餘，又把劣化時卡住的執行緒壓在握手池之下。
+    private val dnsConcurrency = java.util.concurrent.Semaphore(16)
     // [Happy Eyeballs] 連線競速的並行連線改用共享有界執行緒池，取代每次 CONNECT
     // 對每個解析位址 spawn 一條裸 Thread。大量並發連線下裸 Thread 會無上限產生
     // 短命執行緒（執行緒 churn）；此池上限 16 工作緒 + 128 佇列，池滿時由握手
@@ -57,6 +71,11 @@ class Socks5ProxyService : Service() {
             { r -> Thread(r, "socks5-connect").apply { isDaemon = true } },
             java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy()
         )
+    // [Happy Eyeballs] RFC 8305 錯開連線的延後排程器：次要家族（IPv4）延後啟動。
+    // 單執行緒 + daemon，僅在延後時間點把 IPv4 連線嘗試丟回 connectExecutor。
+    private val happyEyeballsScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "socks5-happy-eyeballs").apply { isDaemon = true }
+    }
     // [偵測落檔] 生命週期計數器滾動落檔：把異常信號（acquired/released/stale_skip/
     // bad_slot/purged）以緩慢節奏寫進檔案，取代揮發性 logcat——release 版也有、
     // 重開機不消失，平常不用管，出問題時翻檔案即有痕跡。
@@ -75,31 +94,41 @@ class Socks5ProxyService : Service() {
 
     /** 實際 DNS 查詢（僅在快取未命中時由 single-flight 的 leader 呼叫） */
     private fun doResolve(network: android.net.Network, host: String): List<java.net.InetAddress> {
-        // [穩定性修復] DNS 查詢優先走 DnsResolver API（API 29+）：
-        // 舊路徑 network.getAllByName() 是不可中斷的阻塞呼叫，行動網路 DNS 劣化時
-        // 4 個 socks5-dns 執行緒會全部卡死（future.cancel 無法中斷底層解析），
-        // 新查詢只能靠 DiscardPolicy 快速失敗 —— 表現即「代理突然連不上」。
-        // DnsResolver 內建逾時 + CancellationSignal 可真正取消，不留卡死執行緒。
-        if (android.os.Build.VERSION.SDK_INT >= 29) {
-            // 逾時/失敗 → 回空清單，交由 DnsCache 負快取 3 秒
-            return resolveWithDnsResolver(network, host) ?: emptyList()
+        // [DNS 背壓] 先搶並發額度：額度滿代表 DNS 正在劣化（多個 leader 各自等滿逾時），
+        // 此時與其讓這個握手執行緒再卡 2 秒，不如立刻失敗 → 負快取 → REP=host unreachable。
+        if (!dnsConcurrency.tryAcquire()) {
+            return emptyList()
         }
-        // 5G 網路劣化時 DNS 可能長時間無回應；加上 1 秒 timeout，
-        // 避免 handshake 線程被 DNS 卡死（線程池全滿時新連線會被直接拒絕）。
-        // 失敗（超時/無結果）也回空清單，交由 DnsCache 負快取 3 秒。
-        return try {
-            val future = dnsExecutor.submit<List<java.net.InetAddress>> {
-                network.getAllByName(host)
-                    .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
-                    .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+        try {
+            // [穩定性修復] DNS 查詢優先走 DnsResolver API（API 29+）：
+            // 舊路徑 network.getAllByName() 是不可中斷的阻塞呼叫，行動網路 DNS 劣化時
+            // 4 個 socks5-dns 執行緒會全部卡死（future.cancel 無法中斷底層解析），
+            // 新查詢只能靠 DiscardPolicy 快速失敗 —— 表現即「代理突然連不上」。
+            // DnsResolver 內建逾時 + CancellationSignal 可真正取消，不留卡死執行緒。
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                // 逾時/失敗 → 回空清單，交由 DnsCache 負快取 3 秒
+                return resolveWithDnsResolver(network, host) ?: emptyList()
             }
-            try {
-                future.get(1, java.util.concurrent.TimeUnit.SECONDS)
-            } finally {
-                future.cancel(true)
+            // 5G 網路劣化時 DNS 可能長時間無回應；加上 1 秒 timeout，
+            // 避免 handshake 線程被 DNS 卡死（線程池全滿時新連線會被直接拒絕）。
+            // 失敗（超時/無結果）也回空清單，交由 DnsCache 負快取 3 秒。
+            return try {
+                val future = dnsExecutor.submit<List<java.net.InetAddress>> {
+                    HappyEyeballs.orderIpv6First(
+                        network.getAllByName(host)
+                            .filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
+                    ) { it is java.net.Inet6Address }
+                }
+                try {
+                    future.get(1, java.util.concurrent.TimeUnit.SECONDS)
+                } finally {
+                    future.cancel(true)
+                }
+            } catch (e: Exception) {
+                emptyList()
             }
-        } catch (e: Exception) {
-            emptyList()
+        } finally {
+            dnsConcurrency.release()
         }
     }
 
@@ -144,8 +173,9 @@ class Socks5ProxyService : Service() {
             return null
         }
         val res = answer.get() ?: return emptyList()
-        return res.filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
-            .sortedBy { if (it is java.net.Inet4Address) 0 else 1 }
+        return HappyEyeballs.orderIpv6First(
+            res.filterNot { it.isAnyLocalAddress || it.isLoopbackAddress || it.isLinkLocalAddress }
+        ) { it is java.net.Inet6Address }
     }
     
     companion object {
@@ -206,7 +236,13 @@ class Socks5ProxyService : Service() {
         // 這裡負責收掉原生引用（socket.close()）並清理 map。
         NativeEngine.onSocketClosed = { fd ->
             val socket = activeSockets.remove(fd)
-            android.util.Log.d("FdAudit", "released fd=$fd hadEntry=${socket != null} map=${activeSockets.size}")
+            if (socket == null) {
+                // 異常訊號：釋放一個不在 map 的 fd（late winner / 雙關的洩漏徵兆），
+                // 無論 debug/release 都保留，供現場洩漏追蹤。
+                android.util.Log.w("FdAudit", "released untracked fd=$fd map=${activeSockets.size}")
+            } else if (isDebuggable) {
+                android.util.Log.d("FdAudit", "released fd=$fd map=${activeSockets.size}")
+            }
             if (socket is Closeable) {
                 try { socket.close() } catch (e: Exception) {}
             }
@@ -457,20 +493,34 @@ class Socks5ProxyService : Service() {
         nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.notification_waiting_network), getString(R.string.notification_waiting_network)))
     }
     
+    // 健康檢查端點：依序嘗試，任一成功即視為網路健康。gstatic 在部分地區可能無法連通
+    // （Google 網域被封鎖），因此補上非 Google 的備援端點，避免誤判「5G 斷線」進而
+    // 觸發不必要的代理重建。
+    private val healthCheckUrls = listOf(
+        "http://connectivitycheck.gstatic.com/generate_204",
+        "http://captive.apple.com/hotspot-detect.html",
+        "http://connect.rom.miui.com/generate_204"
+    )
+
     private fun isNetworkHealthy(network: android.net.Network): Boolean {
-        return try {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-            val caps = cm.getNetworkCapabilities(network)
-            if (caps == null || !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
-            network.openConnection(java.net.URL("http://connectivitycheck.gstatic.com/generate_204")).apply {
-                connectTimeout = 3000
-                readTimeout = 3000
-                inputStream.use { it.read() }
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val caps = cm.getNetworkCapabilities(network)
+        if (caps == null || !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
+        for (url in healthCheckUrls) {
+            if (try {
+                    network.openConnection(java.net.URL(url)).apply {
+                        connectTimeout = 3000
+                        readTimeout = 3000
+                        inputStream.use { it.read() }
+                    }
+                    true
+                } catch (e: Exception) {
+                    false
+                }) {
+                return true
             }
-            true
-        } catch (e: Exception) {
-            false
         }
+        return false
     }
     
     /**
@@ -574,8 +624,11 @@ class Socks5ProxyService : Service() {
                 // 且弱訊號下單一位址的 SYN 容易丟失。改為同時對所有位址發起連線，
                 // 最先成功者勝出、其餘立即關閉 —— 最壞延遲從「總和」變成「單次逾時」，
                 // 成功率大幅提升。
+                // resolveWithCache 已 IPv6 優先排序；依家族分割：IPv6 先行、IPv4 延後
+                val ipv6 = addresses.filter { it is java.net.Inet6Address }
+                val ipv4 = addresses.filter { it is java.net.Inet4Address }
+
                 val winner = java.util.concurrent.atomic.AtomicReference<java.net.Socket>()
-                val loserSockets = java.util.concurrent.ConcurrentLinkedQueue<java.net.Socket>()
                 val latch = java.util.concurrent.CountDownLatch(1)
                 // [根因修復 2026-08-23] abandoned：主執行緒逾時放棄後，稍晚才連上的
                 // 「遲到勝者」必須自行關閉，否則成為無人持有的洩漏 socket
@@ -585,28 +638,31 @@ class Socks5ProxyService : Service() {
                 val connectTimeout = 5000L
                 val overallDeadline = connectTimeout + 500L
 
-                for (addr in addresses) {
-                    connectExecutor.execute {
-                        HappyEyeballs.attempt(winner, abandoned, latch,
-                            connect = {
-                                val candidate = java.net.Socket()
-                                try {
-                                    candidate.receiveBufferSize = 3 * 1024 * 1024
-                                    candidate.sendBufferSize = 3 * 1024 * 1024
-                                    candidate.tcpNoDelay = true
-                                    network.bindSocket(candidate)
-                                    candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout.toInt())
-                                    candidate
-                                } catch (e: Exception) {
-                                    try { candidate.close() } catch (e2: Exception) {}
-                                    loserSockets.add(candidate)
-                                    null
-                                }
-                            },
-                            close = { s -> try { s.close() } catch (e: Exception) {} }
-                        )
-                    }
-                }
+                HappyEyeballs.race(
+                    first = ipv6,
+                    deferred = ipv4,
+                    staggerMs = HappyEyeballs.DEFAULT_CONNECTION_ATTEMPT_DELAY_MS,
+                    winner = winner,
+                    abandoned = abandoned,
+                    latch = latch,
+                    dispatch = { run -> connectExecutor.execute(run) },
+                    scheduler = { delay, run -> happyEyeballsScheduler.schedule(run, delay, java.util.concurrent.TimeUnit.MILLISECONDS) },
+                    connect = { addr ->
+                        val candidate = java.net.Socket()
+                        try {
+                            candidate.receiveBufferSize = 3 * 1024 * 1024
+                            candidate.sendBufferSize = 3 * 1024 * 1024
+                            candidate.tcpNoDelay = true
+                            network.bindSocket(candidate)
+                            candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout.toInt())
+                            candidate
+                        } catch (e: Exception) {
+                            try { candidate.close() } catch (e2: Exception) {}
+                            null
+                        }
+                    },
+                    close = { s -> try { s.close() } catch (e: Exception) {} }
+                )
 
                 val got = try {
                     latch.await(overallDeadline, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -628,7 +684,7 @@ class Socks5ProxyService : Service() {
                 val pfd = android.os.ParcelFileDescriptor.fromSocket(socket)
                 val fd = pfd.detachFd()
                 activeSockets[fd] = socket
-                android.util.Log.d("FdAudit", "created fd=$fd map=${activeSockets.size}")
+                if (isDebuggable) android.util.Log.d("FdAudit", "created fd=$fd map=${activeSockets.size}")
                 fd
             }
         } catch (e: Exception) {
@@ -668,6 +724,7 @@ class Socks5ProxyService : Service() {
         cellularNetwork = null
         updateStatus(ProxyStatus.STOPPED)
         serviceScope.cancel()
+        happyEyeballsScheduler.shutdownNow()
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
     }
