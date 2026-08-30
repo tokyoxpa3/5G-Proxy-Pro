@@ -1277,6 +1277,9 @@ static void handle_handshake_fd(int client_fd) {
 
     if (recv(client_fd, buf, 4, MSG_WAITALL) != 4 || buf[0] != 0x05) goto err;
     int cmd = buf[1];
+    // [RFC 1928] RSV 欄位必須為 0x00；非零即協定違規，直接關閉。
+    // 先前未檢查，導致 RSV!=0 的請求照常建立隧道（s2_connect 的 WARN 來源）。
+    if (buf[2] != 0x00) goto err;
     // ... 解析 host/port ...
     char host[256] = {0};
     int port = 0;
