@@ -42,6 +42,11 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
+      - name: Run unit tests
+        run: |
+          chmod +x gradlew
+          ./gradlew test --no-daemon
+
       - name: Build release APK
         run: |
           chmod +x gradlew
