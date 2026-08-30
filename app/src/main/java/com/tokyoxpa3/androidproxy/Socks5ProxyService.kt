@@ -48,6 +48,17 @@ class Socks5ProxyService : Service() {
             { r -> Thread(r, "socks5-dns").apply { isDaemon = true } },
             java.util.concurrent.ThreadPoolExecutor.DiscardPolicy()
         )
+    // [Happy Eyeballs] 連線競速的並行連線改用共享有界執行緒池，取代每次 CONNECT
+    // 對每個解析位址 spawn 一條裸 Thread。大量並發連線下裸 Thread 會無上限產生
+    // 短命執行緒（執行緒 churn）；此池上限 16 工作緒 + 128 佇列，池滿時由握手
+    // 執行緒自行執行（CallerRunsPolicy），天然背壓且不丟失連線嘗試。
+    private val connectExecutor = java.util.concurrent.ThreadPoolExecutor(
+            8, 16,
+            30L, java.util.concurrent.TimeUnit.SECONDS,
+            java.util.concurrent.ArrayBlockingQueue(128),
+            { r -> Thread(r, "socks5-connect").apply { isDaemon = true } },
+            java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy()
+        )
 
     private fun resolveWithCache(network: android.net.Network, host: String): List<java.net.InetAddress> {
         // [關鍵修復] IP 字面值最優先處理（NetRedirector 等 redirector 只送 IP），
@@ -555,6 +566,45 @@ class Socks5ProxyService : Service() {
         }
     }
     
+    /**
+     * [Happy Eyeballs] 單一位址的連線嘗試，交由共享 connectExecutor 並行執行。
+     * 最先成功者經由 winner CAS 勝出並 countDown latch；其餘（含遲到者）自行關閉。
+     */
+    private fun attemptConnect(
+        addr: java.net.InetAddress,
+        port: Int,
+        network: android.net.Network,
+        connectTimeoutMs: Int,
+        winner: java.util.concurrent.atomic.AtomicReference<java.net.Socket>,
+        abandoned: java.util.concurrent.atomic.AtomicBoolean,
+        latch: java.util.concurrent.CountDownLatch,
+        loserSockets: java.util.concurrent.ConcurrentLinkedQueue<java.net.Socket>
+    ) {
+        val candidate = java.net.Socket()
+        try {
+            if (winner.get() != null || abandoned.get()) return
+            candidate.receiveBufferSize = 3 * 1024 * 1024
+            candidate.sendBufferSize = 3 * 1024 * 1024
+            candidate.tcpNoDelay = true
+            network.bindSocket(candidate)
+            candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeoutMs)
+            if (winner.compareAndSet(null, candidate)) {
+                if (abandoned.get()) {
+                    // 主執行緒已放棄：自己關閉並讓出勝者位（不 countDown）
+                    try { candidate.close() } catch (e: Exception) {}
+                    winner.compareAndSet(candidate, null)
+                    return
+                }
+                latch.countDown()
+            } else {
+                try { candidate.close() } catch (e: Exception) {}
+            }
+        } catch (e: Exception) {
+            try { candidate.close() } catch (e2: Exception) {}
+            loserSockets.add(candidate) // 確保關閉（close 後 add 僅為防漏）
+        }
+    }
+
     private fun createSocketBoundToNetwork(host: String, port: Int, isUdp: Boolean): Int {
         val network = cellularNetwork ?: return -1
         return try {
@@ -596,33 +646,9 @@ class Socks5ProxyService : Service() {
                 val overallDeadline = connectTimeout + 500L
 
                 for (addr in addresses) {
-                    val t = Thread {
-                        val candidate = java.net.Socket()
-                        try {
-                            if (winner.get() != null || abandoned.get()) return@Thread
-                            candidate.receiveBufferSize = 3 * 1024 * 1024
-                            candidate.sendBufferSize = 3 * 1024 * 1024
-                            candidate.tcpNoDelay = true
-                            network.bindSocket(candidate)
-                            candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout.toInt())
-                            if (winner.compareAndSet(null, candidate)) {
-                                if (abandoned.get()) {
-                                    // 主執行緒已放棄：自己關閉並讓出勝者位（不 countDown）
-                                    try { candidate.close() } catch (e: Exception) {}
-                                    winner.compareAndSet(candidate, null)
-                                    return@Thread
-                                }
-                                latch.countDown()
-                            } else {
-                                try { candidate.close() } catch (e: Exception) {}
-                            }
-                        } catch (e: Exception) {
-                            try { candidate.close() } catch (e2: Exception) {}
-                            loserSockets.add(candidate) // 確保關閉（close 後 add 僅為防漏）
-                        }
+                    connectExecutor.execute {
+                        attemptConnect(addr, port, network, connectTimeout.toInt(), winner, abandoned, latch, loserSockets)
                     }
-                    t.isDaemon = true
-                    t.start()
                 }
 
                 val got = try {
