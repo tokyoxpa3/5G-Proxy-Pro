@@ -8,6 +8,7 @@ set(CMAKE_C_STANDARD 11)
 set(SOURCE_FILES
     jni_bridge.c
     simple-socks5.c
+    socks5_protocol.c
 )
 
 add_library(androidproxy SHARED
