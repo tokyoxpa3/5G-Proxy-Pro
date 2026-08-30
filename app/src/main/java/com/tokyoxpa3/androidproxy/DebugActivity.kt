@@ -677,6 +677,22 @@ class DebugActivity : Activity() {
         sb.append(cellularIPText.text).append("\n")
 
         sb.append("NativeStats: ").append(NativeEngine.safeGetStats()).append("\n")
+
+        // 附上滾動落檔的歷史痕跡（release 版可直接看，不需 root / debug 版）
+        try {
+            val logFile = java.io.File(filesDir, "engine_stats.log")
+            if (logFile.exists()) {
+                val content = logFile.readText()
+                if (content.isNotBlank()) {
+                    sb.append("\n----- engine_stats.log (tail) -----\n")
+                    sb.append(content.takeLast(4096))
+                    sb.append("\n")
+                }
+            }
+        } catch (e: Exception) {
+            sb.append("\nengine_stats.log: unreadable (").append(e.message).append(")\n")
+        }
+
         return sb.toString()
     }
 
