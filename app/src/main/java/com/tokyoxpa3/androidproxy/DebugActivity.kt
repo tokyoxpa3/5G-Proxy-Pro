@@ -338,6 +338,14 @@ class DebugActivity : Activity() {
             setPadding(0, 32, 0, 32)
             setOnClickListener { toggleProxy() }
         }
+
+        val limitHintText = TextView(this).apply {
+            text = getString(R.string.hint_connection_limit)
+            textSize = 12f
+            setTextColor(0xFF6C757D.toInt())
+            setPadding(8, 16, 8, 0)
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
         
         // IP Display Card
         val ipCard = createCard().apply {
@@ -404,6 +412,7 @@ class DebugActivity : Activity() {
         rootLayout.addView(authLayout)
         rootLayout.addView(passLayout)
         rootLayout.addView(mainButton)
+        rootLayout.addView(limitHintText)
         rootLayout.addView(ipCard)
 
         // Diagnostics Card（自我檢測 + 複製診斷報告）

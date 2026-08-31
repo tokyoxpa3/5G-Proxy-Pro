@@ -747,7 +747,10 @@ static void send_zero_reply(int client_fd, unsigned char rep) {
 // epoll，世代編號防幽靈事件（純驗證抽至 udp_conn.h/c，host 可測），與 TCP 槽位
 // 同一套「永不釋放 + 世代遞增」策略。槽位上限仍受 MAX_CONCURRENT_CONNS 額度控制。
 
-#define UDP_WORKER_COUNT 1
+// [UDP 擴展] 多 worker 分散 epoll 負載：tun2socks 會對每個 UDP socket（DNS/QUIC）
+// 各開一條 session，全部塞進單一 epoll worker 會成單點瓶頸。round-robin 指派
+// （udp_start_session 的 g_udp_next_worker）與建立/join 迴圈皆已參數化，拉高此值即生效。
+#define UDP_WORKER_COUNT 4
 #define UDP_SLOT_COUNT 1088
 
 typedef struct udp_conn_t {
