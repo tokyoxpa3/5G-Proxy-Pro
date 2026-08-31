@@ -64,6 +64,21 @@ int socks5_udp_encode(unsigned char *out, int is_v6, const unsigned char *addr, 
  * v4-mapped 形式呈現）。is_v6=0 時 src 為 4B，否則 16B。 */
 void socks5_addr_normalize(const unsigned char *src, int is_v6, unsigned char *out16);
 
+/* SOCKS5 回覆封裝：寫 [VER=0x05][REP][RSV=0x00][ATYP][ADDR][PORT] 至 out，
+ * 回傳表頭長度（IPv4=10、IPv6=22）。rep 為回覆碼（0x00 成功 / 0x04 等失敗）。
+ * is_v6=0 時 addr 為 4B，否則 16B；port[2] 為 2 位元組網路序。 */
+int socks5_encode_reply(unsigned char *out, unsigned char rep, int is_v6,
+                        const unsigned char *addr, const unsigned char port[2]);
+
+/* UDP-in-TCP frame 長度欄解析與邊界驗證：len_field 為 2 位元組網路序長度。
+ * 4 <= dlen <= max_len 回傳 dlen，否則回傳 -1（<4 裝不下 RSV(2)+FRAG(1)+ATYP(1)
+ * 的合法表頭；>max_len 會爆緩衝）。 */
+int socks5_udp_tcp_frame_len(const unsigned char len_field[2], int max_len);
+
+/* SOCKS5 request 位址欄位長度：atyp=0x01 → 4、0x04 → 16、0x03 → first_byte
+ * （domain 長度，為 0 回傳 -1）。atyp 不合法回傳 -1。供握手讀取 addr 用。 */
+int socks5_request_addr_len(unsigned char atyp, unsigned char first_byte);
+
 #ifdef __cplusplus
 }
 #endif

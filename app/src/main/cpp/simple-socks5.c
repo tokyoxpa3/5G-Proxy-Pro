@@ -20,6 +20,7 @@
 #include <time.h>
 
 #include "socks5_protocol.h"
+#include "conn_state.h"
 
 extern void jni_attach_thread();
 extern void jni_detach_thread();
@@ -41,7 +42,7 @@ extern void release_java_socket(int fd);
 #define CONN_SLOT_COUNT 1088
 #define IDLE_TIMEOUT_SEC 300
 #define UDP_IDLE_TIMEOUT_SEC 60 
-#define CONN_MAGIC 0x5EEDF00Du   // 存活 conn 的驗證值；release 時毒化為 0
+/* CONN_MAGIC 已移至 conn_state.h（供純函式模組與本檔共用同一驗證值） */
 
 static atomic_int g_conn_count = 0;
 static int g_shutdown_pipe[2] = {-1, -1};
@@ -66,6 +67,7 @@ typedef struct full_conn_t {
     int closed; // 標記是否已進入關閉流程（由 list_lock 保護）
     int client_eof; // 客戶端已 FIN（半關閉）: 停止讀取但繼續轉發 target→client
     time_t eof_since; // client_eof 的起始時間（grace period 用）
+    time_t target_eof_since; // target 已 FIN 的起始時間（對稱 client_eof，grace period 用）
     uint32_t client_events;
     uint32_t target_events;
 
@@ -356,8 +358,15 @@ static void update_conn_events(int epoll_fd, full_conn_t *full) {
     if (full->c2t_len == 0 && !full->client_eof) c_ev |= EPOLLIN;
     if (full->t2c_len > 0)  c_ev |= EPOLLOUT;
 
-    uint32_t t_ev = EPOLLRDHUP;
-    if (full->t2c_len == 0) t_ev |= EPOLLIN;
+    // [CLOSE_WAIT 修復] target 已半關閉（FIN）後不再需要 EPOLLRDHUP/EPOLLIN：
+    // 不會再有資料送達，持續 armed 只會讓 level-triggered EPOLLRDHUP 反覆觸發
+    // （熱迴圈）。保留 EPOLLOUT（半關閉的 target 仍可接收）讓 c2t 剩餘資料在
+    // grace period 內排空。
+    uint32_t t_ev = 0;
+    if (!full->target_eof_since) {
+        t_ev = EPOLLRDHUP;
+        if (full->t2c_len == 0) t_ev |= EPOLLIN;
+    }
     if (full->c2t_len > 0)  t_ev |= EPOLLOUT;
 
     // [Slot 修復] 事件攜帶 (gen<<32|slot)，MOD 時必須重用同一識別碼
@@ -366,7 +375,7 @@ static void update_conn_events(int epoll_fd, full_conn_t *full) {
         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, full->client_fd, &ev) == 0) full->client_events = c_ev;
     }
     if (full->target_events != t_ev) {
-        struct epoll_event ev; ev.events = t_ev; ev.data.u64 = full->ep_u64;
+        struct epoll_event ev; ev.events = t_ev; ev.data.u64 = full->ep_u64 | CONN_EV_TARGET_FLAG;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, full->target_fd, &ev) == 0) full->target_events = t_ev;
     }
 }
@@ -461,9 +470,16 @@ static void* worker_loop_safe(void* arg) {
             // [Slot 修復] 事件解碼：低 32 位 = 槽位索引，高 32 位 = 事件發生時的世代。
             // 槽位記憶體永不釋放，以下所有讀取都安全；世代不符 = 幽靈事件（殘留），
             // 直接跳過 —— 不可能處理到已被重用的連線。
-            uint32_t sidx = (uint32_t)(events[i].data.u64 & 0xFFFFFFFFu);
-            uint32_t egen = (uint32_t)(events[i].data.u64 >> 32);
-            if (sidx >= CONN_SLOT_COUNT) {
+            // [可測抽離] 事件識別碼解碼抽至 conn_event_decode（純函式，host 可測）。
+            // client/target 共用 (gen<<32|slot)，target fd 額外帶 CONN_EV_TARGET_FLAG
+            // 以區分 EPOLLRDHUP 來源（對端半關閉是 client 或 target 觸發）。
+            uint32_t sidx, egen; int is_target;
+            conn_event_decode(events[i].data.u64, &sidx, &egen, &is_target);
+            uint64_t key_u64 = events[i].data.u64 & ~CONN_EV_TARGET_FLAG;
+            // [可測抽離] 事件有效性判斷抽至 conn_event_bad_slot / conn_event_check_slot
+            // （純函式，host 可測）。判斷鏈順序（越界 → 未啟用 → 世代/magic → 錯 worker
+            // → 未就緒）若被更動，等同重新打開殘留事件撞重用槽位的 UAF 大門。
+            if (conn_event_bad_slot((int)sidx, CONN_SLOT_COUNT)) {
                 // [Slot 診斷] 速率限制：每 worker 每秒最多 1 筆，避免熱迴圈灌爆 logcat
                 static time_t last_bad_log[WORKER_COUNT] = {0};
                 if (now - last_bad_log[my_widx] >= 1) {
@@ -475,25 +491,29 @@ static void* worker_loop_safe(void* arg) {
                 continue;
             }
             full_conn_t *full = &g_slots[sidx];
-            if (!atomic_load(&g_slot_state[sidx])) {
-                stuck_track(my_widx, me->epoll_fd, events[i].data.u64, "inactive", egen,
+            conn_event_disp_t disp = conn_event_check_slot(
+                egen, full->gen, full->magic,
+                atomic_load(&g_slot_state[sidx]),
+                full->widx, my_widx,
+                full->closed, atomic_load(&full->registered));
+            if (disp == CONN_EV_INACTIVE) {
+                stuck_track(my_widx, me->epoll_fd, key_u64, "inactive", egen,
                             g_slots[sidx].gen, g_slots[sidx].magic, g_slots[sidx].widx,
                             events[i].events, now);
                 atomic_fetch_add(&g_st_bad_slot, 1);
                 continue;
             }
-            if (egen != full->gen || full->magic != CONN_MAGIC) {
+            if (disp == CONN_EV_STALE) {
                 // 幽靈事件：正常情況下 gen 遞增後舊事件全部失效。此計數 > 0 證明
                 // 殘留事件確實存在且被正確防禦（舊設計下這正是 SIGSEGV 來源）
-                stuck_track(my_widx, me->epoll_fd, events[i].data.u64, "stale", egen,
+                stuck_track(my_widx, me->epoll_fd, key_u64, "stale", egen,
                             full->gen, full->magic, full->widx, events[i].events, now);
                 atomic_fetch_add(&g_st_stale_skip, 1);
                 continue;
             }
-            if (full->widx != my_widx) continue;
-            // [H2 修復] closed 或尚未完成 epoll 註冊的連線一律跳過：
+            // [H2 修復] 錯 worker / closed / 尚未完成 epoll 註冊的連線一律跳過：
             // handoff 的兩個 ADD 完成前，事件提前送達會與初始化競態
-            if (full->closed || !atomic_load(&full->registered)) continue;
+            if (disp == CONN_EV_WRONG_WORKER || disp == CONN_EV_NOT_READY) continue;
 
             full->last_active = now;
             uint32_t ev = events[i].events;
@@ -533,6 +553,16 @@ static void* worker_loop_safe(void* arg) {
                         if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off) < 0) fatal_error = 1;
                     } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) fatal_error = 1;
                 }
+            }
+
+            // [CLOSE_WAIT 修復] 主動處理 EPOLLRDHUP：對端已送 FIN（半關閉）。
+            // 藉由 is_target 精確區分來源——target 半關閉時記下 target_eof_since，
+            // 交由下方 5 秒掃描的 grace period 回收（對稱 client_eof）。過去 target
+            // FIN 只在 t2c_len==0 時能被 recv 偵測；client 停滯（t2c_len>0，緩衝塞滿）
+            // 時 recv 被跳過、EPOLLRDHUP 又被忽略 → 上游 fd 卡 CLOSE_WAIT 永不回收。
+            if (!fatal_error && is_target && !full->target_eof_since &&
+                (ev & EPOLLRDHUP) && full->target_fd >= 0) {
+                full->target_eof_since = now;
             }
 
             // 緩衝清空後以 MSG_PEEK 偵測對端是否已 FIN:
@@ -577,16 +607,31 @@ static void* worker_loop_safe(void* arg) {
             full_conn_t *curr = me->conn_list_head;
             while (curr) {
                 full_conn_t *next = curr->next;
+                // [CLOSE_WAIT 修復] 主動偵測 target FIN：client 停滯（t2c 塞滿）時，
+                // 正常 target 讀取（事件迴圈只在 t2c_len==0 才 recv）被跳過，target
+                // 的 FIN 永遠無法經由事件迴圈偵測 → 上游 fd 卡 CLOSE_WAIT。此處對
+                // 仍有效、尚有未排空資料的 conn 做一次 MSG_PEEK，確認 target 是否
+                // 已半關閉；確認後以 target_eof_since + 2 秒 grace 回收（對稱 client_eof）。
+                if (curr->magic == CONN_MAGIC && !curr->closed && atomic_load(&curr->registered) &&
+                    !curr->target_eof_since && curr->t2c_len > 0 && curr->target_fd >= 0) {
+                    char peek;
+                    if (recv(curr->target_fd, &peek, 1, MSG_PEEK) == 0) {
+                        curr->target_eof_since = now;
+                    }
+                }
                 // 檢查是否超時且未被關閉
                 // 1. 一般 idle 超時
                 // 2. client 已半關閉且超過 2 秒 grace period（target 的 keep-alive
                 //    連線不會發 FIN，事件迴圈不會再觸發，必須靠這裡回收，
                 //    否則 CLOSE_WAIT 堆積消耗 fd）
+                // 3. target 已半關閉（FIN）且超過 2 秒 grace period：client 停滯
+                //    未讀導致剩餘資料無法排空，強制回收上游 fd（對稱第 2 點）
                 // magic 檢查：已毒化（finalize 進行中）的 conn 不收集，
                 // finalize 的防禦移除會負責把它解開，避免雙重移除
                 if (curr->magic == CONN_MAGIC && !curr->closed && atomic_load(&curr->registered) &&
                     (now - curr->last_active > IDLE_TIMEOUT_SEC ||
-                    (curr->client_eof && now - curr->eof_since >= 2))) {
+                    (curr->client_eof && now - curr->eof_since >= 2) ||
+                    (curr->target_eof_since && now - curr->target_eof_since >= 2))) {
                     curr->closed = 1;
                     list_remove_locked(me, curr);
                     if (garbage_count < MAX_EVENTS) garbage_list[garbage_count++] = curr;
@@ -703,6 +748,7 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     full->closed = 0;
     full->client_eof = 0;
     full->eof_since = 0;
+    full->target_eof_since = 0;
     full->c2t_len = 0; full->c2t_off = 0;
     full->t2c_len = 0; full->t2c_off = 0;
 
@@ -723,7 +769,9 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     struct epoll_event ev;
     ev.events = full->client_events; ev.data.u64 = full->ep_u64;
     if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) != 0) goto add_failed;
-    ev.events = full->target_events; ev.data.u64 = full->ep_u64;
+    // [CLOSE_WAIT 修復] target fd 額外帶 CONN_EV_TARGET_FLAG（bit31），
+    // worker 事件迴圈以此區分 EPOLLRDHUP 是 client 或 target 的對端半關閉
+    ev.events = full->target_events; ev.data.u64 = full->ep_u64 | CONN_EV_TARGET_FLAG;
     if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev) != 0) goto add_failed;
     // client_fd 已 ADD 成功的情境：close 時核心會自動把它從 epoll 移除，無需 DEL
 
@@ -790,8 +838,25 @@ static int build_sockaddr(unsigned char atyp, const unsigned char *addr, const u
     return -1;
 }
 
+/* 回覆 BND 為 0.0.0.0:0 的標準回覆（CONNECT 成功/失敗、UDP pool 滿、UDP-in-TCP）。
+ * 回覆封裝抽至 socks5_encode_reply（純函式，host 可測），此處只帶入全 0 位址。 */
+static void send_zero_reply(int client_fd, unsigned char rep) {
+    unsigned char zero4[4] = {0, 0, 0, 0};
+    unsigned char zero2[2] = {0, 0};
+    unsigned char out[10];
+    int n = socks5_encode_reply(out, rep, 0, zero4, zero2);
+    send(client_fd, out, n, MSG_NOSIGNAL);
+}
+
 static void handle_udp_session_full(int client_fd) {
-    atomic_fetch_add(&g_conn_count, 1);
+    // [連線額度] UDP session 與 TCP 共用 g_conn_count 的 MAX_CONCURRENT_CONNS 上限：
+    // CAS 預佔，超限即回 REP=0x04 讓客戶端退避，避免 DNS/QUIC 洪水把帳目推爆。
+    if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
+        atomic_fetch_sub(&g_conn_count, 1);
+        send_zero_reply(client_fd, 0x04);
+        close(client_fd);
+        return;
+    }
 
     // [IPv6 支援] 標準 UDP ASSOCIATE 的本地 relay socket 改為雙棧：綁定 ::
     //（IPV6_V6ONLY=0），IPv4 封包會以 v4-mapped 形式送達，IPv6 客戶端也能走
@@ -829,31 +894,29 @@ static void handle_udp_session_full(int client_fd) {
 
     // 回覆的 BND.ADDR 取控制連線的本地（伺服器端）位址：客戶端把 UDP 封包送往
     // 這個位址。客戶端走 IPv6（且非 v4-mapped）時以 ATYP=0x04 回覆。
-    unsigned char resp[22] = {0};
-    resp[0] = 0x05; resp[1] = 0x00; resp[2] = 0x00;
-    int resp_len = 10;
+    // 回覆封裝抽至 socks5_encode_reply（純函式，host 可測）。
+    unsigned char resp[22];
+    int resp_len = 0;
+    unsigned char resp_port[2] = { (unsigned char)(p >> 8), (unsigned char)(p & 0xFF) };
     struct sockaddr_storage ss; socklen_t slen = sizeof(ss);
     if (getsockname(client_fd, (struct sockaddr*)&ss, &slen) == 0) {
         if (ss.ss_family == AF_INET) {
             struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
-            resp[3] = 0x01; /* ATYP IPv4 */
-            memcpy(&resp[4], &s4->sin_addr, 4);
+            resp_len = socks5_encode_reply(resp, 0x00, 0, (const unsigned char *)&s4->sin_addr, resp_port);
         } else if (ss.ss_family == AF_INET6) {
             struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
             if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
-                resp[3] = 0x01;
-                memcpy(&resp[4], &s6->sin6_addr.s6_addr[12], 4);
+                resp_len = socks5_encode_reply(resp, 0x00, 0, (const unsigned char *)&s6->sin6_addr.s6_addr[12], resp_port);
             } else {
-                resp[3] = 0x04; /* ATYP IPv6 */
-                memcpy(&resp[4], &s6->sin6_addr, 16);
-                resp_len = 22;
+                resp_len = socks5_encode_reply(resp, 0x00, 1, (const unsigned char *)&s6->sin6_addr, resp_port);
             }
         }
     }
-    if (resp_len == 22) {
-        resp[20] = p >> 8; resp[21] = p & 0xFF;
-    } else {
-        resp[8] = p >> 8; resp[9] = p & 0xFF;
+    if (resp_len == 0) {
+        // getsockname 失敗的極端情況：回退全 0 的 v4 成功回覆
+        unsigned char zero4[4] = {0,0,0,0};
+        unsigned char zero2[2] = {0,0};
+        resp_len = socks5_encode_reply(resp, 0x00, 0, zero4, zero2);
     }
 
     // 1. 發送 SOCKS5 UDP 握手成功回覆
@@ -978,19 +1041,24 @@ static void handle_udp_session_full(int client_fd) {
 // frame = [2-byte 長度, network order] + [SOCKS5 UDP datagram]
 //        datagram = RSV(2)=0 + FRAG(1)=0 + ATYP(0x01|0x04) + ADDR + PORT(2) + DATA
 static void handle_udp_tcp_session(int client_fd) {
-    atomic_fetch_add(&g_conn_count, 1);
+    // [連線額度] 與標準 UDP ASSOCIATE 一致：共用 MAX_CONCURRENT_CONNS 上限，
+    // 超限回 REP=0x04 讓客戶端退回標準協定。
+    if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
+        atomic_fetch_sub(&g_conn_count, 1);
+        send_zero_reply(client_fd, 0x04);
+        close(client_fd);
+        return;
+    }
 
     // 先建立 5G UDP socket，成功才回覆成功；失敗回 REP=0x04 讓 client 退回標準協定
     int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
-    unsigned char resp[10] = {0x05, 0x00, 0, 0x01, 0,0,0,0, 0,0};
     if (remote_udp_fd < 0) {
-        resp[1] = 0x04; // host unreachable（此擴充指令失敗）
-        send(client_fd, resp, 10, MSG_NOSIGNAL);
+        send_zero_reply(client_fd, 0x04); // host unreachable（此擴充指令失敗）
         close(client_fd);
         atomic_fetch_sub(&g_conn_count, 1);
         return;
     }
-    send(client_fd, resp, 10, MSG_NOSIGNAL);
+    send_zero_reply(client_fd, 0x00);
 
     // 取消 handshake 階段的 5 秒讀超時；blocking socket 由 poll 決定何時讀寫
     struct timeval tv = {UDP_IDLE_TIMEOUT_SEC, 0};
@@ -1021,8 +1089,9 @@ static void handle_udp_tcp_session(int client_fd) {
         if (fds[1].revents) {
             unsigned char h[2];
             if (recv(client_fd, h, 2, MSG_WAITALL) != 2) break;
-            int dlen = (h[0] << 8) | h[1];
-            if (dlen < 4 || dlen > BUFFER_SIZE) break; // 協定違規
+            // frame 長度邊界驗證抽至 socks5_udp_tcp_frame_len（純函式，host 可測）
+            int dlen = socks5_udp_tcp_frame_len(h, BUFFER_SIZE);
+            if (dlen < 0) break; // 協定違規：裝不下表頭或爆緩衝
             if (recv(client_fd, datagram, dlen, MSG_WAITALL) != dlen) break;
 
             // 解析 SOCKS5 UDP datagram（RSV=0、FRAG=0、ATYP 驗證抽至 socks5_udp_parse）
@@ -1113,21 +1182,24 @@ void socks5_server_set_auth(const char *user, const char *pass) {
 // [item2] 帳密以參數傳入（handshake 開始時的鎖內快照），避免讀取過程被修改
 static int do_auth_check(int client_fd, unsigned char *buf, const char *auth_user, const char *auth_pass) {
     unsigned char ulen, plen;
+    unsigned char user_buf[256];
+    unsigned char pass_buf[256];
 
     if (recv(client_fd, buf, 2, MSG_WAITALL) != 2 || buf[0] != 0x01) return -1;
     ulen = buf[1];
     if (ulen == 0 || ulen > 255) return -1;
-    // 帳號使用獨立緩衝區，避免後續 PLEN/密碼讀取覆蓋帳號內容
-    if (recv(client_fd, buf + 2, ulen, MSG_WAITALL) != ulen) return -1;
+    // 帳號與密碼各用獨立緩衝（ulen/plen 皆為單 byte 0..255），
+    // 不再以 buf 上的隱式偏移（buf+2 / buf+258）共享同一塊記憶體
+    if (recv(client_fd, user_buf, ulen, MSG_WAITALL) != ulen) return -1;
     if (recv(client_fd, buf, 1, MSG_WAITALL) != 1) return -1;
     plen = buf[0];
     if (plen > 255) return -1;
-    // 密碼也使用獨立緩衝區（允許 plen == 0：設定的密碼為空時，客戶端可不送密碼）
-    if (plen > 0 && recv(client_fd, buf + 258, plen, MSG_WAITALL) != plen) return -1;
+    // 允許 plen == 0：設定的密碼為空時，客戶端可不送密碼
+    if (plen > 0 && recv(client_fd, pass_buf, plen, MSG_WAITALL) != plen) return -1;
 
     // 帳號與密碼都必須完全相符（啟用認證時兩欄皆非空，因此不再允許空值放行）。
     // 比對邏輯抽至 socks5_check_credentials（純函式，可 host 單元測試）
-    int ok = socks5_check_credentials(buf + 2, ulen, buf + 258, plen, auth_user, auth_pass);
+    int ok = socks5_check_credentials(user_buf, ulen, pass_buf, plen, auth_user, auth_pass);
 
     send(client_fd, ok ? "\x01\x00" : "\x01\x01", 2, MSG_NOSIGNAL);
     return ok ? 0 : -1;
@@ -1268,6 +1340,9 @@ static void handle_handshake_fd(int client_fd) {
     unsigned char buf[1024]; 
     struct timeval tv = {5, 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+    // [健壯性] 回覆寫入同樣設 5 秒超時：握手 socket 為 blocking，慢速客戶端
+    // （只連不讀的 slowloris 式）會讓 send() 無限阻塞、佔死握手執行緒。
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
 
     if (recv(client_fd, buf, 2, MSG_WAITALL) != 2 || buf[0] != 0x05) goto err;
     int nmethods = buf[1];
@@ -1307,13 +1382,24 @@ static void handle_handshake_fd(int client_fd) {
     // ... 解析 host/port ...
     char host[256] = {0};
     int port = 0;
-    // (解析邏輯同原檔)
     int atyp = buf[3];
-    if (atyp == 0x01) { recv(client_fd, buf, 4, MSG_WAITALL); inet_ntop(AF_INET, buf, host, 256); }
-    else if (atyp == 0x03) { recv(client_fd, buf, 1, MSG_WAITALL); int len = buf[0]; recv(client_fd, buf, len, MSG_WAITALL); memcpy(host, buf, len); }
-    else if (atyp == 0x04) { recv(client_fd, buf, 16, MSG_WAITALL); inet_ntop(AF_INET6, buf, host, 256); }
-    else goto err;
-    recv(client_fd, buf, 2, MSG_WAITALL); port = (buf[0] << 8) | buf[1];
+    int addr_len;
+    if (atyp == 0x03) {
+        if (recv(client_fd, buf, 1, MSG_WAITALL) != 1) goto err;
+        addr_len = socks5_request_addr_len(atyp, buf[0]);
+        if (addr_len <= 0) goto err; // domain 長度為 0 等協定違規
+        if (recv(client_fd, buf, addr_len, MSG_WAITALL) != addr_len) goto err;
+        memcpy(host, buf, addr_len);
+        host[addr_len] = '\0';
+    } else {
+        addr_len = socks5_request_addr_len(atyp, 0);
+        if (addr_len <= 0) goto err; // ATYP 不合法（validate 已擋，此為雙保險）
+        if (recv(client_fd, buf, addr_len, MSG_WAITALL) != addr_len) goto err;
+        if (atyp == 0x01) inet_ntop(AF_INET, buf, host, 256);
+        else inet_ntop(AF_INET6, buf, host, 256);
+    }
+    if (recv(client_fd, buf, 2, MSG_WAITALL) != 2) goto err;
+    port = (buf[0] << 8) | buf[1];
 
     if (cmd == 0x01) { // TCP
         tv.tv_sec = 0; setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
@@ -1327,12 +1413,10 @@ static void handle_handshake_fd(int client_fd) {
         int target_fd = request_java_5g_socket(host, port, 0);
         if (target_fd < 0) {
             atomic_fetch_sub(&g_conn_count, 1);
-            unsigned char fail[10] = {0x05, 0x04, 0, 0x01, 0,0,0,0, 0,0}; 
-            send(client_fd, fail, 10, MSG_NOSIGNAL); 
+            send_zero_reply(client_fd, 0x04);
             goto err;
         }
-        unsigned char success[10] = {0x05, 0x00, 0, 0x01, 0,0,0,0, 0,0}; 
-        send(client_fd, success, 10, MSG_NOSIGNAL);
+        send_zero_reply(client_fd, 0x00);
         
         // 轉交給 Worker
         handoff_to_worker(client_fd, target_fd);
@@ -1342,8 +1426,7 @@ static void handle_handshake_fd(int client_fd) {
         // [UDP 池] 轉交專用 UDP session 池；池滿時回 REP=0x04 讓客戶端
         // 退避/關閉，不讓長命 UDP session 佔死握手執行緒池
         if (job_pool_enqueue(&g_udp_pool, client_fd, cmd) != 0) {
-            unsigned char fail[10] = {0x05, 0x04, 0, 0x01, 0,0,0,0, 0,0};
-            send(client_fd, fail, 10, MSG_NOSIGNAL);
+            send_zero_reply(client_fd, 0x04);
             close(client_fd);
         }
         return;

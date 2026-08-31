@@ -57,18 +57,46 @@ int socks5_udp_parse(const unsigned char *dgram, size_t len,
     return -1; /* DOMAIN 或其他 ATYP：UDP datagram 不允許 */
 }
 
+/* 寫入 [ATYP][ADDR][PORT] 至 p（p[0]=ATYP），回傳 7（v4）或 19（v6）bytes。
+ * UDP datagram 表頭與 SOCKS5 回覆共用此段（差異只在前面 3 bytes），
+ * 收斂在此避免兩處各自貼上造成位址/埠偏移漂移。 */
+static int encode_addr_port(unsigned char *p, int is_v6, const unsigned char *addr, const unsigned char port[2]) {
+    if (!is_v6) {
+        p[0] = SOCKS5_ATYP_IPV4;
+        memcpy(p + 1, addr, 4);
+        memcpy(p + 5, port, 2);
+        return 7;
+    }
+    p[0] = SOCKS5_ATYP_IPV6;
+    memcpy(p + 1, addr, 16);
+    memcpy(p + 17, port, 2);
+    return 19;
+}
+
 int socks5_udp_encode(unsigned char *out, int is_v6, const unsigned char *addr, const unsigned char port[2]) {
     out[0] = 0; out[1] = 0; out[2] = 0; /* RSV(2) + FRAG(1) */
-    if (!is_v6) {
-        out[3] = SOCKS5_ATYP_IPV4;
-        memcpy(out + 4, addr, 4);
-        memcpy(out + 8, port, 2);
-        return 10;
-    }
-    out[3] = SOCKS5_ATYP_IPV6;
-    memcpy(out + 4, addr, 16);
-    memcpy(out + 20, port, 2);
-    return 22;
+    return 3 + encode_addr_port(out + 3, is_v6, addr, port);
+}
+
+int socks5_encode_reply(unsigned char *out, unsigned char rep, int is_v6,
+                        const unsigned char *addr, const unsigned char port[2]) {
+    out[0] = 0x05; /* VER */
+    out[1] = rep;
+    out[2] = 0x00; /* RSV */
+    return 3 + encode_addr_port(out + 3, is_v6, addr, port);
+}
+
+int socks5_udp_tcp_frame_len(const unsigned char len_field[2], int max_len) {
+    int dlen = (len_field[0] << 8) | len_field[1];
+    if (dlen < 4 || dlen > max_len) return -1; /* 協定違規：裝不下表頭或爆緩衝 */
+    return dlen;
+}
+
+int socks5_request_addr_len(unsigned char atyp, unsigned char first_byte) {
+    if (atyp == SOCKS5_ATYP_IPV4) return 4;
+    if (atyp == SOCKS5_ATYP_IPV6) return 16;
+    if (atyp == SOCKS5_ATYP_DOMAIN) return first_byte >= 1 ? (int)first_byte : -1;
+    return -1;
 }
 
 void socks5_addr_normalize(const unsigned char *src, int is_v6, unsigned char *out16) {
