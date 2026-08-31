@@ -100,4 +100,5 @@ Also set this App\'s battery saver to \"No restrictions\".</string>
     <string name="self_test_fail">❌ Self test failed</string>
     <string name="diagnostics_title">5G Proxy Pro Diagnostics</string>
     <string name="diagnostics_copied">Diagnostics copied to clipboard</string>
+    <string name="hint_connection_limit">💡 Tip: Avoid opening too many concurrent connections (e.g. high BitTorrent connection limits) to keep the phone proxy stable.</string>
 </resources>
