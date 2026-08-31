@@ -6,8 +6,6 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -23,6 +21,7 @@
 #include "conn_state.h"
 #include "conn_forward.h"
 #include "udp_conn.h"
+#include "ghost_purge.h"
 
 extern void jni_attach_thread();
 extern void jni_detach_thread();
@@ -126,7 +125,6 @@ static atomic_llong g_st_stale_skip = 0;   // gen 不符被跳過的事件數（
 static atomic_llong g_st_bad_slot = 0;     // slot 越界 / 槽位未啟用
 static atomic_llong g_st_exhausted = 0;    // 槽位耗盡次數
 static atomic_llong g_st_double_fin = 0;   // 二次 finalize 嘗試
-static atomic_llong g_st_ghost_purged = 0; // 幽靈註冊被強制拔除次數
 
 // 取得空閒槽位並遞增世代。回傳 slot 索引，耗盡回傳 -1。
 // 只在 handoff_to_worker（握手池執行緒）呼叫。
@@ -168,135 +166,6 @@ static void slots_init(void) {
         g_free_slots[i] = i;
     }
     g_free_slot_top = CONN_SLOT_COUNT;
-}
-
-// [Slot 診斷] 卡死事件追蹤：同一 u64 被連續跳過 N 次代表某個 fd 卡在 epoll 裡
-// （正常殘留事件只出現一兩次就消失）。用小雜湊表記錄，門檻到達時大聲記 log。
-#define STUCK_TRACK_SLOTS 512
-#define STUCK_TRACK_MASK (STUCK_TRACK_SLOTS - 1)
-typedef struct { uint64_t u64; long long count; time_t last_log; int used; } stuck_ent_t;
-static stuck_ent_t g_stuck[STUCK_TRACK_SLOTS];
-
-// [幽靈清除器] 記錄每個註冊戳記對應的 fd 對。當某戳記的殘留事件超過門檻
-//（代表其底層 fd 因任何未知路徑仍開著且永久就緒），直接對兩個記錄的 fd 做
-// EPOLL_CTL_DEL —— 無論洩漏根源為何，熱迴圈都會被切斷（DEL 對已關閉/未註冊
-// 的 fd 只是無害失敗）。環形覆寫，只需涵蓋近期註冊。
-#define STAMP_RING_SIZE 4096
-#define STAMP_RING_MASK (STAMP_RING_SIZE - 1)
-typedef struct {
-    uint64_t u64;
-    int client_fd;
-    int target_fd;
-    int widx;
-    unsigned long long c_ino, t_ino;   // 註冊當下的 inode（跨 dup 引用比對用）
-} stamp_ent_t;
-static stamp_ent_t g_stamp_ring[STAMP_RING_SIZE];
-static atomic_int g_stamp_ring_pos = 0;
-static pthread_mutex_t g_stamp_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void stamp_record(uint64_t u64, int client_fd, int target_fd, int widx) {
-    struct stat st;
-    unsigned long long ci = 0, ti = 0;
-    if (client_fd >= 0 && fstat(client_fd, &st) == 0) ci = ((unsigned long long)st.st_dev << 32) | st.st_ino;
-    if (target_fd >= 0 && fstat(target_fd, &st) == 0) ti = ((unsigned long long)st.st_dev << 32) | st.st_ino;
-    pthread_mutex_lock(&g_stamp_lock);
-    int pos = atomic_fetch_add(&g_stamp_ring_pos, 1) & STAMP_RING_MASK;
-    g_stamp_ring[pos].u64 = u64;
-    g_stamp_ring[pos].client_fd = client_fd;
-    g_stamp_ring[pos].target_fd = target_fd;
-    g_stamp_ring[pos].widx = widx;
-    g_stamp_ring[pos].c_ino = ci;
-    g_stamp_ring[pos].t_ino = ti;
-    pthread_mutex_unlock(&g_stamp_lock);
-}
-
-// [幽靈清除器 v2] epoll 註冊錨定在「開啟描述」而非 fd 編號：若 conn 的 C 端副本
-// 已關閉但另一個 dup 引用（如 Java 端原生 fd）仍存活，DEL(舊編號) 會 ENOENT，
-// 幽靈註冊繼續發事件。因此這裡改以「inode 反查」：掃描 /proc/self/fd 找出
-// 仍指向同一描述的任何 fd 編號，對其執行 DEL —— 無論倖存引用是誰都拔得掉。
-static int stamp_purge(uint64_t u64) {
-    int found = 0;
-    unsigned long long cino = 0, tino = 0;
-    int cfd = -1, tfd = -1;
-    struct epoll_event ev;
-    pthread_mutex_lock(&g_stamp_lock);
-    for (int i = 0; i < STAMP_RING_SIZE; i++) {
-        if (g_stamp_ring[i].u64 == u64) {
-            cino = g_stamp_ring[i].c_ino; tino = g_stamp_ring[i].t_ino;
-            cfd = g_stamp_ring[i].client_fd; tfd = g_stamp_ring[i].target_fd;
-            found = 1;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_stamp_lock);
-    if (!found) return 0;
-
-    // 直接編號先試（多數情況描述已死、編號未重用）
-    for (int w = 0; w < WORKER_COUNT; w++) {
-        if (cfd >= 0) epoll_ctl(workers[w].epoll_fd, EPOLL_CTL_DEL, cfd, &ev);
-        if (tfd >= 0) epoll_ctl(workers[w].epoll_fd, EPOLL_CTL_DEL, tfd, &ev);
-    }
-
-    // [節流] inode 掃描成本高（opendir + 每個 fd fstat），全域每 200ms 限一次；
-    // 幽靈事件在掃描前仍會被 gen/state 檢查擋下，只是延後拔除，正確性不受影響
-    static atomic_llong g_last_scan_ms = 0;
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    long long prev_ms = atomic_load(&g_last_scan_ms);
-    if (now_ms - prev_ms < 200) return 1;
-    if (!atomic_compare_exchange_strong(&g_last_scan_ms, &prev_ms, now_ms)) return 1;
-
-    // inode 反查：掃 /proc/self/fd，對每個數值 fd 做 fstat 比對 dev:ino
-    DIR *d = opendir("/proc/self/fd");
-    if (!d) return 1;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-        int n = atoi(de->d_name);
-        if (n < 0) continue;
-        struct stat st2;
-        if (fstat(n, &st2) != 0) continue;
-        unsigned long long id = ((unsigned long long)st2.st_dev << 32) | st2.st_ino;
-        if ((cino && id == cino) || (tino && id == tino)) {
-            for (int w = 0; w < WORKER_COUNT; w++)
-                epoll_ctl(workers[w].epoll_fd, EPOLL_CTL_DEL, n, &ev);
-        }
-    }
-    closedir(d);
-    return 1;
-}
-
-#define GHOST_PURGE_THRESHOLD 5000
-
-static void stuck_track(int my_widx, int epoll_fd, uint64_t u64, const char *why,
-                        uint32_t egen, uint32_t gennow, uint32_t magicv, int widx_v,
-                        uint32_t ev, time_t now) {
-    stuck_ent_t *e = &g_stuck[(u64 >> 13) & STUCK_TRACK_MASK];
-    if (!e->used || e->u64 != u64) {
-        // 槽被別的 u64 佔走或首次：直接重置（碰撞時統計略低估可接受）
-        e->u64 = u64; e->count = 0; e->used = 1; e->last_log = 0;
-    }
-    e->count++;
-    long long c = e->count;
-    if ((c == 32 || c == 200 || c == 1000 || c == 5000 || c == 25000 ||
-         (c > 25000 && (c % 50000) == 0)) && now - e->last_log >= 1) {
-        e->last_log = now;
-        LOGE("STUCK %s u64=%llx slot=%u gen_evt=%u gen_now=%u magic=%x widx=%d events=%x count=%lld",
-             why, (unsigned long long)u64, (uint32_t)(u64 & 0xFFFFFFFFu),
-             egen, gennow, magicv, widx_v, ev, c);
-    }
-    // [幽靈清除器] 同一戳記殘留過多 = 底層 fd 未被正常回收且永久就緒，
-    // 主動從所有 worker 的 epoll 拔除，杜絕熱迴圈（fd 本體留給洩漏追蹤）
-    if (c == GHOST_PURGE_THRESHOLD || (c > GHOST_PURGE_THRESHOLD && (c % GHOST_PURGE_THRESHOLD) == 0)) {
-        int purged = stamp_purge(u64);
-        if (purged) {
-            atomic_fetch_add(&g_st_ghost_purged, 1);
-            LOGE("GHOST PURGED u64=%llx slot=%u after %lld residual events",
-                 (unsigned long long)u64, (uint32_t)(u64 & 0xFFFFFFFFu), c);
-            e->count = 0; // 重置計數，若又出現代表另有來源
-        }
-    }
 }
 
 static atomic_int server_running = 0;
@@ -430,8 +299,15 @@ static void conn_finalize(full_conn_t *conn) {
         // 留在 epoll 永久就緒 → level-triggered 事件風暴 → 舊設計下殘留事件
         // 撞重用記憶體 = SIGSEGV 的真正源頭。
         // 因此必須雙邊各關各的：C 關自己的副本，並通知 Java 關 Socket（原生）。
-        close(conn->target_fd);
+        //
+        // [fd 重用競態 2026-08-31] 順序必須是「先 release 再 close」：
+        // activeSockets 以 fd 編號當 key，close() 一執行該編號即被 OS 釋放、
+        // 可能立刻被並發握手執行緒的 detachFd() 重用。若先 close 再 release，
+        // 延遲抵達的 JNI map.remove(fd) 會誤刪並關閉「重用編號」上的無辜連線。
+        // dup 語意下兩邊是不同編號、指向同一描述，先關 Java 端不影響 C 端副本，
+        // 描述要等 C 端也 close 後才真正銷毀（發 FIN）。
         release_java_socket(conn->target_fd); // Java 端 socket.close() 收掉原生 fd
+        close(conn->target_fd);
         conn->target_fd = -1;
     }
 
@@ -506,17 +382,17 @@ static void* worker_loop_safe(void* arg) {
                 full->widx, my_widx,
                 full->closed, atomic_load(&full->registered));
             if (disp == CONN_EV_INACTIVE) {
-                stuck_track(my_widx, me->epoll_fd, key_u64, "inactive", egen,
-                            g_slots[sidx].gen, g_slots[sidx].magic, g_slots[sidx].widx,
-                            events[i].events, now);
+                ghost_stuck_track(key_u64, "inactive", egen,
+                                  g_slots[sidx].gen, g_slots[sidx].magic, g_slots[sidx].widx,
+                                  events[i].events, now);
                 atomic_fetch_add(&g_st_bad_slot, 1);
                 continue;
             }
             if (disp == CONN_EV_STALE) {
                 // 幽靈事件：正常情況下 gen 遞增後舊事件全部失效。此計數 > 0 證明
                 // 殘留事件確實存在且被正確防禦（舊設計下這正是 SIGSEGV 來源）
-                stuck_track(my_widx, me->epoll_fd, key_u64, "stale", egen,
-                            full->gen, full->magic, full->widx, events[i].events, now);
+                ghost_stuck_track(key_u64, "stale", egen,
+                                  full->gen, full->magic, full->widx, events[i].events, now);
                 atomic_fetch_add(&g_st_stale_skip, 1);
                 continue;
             }
@@ -670,7 +546,7 @@ static void* worker_loop_safe(void* arg) {
                      atomic_load(&g_conn_count),
                      (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
                      (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
-                     (long long)atomic_load(&g_st_exhausted), (long long)atomic_load(&g_st_ghost_purged));
+                     (long long)atomic_load(&g_st_exhausted), ghost_purge_get_count());
             }
 #endif
         }
@@ -730,7 +606,9 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     int slot = slot_acquire();
     if (slot < 0) {
         atomic_fetch_sub(&g_conn_count, 1);
-        close(client_fd); close(target_fd); release_java_socket(target_fd); return;
+        // [fd 重用競態] 同樣必須先 release_java_socket 再 close(target_fd)，否則
+        // close 後 fd 編號可能被立即重用，導致 map.remove 誤刪並發建立的新連線。
+        release_java_socket(target_fd); close(client_fd); close(target_fd); return;
     }
     full_conn_t *full = &g_slots[slot];
 
@@ -787,7 +665,7 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev) != 0) goto add_failed;
     // client_fd 已 ADD 成功的情境：close 時核心會自動把它從 epoll 移除，無需 DEL
 
-    stamp_record(full->ep_u64, client_fd, target_fd, idx); // [幽靈清除器] 記錄戳記→fd 對應
+    ghost_stamp_record(full->ep_u64, client_fd, target_fd, idx); // [幽靈清除器] 記錄戳記→fd 對應
     atomic_store(&full->registered, 1); // 事件從此可交付 worker
     // [H2 修復 v2] 成功路徑不再扣 ref：conn 的 base ref（=1）由 worker 持有，
     // 待 worker 日後垃圾回收時 unref（1→0）→ finalize
@@ -990,8 +868,11 @@ static void udp_conn_finalize(udp_conn_t *u) {
     if (u->client_fd >= 0) { close(u->client_fd); u->client_fd = -1; }
     if (u->local_udp_fd >= 0) { close(u->local_udp_fd); u->local_udp_fd = -1; }
     if (u->remote_udp_fd >= 0) {
-        close(u->remote_udp_fd);
+        // [fd 重用競態] 先 release 再 close：close 後 fd 編號可能被立即重用，
+        // 導致 activeSockets.map.remove(fd) 誤刪並發建立的新 session。詳見
+        // conn_finalize 的完整說明（dup 語意、先關 Java 端不影響 C 端副本）。
         release_java_socket(u->remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
+        close(u->remote_udp_fd);
         u->remote_udp_fd = -1;
     }
     free(u->in_buf); u->in_buf = NULL;
@@ -1719,12 +1600,15 @@ static void* listener_task(void* arg) {
     // [Slot 修復] 每次啟動重建空閒槽位堆疊（gen 延續遞增，跨重啟仍不混淆）
     slots_init();
 
+    int worker_ep_fds[WORKER_COUNT];
     for (int i = 0; i < WORKER_COUNT; i++) {
         workers[i].epoll_fd = epoll_create1(0);
+        worker_ep_fds[i] = workers[i].epoll_fd;
         workers[i].conn_list_head = NULL;
         pthread_mutex_init(&workers[i].list_lock, NULL); // [關鍵] 初始化鎖
         pthread_create(&workers[i].thread_id, NULL, worker_loop_safe, &workers[i]);
     }
+    ghost_purge_set_epoll_fds(worker_ep_fds, WORKER_COUNT);
 
     // [執行緒池] 握手池（短命任務）
     job_pool_init(&g_handshake_pool, HANDSHAKE_POOL_SIZE, HANDSHAKE_QUEUE_SIZE, handle_handshake_job);
@@ -1832,7 +1716,7 @@ int socks5_server_get_stats(char *out, size_t out_len) {
              atomic_load(&g_conn_count),
              (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
              (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
-             (long long)atomic_load(&g_st_exhausted), (long long)atomic_load(&g_st_ghost_purged));
+             (long long)atomic_load(&g_st_exhausted), ghost_purge_get_count());
     return 0;
 }
 
@@ -1845,7 +1729,7 @@ int socks5_server_main_dynamic(int port) {
     atomic_store(&g_st_acquired, 0); atomic_store(&g_st_released, 0);
     atomic_store(&g_st_stale_skip, 0); atomic_store(&g_st_bad_slot, 0);
     atomic_store(&g_st_exhausted, 0); atomic_store(&g_st_double_fin, 0);
-    atomic_store(&g_st_ghost_purged, 0);
+    ghost_purge_reset();
     ListenerArgs *args = malloc(sizeof(ListenerArgs));
     args->port = port;
     pthread_create(&listener_thread, NULL, listener_task, args);
