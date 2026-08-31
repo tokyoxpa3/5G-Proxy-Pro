@@ -92,7 +92,7 @@ def cprotoCc = ['cc', 'gcc', 'clang'].find { c ->
 
 tasks.register('cProtocolTest') {
     group = 'verification'
-    description = 'Compile and run pure SOCKS5 protocol parsing unit tests on the host C compiler.'
+    description = 'Compile and run pure C unit tests (SOCKS5 protocol + conn state) on the host C compiler.'
     onlyIf {
         if (cprotoCc == null) {
             logger.warn('cProtocolTest skipped: no C compiler (cc/gcc/clang) found')
@@ -101,18 +101,27 @@ tasks.register('cProtocolTest') {
         return true
     }
     doLast {
-        def src = file('src/main/cpp/socks5_protocol.c')
-        def tst = file('src/test/cpp/socks5_protocol_test.c')
-        def out = new File("${buildDir}/tmp/cproto/socks5_protocol_test")
-        out.parentFile.mkdirs()
-        project.exec {
-            commandLine cprotoCc, '-std=c11', '-Wall', '-Wextra',
-                '-I', file('src/main/cpp').absolutePath,
-                '-o', out.absolutePath,
-                src.absolutePath, tst.absolutePath
-        }
-        project.exec {
-            commandLine out.absolutePath
+        // 每個純函式模組的來源與其 host 測試二進位（全部零 Android/JNI/socket 依賴）
+        def targets = [
+            [name: 'socks5_protocol_test',
+             srcs: ['src/main/cpp/socks5_protocol.c',
+                    'src/test/cpp/socks5_protocol_test.c']],
+            [name: 'conn_state_test',
+             srcs: ['src/main/cpp/conn_state.c',
+                    'src/test/cpp/conn_state_test.c']],
+        ]
+        targets.each { t ->
+            def srcs = t.srcs.collect { file(it).absolutePath }
+            def out = new File("${buildDir}/tmp/cproto/${t.name}")
+            out.parentFile.mkdirs()
+            project.exec {
+                commandLine([cprotoCc, '-std=c11', '-Wall', '-Wextra',
+                    '-I', file('src/main/cpp').absolutePath,
+                    '-o', out.absolutePath] + srcs)
+            }
+            project.exec {
+                commandLine out.absolutePath
+            }
         }
     }
 }

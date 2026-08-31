@@ -172,6 +172,78 @@ static void test_addr_normalize(void) {
     CHECK(memcmp(na, nb, 16) == 0);
 }
 
+/* ============ SOCKS5 回覆封裝 / frame 長度 / request 位址長度 ============ */
+
+static void test_encode_reply(void) {
+    unsigned char out[22];
+
+    /* 失敗回覆 REP=0x04，IPv4 0.0.0.0:0 */
+    unsigned char a4[4] = {0,0,0,0};
+    unsigned char z2[2] = {0,0};
+    int n = socks5_encode_reply(out, 0x04, 0, a4, z2);
+    CHECK(n == 10);
+    CHECK(out[0] == 0x05 && out[1] == 0x04 && out[2] == 0x00);
+    CHECK(out[3] == 0x01);
+    CHECK(out[4] == 0 && out[5] == 0 && out[6] == 0 && out[7] == 0);
+    CHECK(out[8] == 0 && out[9] == 0);
+
+    /* 成功回覆 REP=0x00，IPv4，非零位址/埠 */
+    unsigned char a4b[4] = {192,168,1,5};
+    unsigned char p4[2] = {0x04, 0x38}; /* 1080 */
+    n = socks5_encode_reply(out, 0x00, 0, a4b, p4);
+    CHECK(n == 10);
+    CHECK(out[1] == 0x00);
+    CHECK(out[4] == 192 && out[5] == 168 && out[6] == 1 && out[7] == 5);
+    CHECK(out[8] == 0x04 && out[9] == 0x38);
+
+    /* 成功回覆 REP=0x00，IPv6 */
+    unsigned char a6[16]; for (int i = 0; i < 16; i++) a6[i] = (unsigned char)(i+1);
+    n = socks5_encode_reply(out, 0x00, 1, a6, p4);
+    CHECK(n == 22);
+    CHECK(out[0] == 0x05 && out[1] == 0x00 && out[2] == 0x00);
+    CHECK(out[3] == 0x04);
+    CHECK(out[4] == 1 && out[19] == 16);
+    CHECK(out[20] == 0x04 && out[21] == 0x38);
+}
+
+static void test_udp_tcp_frame_len(void) {
+    unsigned char h[2];
+
+    /* 合法：4..max_len 之間 */
+    h[0] = 0x00; h[1] = 0x04;
+    CHECK(socks5_udp_tcp_frame_len(h, 65536) == 4);
+    h[0] = 0x00; h[1] = 0x0A;
+    CHECK(socks5_udp_tcp_frame_len(h, 65536) == 10);
+    h[0] = 0xFF; h[1] = 0xFF; /* 0xFFFF = 65535 */
+    CHECK(socks5_udp_tcp_frame_len(h, 65536) == 65535);
+
+    /* 太小：< 4（裝不下 RSV(2)+FRAG(1)+ATYP(1)） */
+    h[0] = 0x00; h[1] = 0x00;
+    CHECK(socks5_udp_tcp_frame_len(h, 65536) == -1);
+    h[0] = 0x00; h[1] = 0x03;
+    CHECK(socks5_udp_tcp_frame_len(h, 65536) == -1);
+
+    /* 超過 max_len：邊界（== 合法、> 違規） */
+    h[0] = 0x00; h[1] = 0x04;
+    CHECK(socks5_udp_tcp_frame_len(h, 4) == 4);
+    h[0] = 0x00; h[1] = 0x05;
+    CHECK(socks5_udp_tcp_frame_len(h, 4) == -1);
+    h[0] = 0xFF; h[1] = 0xFF;
+    CHECK(socks5_udp_tcp_frame_len(h, 65535) == 65535);
+    CHECK(socks5_udp_tcp_frame_len(h, 65534) == -1);
+}
+
+static void test_request_addr_len(void) {
+    CHECK(socks5_request_addr_len(0x01, 0) == 4);
+    CHECK(socks5_request_addr_len(0x04, 0) == 16);
+    CHECK(socks5_request_addr_len(0x03, 1) == 1);
+    CHECK(socks5_request_addr_len(0x03, 255) == 255);
+    CHECK(socks5_request_addr_len(0x03, 0) == -1); /* domain 長度 0 違規 */
+    CHECK(socks5_request_addr_len(0x00, 0) == -1);
+    CHECK(socks5_request_addr_len(0x02, 0) == -1);
+    CHECK(socks5_request_addr_len(0xFF, 0) == -1);
+}
+
 int main(void) {
     test_method_offered();
     test_check_credentials();
@@ -180,6 +252,9 @@ int main(void) {
     test_udp_parse();
     test_udp_encode();
     test_addr_normalize();
+    test_encode_reply();
+    test_udp_tcp_frame_len();
+    test_request_addr_len();
     if (g_failures == 0) {
         printf("socks5_protocol_test: ALL PASS\n");
         return 0;
