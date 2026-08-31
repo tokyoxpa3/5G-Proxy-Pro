@@ -109,6 +109,12 @@ tasks.register('cProtocolTest') {
             [name: 'conn_state_test',
              srcs: ['src/main/cpp/conn_state.c',
                     'src/test/cpp/conn_state_test.c']],
+            [name: 'conn_forward_test',
+             srcs: ['src/main/cpp/conn_forward.c',
+                    'src/test/cpp/conn_forward_test.c']],
+            [name: 'udp_conn_test',
+             srcs: ['src/main/cpp/udp_conn.c',
+                    'src/test/cpp/udp_conn_test.c']],
         ]
         targets.each { t ->
             def srcs = t.srcs.collect { file(it).absolutePath }
