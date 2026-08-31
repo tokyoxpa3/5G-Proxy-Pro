@@ -214,7 +214,7 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 
 | 功能 | 目的地 | 時機 |
 |---|---|---|
-| 原生引擎健康檢查 | `connectivitycheck.gstatic.com`（透過 5G） | 每 10 秒，驗證伺服器存活 |
+| 原生引擎健康檢查 | `connectivitycheck.gstatic.com` / `captive.apple.com` / `connect.rom.miui.com`（依序備援，透過 5G） | 每 10 秒，驗證伺服器存活 |
 | 公網 IP 顯示 | `api.ipify.org` | 按下「刷新狀態」時 |
 | 自我檢測 | example.com（透過 5G 代理） | 僅在點擊「自我檢測」時 |
 

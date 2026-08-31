@@ -17,6 +17,7 @@ set(SOURCE_FILES
     src/main/cpp/conn_state.c
     src/main/cpp/conn_forward.c
     src/main/cpp/udp_conn.c
+    src/main/cpp/ghost_purge.c
 )
 
 add_library(androidproxy SHARED

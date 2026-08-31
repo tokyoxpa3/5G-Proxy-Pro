@@ -115,15 +115,32 @@ tasks.register('cProtocolTest') {
             [name: 'udp_conn_test',
              srcs: ['src/main/cpp/udp_conn.c',
                     'src/test/cpp/udp_conn_test.c']],
+            [name: 'ghost_purge_test',
+             srcs: ['src/test/cpp/ghost_purge_test.c']],
         ]
+        // [Linux 整合測試] epoll 引擎整合測試依賴 <sys/epoll.h>，僅在 Linux (CI) 執行。
+        def isLinux = org.gradle.internal.os.OperatingSystem.current().isLinux()
+        if (isLinux) {
+            targets.add([
+                name: 'epoll_integration_test',
+                srcs: ['src/main/cpp/simple-socks5.c',
+                       'src/main/cpp/socks5_protocol.c',
+                       'src/main/cpp/conn_state.c',
+                       'src/main/cpp/conn_forward.c',
+                       'src/main/cpp/udp_conn.c',
+                       'src/main/cpp/ghost_purge.c',
+                       'src/test/cpp/epoll_integration_test.c'],
+                extraFlags: ['-I', file('src/test/cpp/shim').absolutePath, '-pthread', '-D_DEFAULT_SOURCE']
+            ])
+        }
         targets.each { t ->
             def srcs = t.srcs.collect { file(it).absolutePath }
             def out = new File("${buildDir}/tmp/cproto/${t.name}")
             out.parentFile.mkdirs()
+            def flags = [cprotoCc, '-std=c11', '-Wall', '-Wextra',
+                '-I', file('src/main/cpp').absolutePath] + (t.extraFlags ?: []) + ['-o', out.absolutePath] + srcs
             project.exec {
-                commandLine([cprotoCc, '-std=c11', '-Wall', '-Wextra',
-                    '-I', file('src/main/cpp').absolutePath,
-                    '-o', out.absolutePath] + srcs)
+                commandLine flags
             }
             project.exec {
                 commandLine out.absolutePath
