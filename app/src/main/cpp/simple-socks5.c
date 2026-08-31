@@ -1096,7 +1096,12 @@ static int udp_remote_event(udp_conn_t *u) {
             u->out_buf[start - 2] = (unsigned char)(dlen >> 8);
             u->out_buf[start - 1] = (unsigned char)(dlen & 0xFF);
             u->out_len = dlen + 2;
-            u->out_off = start - 2;
+            u->out_off = 0;
+            // [P2 修復] frame 建在 out_buf[start-2] 而非 offset 0，但 udp_flush_out 的
+            // out_off 語意是「已送出位元組數」（初始應為 0）。先 memmove 到 offset 0，
+            // 否則 send() 從 buffer 中段起算、少送 start-2 位元組（IPv4 少 12 bytes，
+            // client 收到長度欄後永遠收不齊 body → recv 逾時）。
+            if (start - 2 != 0) memmove(u->out_buf, u->out_buf + start - 2, (size_t)u->out_len);
             if (udp_flush_out(u) != 0) return -1;
             // 若已完整送出（out_len==0）循環讀下一 datagram；若 partial 則下輪 return
         }
