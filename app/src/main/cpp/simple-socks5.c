@@ -21,6 +21,8 @@
 
 #include "socks5_protocol.h"
 #include "conn_state.h"
+#include "conn_forward.h"
+#include "udp_conn.h"
 
 extern void jni_attach_thread();
 extern void jni_detach_thread();
@@ -352,22 +354,29 @@ static int try_send(int fd, unsigned char *buf, ssize_t *len, ssize_t *off) {
     return 1;
 }
 
+// [可測抽離] 事件興趣遮罩的決策核心抽至 conn_forward_interest（純函式，host 可測）。
+// 這裡只做 CONN_FWD_* 抽象位元 → epoll 常數的機械映射，以及實際的 epoll_ctl MOD。
+static uint32_t map_fwd_to_epoll(uint32_t fwd) {
+    uint32_t ev = 0;
+    if (fwd & CONN_FWD_RDHUP) ev |= EPOLLRDHUP;
+    if (fwd & CONN_FWD_IN)    ev |= EPOLLIN;
+    if (fwd & CONN_FWD_OUT)   ev |= EPOLLOUT;
+    return ev;
+}
+
 static void update_conn_events(int epoll_fd, full_conn_t *full) {
     if (full->closed) return;
-    uint32_t c_ev = EPOLLRDHUP; 
-    if (full->c2t_len == 0 && !full->client_eof) c_ev |= EPOLLIN;
-    if (full->t2c_len > 0)  c_ev |= EPOLLOUT;
-
     // [CLOSE_WAIT 修復] target 已半關閉（FIN）後不再需要 EPOLLRDHUP/EPOLLIN：
     // 不會再有資料送達，持續 armed 只會讓 level-triggered EPOLLRDHUP 反覆觸發
     // （熱迴圈）。保留 EPOLLOUT（半關閉的 target 仍可接收）讓 c2t 剩餘資料在
-    // grace period 內排空。
-    uint32_t t_ev = 0;
-    if (!full->target_eof_since) {
-        t_ev = EPOLLRDHUP;
-        if (full->t2c_len == 0) t_ev |= EPOLLIN;
-    }
-    if (full->c2t_len > 0)  t_ev |= EPOLLOUT;
+    // grace period 內排空。此決策（含 client 側對稱規則）由 conn_forward_interest
+    // 以純函式鎖住，host 單元測試覆蓋。
+    uint32_t c_fwd, t_fwd;
+    conn_forward_interest(
+        full->closed, full->client_eof, full->target_eof_since ? 1 : 0,
+        full->c2t_len > 0, full->t2c_len > 0, &c_fwd, &t_fwd);
+    uint32_t c_ev = map_fwd_to_epoll(c_fwd);
+    uint32_t t_ev = map_fwd_to_epoll(t_fwd);
 
     // [Slot 修復] 事件攜帶 (gen<<32|slot)，MOD 時必須重用同一識別碼
     if (full->client_events != c_ev) {
@@ -575,7 +584,8 @@ static void* worker_loop_safe(void* arg) {
                     // 不能無限期等 target 的 FIN——HTTP keep-alive 的 target
                     // 不會發 FIN，否則測速等大量短連線會堆積數百條 CLOSE_WAIT
                     // 消耗 fd，最終拒絕服務。
-                    if (now - full->eof_since >= 2) fatal_error = 1;
+                    // [可測抽離] grace 判定抽至 conn_forward_grace_expired（純函式）。
+                    if (conn_forward_grace_expired(now, full->eof_since, CONN_FWD_GRACE_SEC)) fatal_error = 1;
                 } else {
                     char tmp;
                     if (recv(full->target_fd, &tmp, 1, MSG_PEEK) == 0) fatal_error = 1;
@@ -628,10 +638,12 @@ static void* worker_loop_safe(void* arg) {
                 //    未讀導致剩餘資料無法排空，強制回收上游 fd（對稱第 2 點）
                 // magic 檢查：已毒化（finalize 進行中）的 conn 不收集，
                 // finalize 的防禦移除會負責把它解開，避免雙重移除
+                // [可測抽離] grace 判定抽至 conn_forward_grace_expired（純函式），
+                // 與事件迴圈內的同名判定共用同一函式與同一常數，杜絕漂移。
                 if (curr->magic == CONN_MAGIC && !curr->closed && atomic_load(&curr->registered) &&
                     (now - curr->last_active > IDLE_TIMEOUT_SEC ||
-                    (curr->client_eof && now - curr->eof_since >= 2) ||
-                    (curr->target_eof_since && now - curr->target_eof_since >= 2))) {
+                    (curr->client_eof && conn_forward_grace_expired(now, curr->eof_since, CONN_FWD_GRACE_SEC)) ||
+                    conn_forward_grace_expired(now, curr->target_eof_since, CONN_FWD_GRACE_SEC))) {
                     curr->closed = 1;
                     list_remove_locked(me, curr);
                     if (garbage_count < MAX_EVENTS) garbage_list[garbage_count++] = curr;
@@ -848,316 +860,559 @@ static void send_zero_reply(int client_fd, unsigned char rep) {
     send(client_fd, out, n, MSG_NOSIGNAL);
 }
 
-static void handle_udp_session_full(int client_fd) {
-    // [連線額度] UDP session 與 TCP 共用 g_conn_count 的 MAX_CONCURRENT_CONNS 上限：
-    // CAS 預佔，超限即回 REP=0x04 讓客戶端退避，避免 DNS/QUIC 洪水把帳目推爆。
-    if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
-        atomic_fetch_sub(&g_conn_count, 1);
-        send_zero_reply(client_fd, 0x04);
-        close(client_fd);
-        return;
+// ================= UDP session 固定槽位 + epoll worker（P2） =================
+// 原先每條 UDP session（0x03 標準 UDP ASSOCIATE / 0x04 UDP-in-TCP）都佔一條
+// 專用執行緒跑 poll()（g_udp_pool，UDP_POOL_SIZE=96 條上限）。
+// 5G-Proxy-Client 的 tun2socks 對每個 UDP socket（DNS / QUIC 443）都開一條
+// session，96 條很快被佔滿 → REP=0x04 退避 =「伺服器拒絕服務」。
+// 改為固定槽位表 + 單一 epoll worker：每條 session 的 2~3 個 fd 註冊進同一個
+// epoll，世代編號防幽靈事件（純驗證抽至 udp_conn.h/c，host 可測），與 TCP 槽位
+// 同一套「永不釋放 + 世代遞增」策略。槽位上限仍受 MAX_CONCURRENT_CONNS 額度控制。
+
+#define UDP_WORKER_COUNT 1
+#define UDP_SLOT_COUNT 1088
+
+typedef struct udp_conn_t {
+    uint32_t magic;
+    int slot;
+    uint32_t gen;
+    uint64_t ep_u64;
+
+    int client_fd;     // TCP：0x03 控制連線 / 0x04 資料連線
+    int local_udp_fd;  // 0x03 的 LAN relay socket；0x04 為 -1
+    int remote_udp_fd; // 5G UDP socket
+
+    unsigned char *in_buf;   // 0x03 datagram 暫存 / 0x04 frame 重組緩衝
+    unsigned char *out_buf;  // 0x04 出向 frame 緩衝（remote→client 可能 partial send）
+
+    // 0x03：來源驗證（控制連線 peer）+ 回覆路由（最後一個合法 client 來源）
+    struct sockaddr_storage peer_ss;
+    socklen_t peer_ss_len;
+    struct sockaddr_storage client_src_addr;
+    socklen_t client_src_len;
+
+    // 0x04 frame 重組狀態（非阻塞下需記錄部分讀取進度）
+    unsigned char len_bytes[2];
+    int len_got;      // 長度欄已讀 0/1/2 位元組
+    int frame_expect; // 期望的 datagram 總長（讀到長度欄後設定）
+    int frame_got;    // 已重組的 datagram 位元組數
+    int out_len, out_off; // 0x04 出向 frame：總長 / 已送出
+
+    uint32_t client_events; // 目前 client fd 的興趣遮罩（MOD 比對用）
+
+    int closed;
+    atomic_int refs;
+    atomic_int finalized;
+    atomic_int registered;
+    time_t last_active;
+
+    struct udp_conn_t *next, *prev;
+    int widx;
+} udp_conn_t;
+
+typedef struct {
+    int epoll_fd;
+    pthread_t thread_id;
+    udp_conn_t *conn_list_head;
+    pthread_mutex_t list_lock;
+} udp_worker_t;
+
+static udp_worker_t udp_workers[UDP_WORKER_COUNT];
+
+// 槽位表（靜態，永不釋放；世代遞增防幽靈事件）
+static udp_conn_t g_udp_slots[UDP_SLOT_COUNT];
+static atomic_int g_udp_slot_state[UDP_SLOT_COUNT];
+static int g_udp_free_slots[UDP_SLOT_COUNT];
+static int g_udp_free_slot_top = 0;
+static pthread_mutex_t g_udp_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_udp_next_worker = 0;
+
+static atomic_llong g_udp_st_acquired = 0, g_udp_st_released = 0;
+static atomic_llong g_udp_st_stale = 0, g_udp_st_bad_slot = 0;
+static atomic_llong g_udp_st_exhausted = 0, g_udp_st_double_fin = 0;
+
+static void udp_slots_init(void) {
+    for (int i = 0; i < UDP_SLOT_COUNT; i++) {
+        if (g_udp_slots[i].gen == 0) g_udp_slots[i].gen = 1;
+        atomic_store(&g_udp_slot_state[i], 0);
+        g_udp_free_slots[i] = i;
     }
-
-    // [IPv6 支援] 標準 UDP ASSOCIATE 的本地 relay socket 改為雙棧：綁定 ::
-    //（IPV6_V6ONLY=0），IPv4 封包會以 v4-mapped 形式送達，IPv6 客戶端也能走
-    // 標準 UDP relay（先前 AF_INET-only 會讓 IPv6 客戶端整段靜默失敗），
-    // 與 TCP 路徑的 IPv6 支援對齊。
-    int local_udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
-    int local_is_v6 = (local_udp_fd >= 0);
-    if (!local_is_v6) {
-        // 極端環境沒有 IPv6 時回退 IPv4-only（行為同改動前）
-        local_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    }
-    if (local_udp_fd < 0) {
-        close(client_fd);
-        atomic_fetch_sub(&g_conn_count, 1);
-        return;
-    }
-    if (local_is_v6) {
-        int v6only = 0;
-        setsockopt(local_udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
-        struct sockaddr_in6 a6 = {0};
-        a6.sin6_family = AF_INET6; /* sin6_addr 全 0 = :: */
-        bind(local_udp_fd, (struct sockaddr*)&a6, sizeof(a6));
-    } else {
-        struct sockaddr_in a4 = {0};
-        a4.sin_family = AF_INET;
-        a4.sin_addr.s_addr = htonl(INADDR_ANY);
-        bind(local_udp_fd, (struct sockaddr*)&a4, sizeof(a4));
-    }
-
-    struct sockaddr_storage local_ss; socklen_t local_len = sizeof(local_ss);
-    getsockname(local_udp_fd, (struct sockaddr*)&local_ss, &local_len);
-    unsigned short p = (local_ss.ss_family == AF_INET6)
-        ? ntohs(((struct sockaddr_in6*)&local_ss)->sin6_port)
-        : ntohs(((struct sockaddr_in*)&local_ss)->sin_port);
-
-    // 回覆的 BND.ADDR 取控制連線的本地（伺服器端）位址：客戶端把 UDP 封包送往
-    // 這個位址。客戶端走 IPv6（且非 v4-mapped）時以 ATYP=0x04 回覆。
-    // 回覆封裝抽至 socks5_encode_reply（純函式，host 可測）。
-    unsigned char resp[22];
-    int resp_len = 0;
-    unsigned char resp_port[2] = { (unsigned char)(p >> 8), (unsigned char)(p & 0xFF) };
-    struct sockaddr_storage ss; socklen_t slen = sizeof(ss);
-    if (getsockname(client_fd, (struct sockaddr*)&ss, &slen) == 0) {
-        if (ss.ss_family == AF_INET) {
-            struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
-            resp_len = socks5_encode_reply(resp, 0x00, 0, (const unsigned char *)&s4->sin_addr, resp_port);
-        } else if (ss.ss_family == AF_INET6) {
-            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
-            if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
-                resp_len = socks5_encode_reply(resp, 0x00, 0, (const unsigned char *)&s6->sin6_addr.s6_addr[12], resp_port);
-            } else {
-                resp_len = socks5_encode_reply(resp, 0x00, 1, (const unsigned char *)&s6->sin6_addr, resp_port);
-            }
-        }
-    }
-    if (resp_len == 0) {
-        // getsockname 失敗的極端情況：回退全 0 的 v4 成功回覆
-        unsigned char zero4[4] = {0,0,0,0};
-        unsigned char zero2[2] = {0,0};
-        resp_len = socks5_encode_reply(resp, 0x00, 0, zero4, zero2);
-    }
-
-    // 1. 發送 SOCKS5 UDP 握手成功回覆
-    send(client_fd, resp, resp_len, MSG_NOSIGNAL);
-
-    // 2. 請求 Java 層建立 5G UDP Socket
-    int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
-    if (remote_udp_fd < 0) { 
-        close(local_udp_fd); 
-        close(client_fd); 
-        atomic_fetch_sub(&g_conn_count, 1); 
-        return; 
-    }
-
-    // 記錄控制連線的對端位址：UDP relay 只接受來自此用戶端的封包，
-    // 且回覆一律送回此位址，避免被其他裝置竄改轉送目標。
-    // [IPv6 支援] 以 sockaddr_storage 保存完整對端位址（v4 或 v6），
-    // 來源驗證時用 same_ip() 把 v4-mapped 正規化後比對。
-    struct sockaddr_storage peer_ss = {0};
-    socklen_t peer_ss_len = sizeof(peer_ss);
-    getpeername(client_fd, (struct sockaddr*)&peer_ss, &peer_ss_len);
-
-    unsigned char *udp_buf = malloc(BUFFER_SIZE + 64);
-    struct sockaddr_storage client_src_addr = {0};
-    socklen_t client_src_len = 0;
-    
-    // [關鍵修正] 使用 poll() 取代 select()/FD_SET：
-    // select() 的 FD_SET 受 FD_SETSIZE(1024) 硬限制，當進程開啟的 fd 超過 1024
-    // (例如大量 TCP 連線各佔 2 個 fd) 時，FD_SET 會觸發 bionic FORTIFY 檢查並
-    // SIGABRT：'FORTIFY: FD_SET: file descriptor NNNN >= FD_SETSIZE 1024'。
-    // poll() 以 pollfd 陣列管理，無此上限。
-    struct pollfd fds[4];
-
-    while (atomic_load(&server_running)) {
-        fds[0].fd = g_shutdown_pipe[0]; fds[0].events = POLLIN; fds[0].revents = 0;
-        fds[1].fd = client_fd;          fds[1].events = POLLIN; fds[1].revents = 0;
-        fds[2].fd = local_udp_fd;       fds[2].events = POLLIN; fds[2].revents = 0;
-        fds[3].fd = remote_udp_fd;      fds[3].events = POLLIN; fds[3].revents = 0;
-
-        int res = poll(fds, 4, UDP_IDLE_TIMEOUT_SEC * 1000);
-        if (res <= 0) break; // 超時或錯誤
-
-        if (fds[0].revents) break; // shutdown pipe
-        
-        // 監測 TCP 控制通道是否斷開
-        if (fds[1].revents) {
-            if (recv(client_fd, udp_buf, 1, MSG_PEEK) <= 0) break;
-        }
-
-        // 收到 Client 的 UDP 封包 -> 轉發給 5G
-        if (fds[2].revents) {
-            struct sockaddr_storage tmp; socklen_t tlen = sizeof(tmp);
-            ssize_t r = recvfrom(local_udp_fd, udp_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
-            if (r > 3) {
-                // 解析 SOCKS5 UDP 表頭（RSV/FRAG/ATYP 驗證抽至 socks5_udp_parse，host 可測）
-                unsigned char atyp; const unsigned char *addr; unsigned char port[2];
-                int hlen = socks5_udp_parse(udp_buf, (size_t)r, &atyp, &addr, port);
-                if (hlen > 0 && !same_ip(&tmp, &peer_ss)) {
-                    // 來源驗證：只接受控制連線同來源 IP 的封包 (允許多個 UDP 來源 port)
-                    char src_ip[INET6_ADDRSTRLEN] = "?";
-                    if (tmp.ss_family == AF_INET)
-                        inet_ntop(AF_INET, &((struct sockaddr_in*)&tmp)->sin_addr, src_ip, sizeof(src_ip));
-                    else if (tmp.ss_family == AF_INET6)
-                        inet_ntop(AF_INET6, &((struct sockaddr_in6*)&tmp)->sin6_addr, src_ip, sizeof(src_ip));
-                    LOGE("UDP relay: 拒絕未授權來源封包 %s", src_ip);
-                } else if (hlen > 0) {
-                    client_src_addr = tmp; 
-                    client_src_len = tlen;
-                    
-                    struct sockaddr_storage dst_ss; socklen_t dlen;
-                    if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && r > hlen) {
-                        if (sendto(remote_udp_fd, udp_buf+hlen, r-hlen, 0, (struct sockaddr*)&dst_ss, dlen) < 0) {
-                            LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
-                        }
-                    }
-                } else if (udp_buf[2] != 0) {
-                    LOGE("UDP relay: 收到 FRAG!=0 的 UDP 封包，已丟棄");
-                }
-                // hlen<=0 且 FRAG==0：RSV!=0 或 ATYP 不合法（如 DOMAIN），靜默丟棄，
-                // 與 TCP 路徑對 RSV 的驗證一致（commit 30ebb59）
-            }
-        }
-        
-        // 收到 5G 的 UDP 封包 -> 封裝 Header 轉回給 Client
-        if (fds[3].revents && client_src_len > 0) {
-            struct sockaddr_in6 src6; socklen_t sl = sizeof(src6);
-            int off = 22; // 預留足夠空間給 IPv6 Header
-
-            // 直接讀到 buffer 後面，保留前面給 Header
-            ssize_t r = recvfrom(remote_udp_fd, udp_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
-
-            if (r > 0) {
-                // 判斷來源地址類型;雙棧 socket 收到 IPv4 來源時會是 v4-mapped，一律輸出 IPv4 ATYP。
-                // 表頭封裝抽至 socks5_udp_encode（純函式，host 可測）。
-                const unsigned char *addr; int is_v6;
-                if (src6.sin6_family == AF_INET) {
-                    addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr;
-                    is_v6 = 0;
-                } else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) {
-                    addr = (const unsigned char *)&src6.sin6_addr.s6_addr[12]; // v4-mapped 尾 4 bytes
-                    is_v6 = 0;
-                } else {
-                    addr = (const unsigned char *)&src6.sin6_addr;
-                    is_v6 = 1;
-                }
-                int hlen = socks5_udp_encode(udp_buf + off - (is_v6 ? 22 : 10), is_v6, addr, (const unsigned char *)&src6.sin6_port);
-                int start = off - hlen;
-                sendto(local_udp_fd, udp_buf + start, r + hlen, 0, (struct sockaddr*)&client_src_addr, client_src_len);
-            }
-        }
-    }
-    
-    if(udp_buf) free(udp_buf);
-    close(remote_udp_fd); release_java_socket(remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
-    close(local_udp_fd); 
-    close(client_fd);
-    atomic_fetch_sub(&g_conn_count, 1);
+    g_udp_free_slot_top = UDP_SLOT_COUNT;
 }
 
-// UDP-in-TCP（自訂擴充 SOCKS5 指令 0x04）：
-// 握手成功後，同一條 TCP 連線以 frame 承載 UDP datagram。
-// frame = [2-byte 長度, network order] + [SOCKS5 UDP datagram]
-//        datagram = RSV(2)=0 + FRAG(1)=0 + ATYP(0x01|0x04) + ADDR + PORT(2) + DATA
-static void handle_udp_tcp_session(int client_fd) {
-    // [連線額度] 與標準 UDP ASSOCIATE 一致：共用 MAX_CONCURRENT_CONNS 上限，
-    // 超限回 REP=0x04 讓客戶端退回標準協定。
-    if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
-        atomic_fetch_sub(&g_conn_count, 1);
-        send_zero_reply(client_fd, 0x04);
-        close(client_fd);
+static int udp_slot_acquire(void) {
+    pthread_mutex_lock(&g_udp_slot_lock);
+    if (g_udp_free_slot_top == 0) {
+        pthread_mutex_unlock(&g_udp_slot_lock);
+        atomic_fetch_add(&g_udp_st_exhausted, 1);
+        return -1;
+    }
+    int idx = g_udp_free_slots[--g_udp_free_slot_top];
+    uint32_t new_gen = ++g_udp_slots[idx].gen;
+    pthread_mutex_unlock(&g_udp_slot_lock);
+
+    memset(&g_udp_slots[idx], 0, sizeof(udp_conn_t));
+    g_udp_slots[idx].gen = new_gen;
+    g_udp_slots[idx].slot = idx;
+    g_udp_slots[idx].client_fd = -1;
+    g_udp_slots[idx].local_udp_fd = -1;
+    g_udp_slots[idx].remote_udp_fd = -1;
+    atomic_store(&g_udp_slot_state[idx], 1);
+    atomic_fetch_add(&g_udp_st_acquired, 1);
+    return idx;
+}
+
+static void udp_slot_release(int idx) {
+    atomic_store(&g_udp_slot_state[idx], 0);
+    pthread_mutex_lock(&g_udp_slot_lock);
+    g_udp_free_slots[g_udp_free_slot_top++] = idx;
+    pthread_mutex_unlock(&g_udp_slot_lock);
+    atomic_fetch_add(&g_udp_st_released, 1);
+}
+
+static void udp_conn_unref(udp_conn_t *u);
+
+static void udp_conn_finalize(udp_conn_t *u) {
+    if (atomic_exchange(&u->finalized, 1) != 0) {
+        atomic_fetch_add(&g_udp_st_double_fin, 1);
         return;
     }
-
-    // 先建立 5G UDP socket，成功才回覆成功；失敗回 REP=0x04 讓 client 退回標準協定
-    int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
-    if (remote_udp_fd < 0) {
-        send_zero_reply(client_fd, 0x04); // host unreachable（此擴充指令失敗）
-        close(client_fd);
-        atomic_fetch_sub(&g_conn_count, 1);
-        return;
+    udp_worker_t *w = &udp_workers[u->widx];
+    pthread_mutex_lock(&w->list_lock);
+    if (u->next || u->prev || w->conn_list_head == u) {
+        if (u->prev) u->prev->next = u->next; else w->conn_list_head = u->next;
+        if (u->next) u->next->prev = u->prev;
+        u->next = NULL; u->prev = NULL;
     }
-    send_zero_reply(client_fd, 0x00);
+    u->magic = 0;
+    pthread_mutex_unlock(&w->list_lock);
 
-    // 取消 handshake 階段的 5 秒讀超時；blocking socket 由 poll 決定何時讀寫
-    struct timeval tv = {UDP_IDLE_TIMEOUT_SEC, 0};
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
-
-    unsigned char *datagram = malloc(BUFFER_SIZE + 64);
-    if (!datagram) {
-        close(remote_udp_fd); release_java_socket(remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
-        close(client_fd);
-        atomic_fetch_sub(&g_conn_count, 1);
-        return;
+    if (u->client_fd >= 0) { close(u->client_fd); u->client_fd = -1; }
+    if (u->local_udp_fd >= 0) { close(u->local_udp_fd); u->local_udp_fd = -1; }
+    if (u->remote_udp_fd >= 0) {
+        close(u->remote_udp_fd);
+        release_java_socket(u->remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
+        u->remote_udp_fd = -1;
     }
+    free(u->in_buf); u->in_buf = NULL;
+    free(u->out_buf); u->out_buf = NULL;
+    atomic_fetch_sub(&g_conn_count, 1);
+    udp_slot_release(u->slot);
+}
 
-    struct sockaddr_in6 src6; socklen_t sl = sizeof(src6);
+static void udp_conn_unref(udp_conn_t *u) {
+    if (!u) return;
+    if (atomic_fetch_sub(&u->refs, 1) == 1) udp_conn_finalize(u);
+}
 
-    while (atomic_load(&server_running)) {
-        struct pollfd fds[3];
-        fds[0].fd = g_shutdown_pipe[0]; fds[0].events = POLLIN; fds[0].revents = 0;
-        fds[1].fd = client_fd;          fds[1].events = POLLIN; fds[1].revents = 0;
-        fds[2].fd = remote_udp_fd;      fds[2].events = POLLIN; fds[2].revents = 0;
+// 出向 frame 排空（0x04）。回傳 0 = 尚未排空（等 EPOLLOUT）/ 已排空；
+// -1 = 不可回復的 send 錯誤，應關閉 session。
+static int udp_flush_out(udp_conn_t *u) {
+    while (u->out_off < u->out_len) {
+        ssize_t n = send(u->client_fd, u->out_buf + u->out_off, u->out_len - u->out_off, MSG_NOSIGNAL);
+        if (n > 0) { u->out_off += n; }
+        else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        else return -1;
+    }
+    u->out_len = 0; u->out_off = 0;
+    return 0;
+}
 
-        int res = poll(fds, 3, UDP_IDLE_TIMEOUT_SEC * 1000);
-        if (res <= 0) break; // 超時或錯誤
-        if (fds[0].revents) break; // shutdown pipe
+// 0x03：client 控制連線事件 → 偵測對端是否斷開。回傳 -1 = 關閉。
+static int udp_ctrl_event(udp_conn_t *u, uint32_t ev) {
+    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) return -1;
+    if (ev & EPOLLIN) {
+        char tmp;
+        if (recv(u->client_fd, &tmp, 1, MSG_PEEK) <= 0) return -1;
+    }
+    return 0;
+}
 
-        // client → 讀 frame → 5G UDP
-        if (fds[1].revents) {
-            unsigned char h[2];
-            if (recv(client_fd, h, 2, MSG_WAITALL) != 2) break;
-            // frame 長度邊界驗證抽至 socks5_udp_tcp_frame_len（純函式，host 可測）
-            int dlen = socks5_udp_tcp_frame_len(h, BUFFER_SIZE);
-            if (dlen < 0) break; // 協定違規：裝不下表頭或爆緩衝
-            if (recv(client_fd, datagram, dlen, MSG_WAITALL) != dlen) break;
-
-            // 解析 SOCKS5 UDP datagram（RSV=0、FRAG=0、ATYP 驗證抽至 socks5_udp_parse）
-            unsigned char atyp; const unsigned char *addr; unsigned char port[2];
-            int hlen = socks5_udp_parse(datagram, (size_t)dlen, &atyp, &addr, port);
-            if (hlen > 0) {
-                struct sockaddr_storage dst_ss; socklen_t dlen2;
-                if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen2) == 0 && dlen > hlen) {
-                    if (sendto(remote_udp_fd, datagram + hlen, dlen - hlen, 0,
-                               (struct sockaddr*)&dst_ss, dlen2) < 0) {
-                        LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
-                    } else {
-#ifndef NDEBUG
-                        LOGI("UDP-in-TCP: client→5G frame dlen=%d hlen=%d payload=%d", dlen, hlen, dlen - hlen);
-#endif
-                    }
+// 0x03：local UDP → 5G remote。回傳 -1 = 關閉。
+static int udp_local_event(udp_conn_t *u) {
+    struct sockaddr_storage tmp; socklen_t tlen;
+    for (;;) {
+        tlen = sizeof(tmp);
+        ssize_t r = recvfrom(u->local_udp_fd, u->in_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
+        if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
+        if (r <= 3) continue; // 連 RSV(2)+FRAG(1)+ATYP(1) 都湊不齊，丟棄
+        unsigned char atyp; const unsigned char *addr; unsigned char port[2];
+        int hlen = socks5_udp_parse(u->in_buf, (size_t)r, &atyp, &addr, port);
+        if (hlen > 0 && !same_ip(&tmp, &u->peer_ss)) {
+            continue; // 未授權來源：靜默丟棄（避免 log 洪水 DoS）
+        }
+        if (hlen > 0) {
+            u->client_src_addr = tmp;
+            u->client_src_len = tlen;
+            struct sockaddr_storage dst_ss; socklen_t dlen;
+            if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && r > hlen) {
+                if (sendto(u->remote_udp_fd, u->in_buf + hlen, r - hlen, 0, (struct sockaddr*)&dst_ss, dlen) < 0) {
+                    LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
                 }
             }
         }
+    }
+}
 
-        // 5G UDP → 封裝成 frame → client（單一 send 送出 長度欄 + datagram）
-        if (fds[2].revents) {
+// remote 5G UDP → client（0x03 走 local UDP / 0x04 走 TCP frame）。回傳 -1 = 關閉。
+static int udp_remote_event(udp_conn_t *u) {
+    if (u->local_udp_fd >= 0) {
+        // 0x03：5G → local UDP（SOCKS5 UDP header 封裝）
+        struct sockaddr_in6 src6; socklen_t sl;
+        for (;;) {
             sl = sizeof(src6);
-            // 前方預留 24 bytes：2-byte frame 長度欄 + 22-byte IPv6 SOCKS5 UDP 標頭。
-            // 非 v4-mapped IPv6 來源時 start = off - 22 = 2，長度欄寫在 datagram[0..1]；
-            // 若只預留 22，會寫到 datagram[-2] 腐蝕 heap（malloc metadata）
-            int off = 2 + 22;
-            ssize_t r = recvfrom(remote_udp_fd, datagram + off, BUFFER_SIZE - off, 0,
-                                 (struct sockaddr*)&src6, &sl);
-            if (r > 0) {
-#ifndef NDEBUG
-                LOGI("UDP-in-TCP: 5G→client datagram r=%zd", r);
-#endif
-                // 表頭封裝抽至 socks5_udp_encode（純函式，host 可測）
+            int off = 22; // 預留 IPv6 header
+            ssize_t r = recvfrom(u->remote_udp_fd, u->in_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
+            if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
+            if (r == 0) continue;
+            if (u->client_src_len > 0) {
                 const unsigned char *addr; int is_v6;
-                if (src6.sin6_family == AF_INET) {
-                    addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr;
-                    is_v6 = 0;
-                } else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) {
-                    addr = (const unsigned char *)&src6.sin6_addr.s6_addr[12];
-                    is_v6 = 0;
-                } else {
-                    addr = (const unsigned char *)&src6.sin6_addr;
-                    is_v6 = 1;
-                }
-                int hlen = socks5_udp_encode(datagram + off - (is_v6 ? 22 : 10), is_v6, addr, (const unsigned char *)&src6.sin6_port);
+                if (src6.sin6_family == AF_INET) { addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr; is_v6 = 0; }
+                else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) { addr = (const unsigned char *)&src6.sin6_addr.s6_addr[12]; is_v6 = 0; }
+                else { addr = (const unsigned char *)&src6.sin6_addr; is_v6 = 1; }
+                int hlen = socks5_udp_encode(u->in_buf + off - (is_v6 ? 22 : 10), is_v6, addr, (const unsigned char *)&src6.sin6_port);
                 int start = off - hlen;
-                int dlen = r + hlen;
-                datagram[start - 2] = (unsigned char)(dlen >> 8);
-                datagram[start - 1] = (unsigned char)(dlen & 0xFF);
-                int total = dlen + 2;
-                ssize_t tt = 0;
-                while (tt < total) {
-                    ssize_t n = send(client_fd, datagram + start - 2 + tt, total - tt, MSG_NOSIGNAL);
-                    if (n > 0) tt += n;
-                    else break;
+                sendto(u->local_udp_fd, u->in_buf + start, r + hlen, 0, (struct sockaddr*)&u->client_src_addr, u->client_src_len);
+            }
+            // client_src_len == 0：尚無 client 來源，無回覆路由，丟棄
+        }
+    } else {
+        // 0x04：5G → client TCP frame
+        struct sockaddr_in6 src6; socklen_t sl;
+        for (;;) {
+            if (u->out_len > 0) return 0; // 出向尚未排空，等 EPOLLOUT
+            sl = sizeof(src6);
+            int off = 2 + 22; // 2-byte frame 長度欄 + 22-byte IPv6 header
+            ssize_t r = recvfrom(u->remote_udp_fd, u->out_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
+            if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
+            if (r == 0) continue;
+            const unsigned char *addr; int is_v6;
+            if (src6.sin6_family == AF_INET) { addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr; is_v6 = 0; }
+            else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) { addr = (const unsigned char *)&src6.sin6_addr.s6_addr[12]; is_v6 = 0; }
+            else { addr = (const unsigned char *)&src6.sin6_addr; is_v6 = 1; }
+            int hlen = socks5_udp_encode(u->out_buf + off - (is_v6 ? 22 : 10), is_v6, addr, (const unsigned char *)&src6.sin6_port);
+            int start = off - hlen;
+            int dlen = r + hlen;
+            u->out_buf[start - 2] = (unsigned char)(dlen >> 8);
+            u->out_buf[start - 1] = (unsigned char)(dlen & 0xFF);
+            u->out_len = dlen + 2;
+            u->out_off = start - 2;
+            if (udp_flush_out(u) != 0) return -1;
+            // 若已完整送出（out_len==0）循環讀下一 datagram；若 partial 則下輪 return
+        }
+    }
+}
+
+// 0x04：client TCP → 5G（frame 重組）。回傳 -1 = 關閉。
+static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
+    // 先排空出向（可能有 pending frame）
+    if (u->out_len > 0 && udp_flush_out(u) != 0) return -1;
+    if (!(ev & EPOLLIN)) return 0;
+
+    for (;;) {
+        if (u->len_got < 2) {
+            while (u->len_got < 2) {
+                ssize_t n = recv(u->client_fd, u->len_bytes + u->len_got, 2 - u->len_got, 0);
+                if (n > 0) { u->len_got += n; }
+                else if (n == 0) return -1;
+                else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+                else return -1;
+            }
+            int dlen = socks5_udp_tcp_frame_len(u->len_bytes, BUFFER_SIZE);
+            if (dlen < 0) return -1; // 協定違規：裝不下表頭或爆緩衝
+            u->frame_expect = dlen;
+            u->frame_got = 0;
+        }
+        while (u->frame_got < u->frame_expect) {
+            ssize_t n = recv(u->client_fd, u->in_buf + u->frame_got, u->frame_expect - u->frame_got, 0);
+            if (n > 0) { u->frame_got += n; }
+            else if (n == 0) return -1;
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            else return -1;
+        }
+        // 完整 datagram 到手 → 解析並轉發 5G
+        unsigned char atyp; const unsigned char *addr; unsigned char port[2];
+        int hlen = socks5_udp_parse(u->in_buf, (size_t)u->frame_expect, &atyp, &addr, port);
+        if (hlen > 0) {
+            struct sockaddr_storage dst_ss; socklen_t dlen;
+            if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && u->frame_expect > hlen) {
+                if (sendto(u->remote_udp_fd, u->in_buf + hlen, u->frame_expect - hlen, 0, (struct sockaddr*)&dst_ss, dlen) < 0) {
+                    LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
                 }
             }
         }
+        u->len_got = 0;
+        u->frame_expect = 0;
+        u->frame_got = 0;
+        u->last_active = time(NULL);
+        // 循環讀下一 frame
+    }
+}
+
+static void udp_update_events(udp_worker_t *w, udp_conn_t *u) {
+    if (u->closed) return;
+    uint32_t c_ev = EPOLLIN | EPOLLRDHUP;
+    if (u->local_udp_fd < 0 && u->out_len > 0) c_ev |= EPOLLOUT; // 0x04 出向未排空
+    if (u->client_events != c_ev) {
+        struct epoll_event ev;
+        ev.events = c_ev; ev.data.u64 = u->ep_u64;
+        if (epoll_ctl(w->epoll_fd, EPOLL_CTL_MOD, u->client_fd, &ev) == 0) u->client_events = c_ev;
+    }
+}
+
+static void* udp_worker_loop(void* arg) {
+    jni_attach_thread();
+    udp_worker_t *me = (udp_worker_t*)arg;
+    struct epoll_event events[MAX_EVENTS];
+    udp_conn_t *garbage[MAX_EVENTS];
+    int garbage_count = 0;
+    time_t last_check = time(NULL);
+
+    struct epoll_event stop_ev; stop_ev.events = EPOLLIN; stop_ev.data.u64 = 0;
+    epoll_ctl(me->epoll_fd, EPOLL_CTL_ADD, g_shutdown_pipe[0], &stop_ev);
+
+    while (atomic_load(&server_running)) {
+        garbage_count = 0;
+        int nfds = epoll_wait(me->epoll_fd, events, MAX_EVENTS, 2000);
+        time_t now = time(NULL);
+
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.u64 == 0) goto exit_udp_worker; // shutdown pipe
+
+            uint32_t sidx, egen; udp_fd_role_t role;
+            udp_event_decode(events[i].data.u64, &sidx, &egen, &role);
+            if (udp_event_bad_slot((int)sidx, UDP_SLOT_COUNT)) {
+                atomic_fetch_add(&g_udp_st_bad_slot, 1);
+                continue;
+            }
+            udp_conn_t *u = &g_udp_slots[sidx];
+            udp_event_disp_t disp = udp_event_check_slot(
+                egen, u->gen, u->magic, atomic_load(&g_udp_slot_state[sidx]),
+                u->closed, atomic_load(&u->registered));
+            if (disp != UDP_EV_PROCESS) {
+                if (disp == UDP_EV_STALE) atomic_fetch_add(&g_udp_st_stale, 1);
+                continue;
+            }
+            u->last_active = now;
+            uint32_t ev = events[i].events;
+            int fatal = 0;
+            switch (role) {
+            case UDP_ROLE_CLIENT:
+                fatal = (u->local_udp_fd >= 0) ? udp_ctrl_event(u, ev) : udp_client_data_event(u, ev);
+                break;
+            case UDP_ROLE_LOCAL:
+                fatal = udp_local_event(u);
+                break;
+            case UDP_ROLE_REMOTE:
+                fatal = udp_remote_event(u);
+                break;
+            }
+            if (fatal) {
+                pthread_mutex_lock(&me->list_lock);
+                if (!u->closed) {
+                    u->closed = 1;
+                    if (u->prev) u->prev->next = u->next; else me->conn_list_head = u->next;
+                    if (u->next) u->next->prev = u->prev;
+                    u->next = NULL; u->prev = NULL;
+                    if (garbage_count < MAX_EVENTS) garbage[garbage_count++] = u;
+                }
+                pthread_mutex_unlock(&me->list_lock);
+            } else {
+                udp_update_events(me, u);
+            }
+        }
+
+        // 5 秒掃描閒置逾時（UDP_IDLE_TIMEOUT_SEC）
+        if (now - last_check >= 5) {
+            pthread_mutex_lock(&me->list_lock);
+            udp_conn_t *cur = me->conn_list_head;
+            while (cur) {
+                udp_conn_t *next = cur->next;
+                if (cur->magic == UDP_CONN_MAGIC && !cur->closed &&
+                    atomic_load(&cur->registered) &&
+                    udp_conn_idle_expired(now, cur->last_active, UDP_IDLE_TIMEOUT_SEC)) {
+                    cur->closed = 1;
+                    if (cur->prev) cur->prev->next = cur->next; else me->conn_list_head = cur->next;
+                    if (cur->next) cur->next->prev = cur->prev;
+                    cur->next = NULL; cur->prev = NULL;
+                    if (garbage_count < MAX_EVENTS) garbage[garbage_count++] = cur;
+                }
+                cur = next;
+            }
+            pthread_mutex_unlock(&me->list_lock);
+            last_check = now;
+        }
+
+        for (int i = 0; i < garbage_count; i++) udp_conn_unref(garbage[i]);
     }
 
-    free(datagram);
-    close(remote_udp_fd); release_java_socket(remote_udp_fd); // [根因修復 v2] 雙邊各關各的引用
-    close(client_fd);
-    atomic_fetch_sub(&g_conn_count, 1);
+exit_udp_worker:
+    // 清空剩餘 session（分批取出、鎖外 unref，避免 finalize 重入 list_lock 死鎖）
+    for (;;) {
+        int n = 0;
+        udp_conn_t *collected[MAX_EVENTS];
+        pthread_mutex_lock(&me->list_lock);
+        udp_conn_t *cur = me->conn_list_head;
+        while (cur && n < MAX_EVENTS) {
+            udp_conn_t *next = cur->next;
+            if (cur->prev) cur->prev->next = cur->next; else me->conn_list_head = cur->next;
+            if (cur->next) cur->next->prev = cur->prev;
+            cur->next = NULL; cur->prev = NULL;
+            if (cur->magic == UDP_CONN_MAGIC) { cur->closed = 1; collected[n++] = cur; }
+            cur = next;
+        }
+        pthread_mutex_unlock(&me->list_lock);
+        for (int i = 0; i < n; i++) udp_conn_unref(collected[i]);
+        if (n < MAX_EVENTS) break;
+    }
+    // 銷毀事件迴圈中途退出時尚未處理的垃圾
+    for (int g = 0; g < garbage_count; g++) udp_conn_unref(garbage[g]);
+
+    close(me->epoll_fd);
+    jni_detach_thread();
+    return NULL;
 }
+
+// 由握手執行緒呼叫：建立 UDP session（額度 → 槽位 → socket → 回覆 → 註冊）。
+// 所有失敗路徑都由 udp_conn_unref 的 finalize 負責關 fd 與歸還 g_conn_count 額度。
+static void udp_start_session(int client_fd, int cmd) {
+    if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
+        atomic_fetch_sub(&g_conn_count, 1);
+        send_zero_reply(client_fd, 0x04);
+        close(client_fd);
+        return;
+    }
+    int slot = udp_slot_acquire();
+    if (slot < 0) {
+        atomic_fetch_sub(&g_conn_count, 1);
+        send_zero_reply(client_fd, 0x04);
+        close(client_fd);
+        return;
+    }
+    udp_conn_t *u = &g_udp_slots[slot];
+    u->magic = UDP_CONN_MAGIC;
+    u->client_fd = client_fd;
+    u->local_udp_fd = -1;
+    u->remote_udp_fd = -1;
+    u->widx = atomic_fetch_add(&g_udp_next_worker, 1) % UDP_WORKER_COUNT;
+    u->ep_u64 = ((uint64_t)u->gen << 32) | (uint32_t)slot;
+    atomic_store(&u->refs, 1);
+    atomic_store(&u->finalized, 0);
+    atomic_store(&u->registered, 0);
+    u->last_active = time(NULL);
+    u->in_buf = malloc(BUFFER_SIZE + 64);
+    u->out_buf = malloc(BUFFER_SIZE + 64);
+    if (!u->in_buf || !u->out_buf) { udp_conn_unref(u); return; }
+
+    if (cmd == 0x03) {
+        // 標準 UDP ASSOCIATE：建立雙棧 local relay socket
+        int local_udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+        int local_is_v6 = (local_udp_fd >= 0);
+        if (!local_is_v6) local_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (local_udp_fd < 0) { udp_conn_unref(u); return; }
+        if (local_is_v6) {
+            int v6only = 0;
+            setsockopt(local_udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+            struct sockaddr_in6 a6 = {0};
+            a6.sin6_family = AF_INET6; /* sin6_addr 全 0 = :: */
+            bind(local_udp_fd, (struct sockaddr*)&a6, sizeof(a6));
+        } else {
+            struct sockaddr_in a4 = {0};
+            a4.sin_family = AF_INET;
+            a4.sin_addr.s_addr = htonl(INADDR_ANY);
+            bind(local_udp_fd, (struct sockaddr*)&a4, sizeof(a4));
+        }
+        u->local_udp_fd = local_udp_fd;
+
+        // BND.ADDR 取控制連線的本地（伺服器端）位址，BND.PORT 取 local relay port
+        struct sockaddr_storage local_ss; socklen_t local_len = sizeof(local_ss);
+        getsockname(local_udp_fd, (struct sockaddr*)&local_ss, &local_len);
+        unsigned short p = (local_ss.ss_family == AF_INET6)
+            ? ntohs(((struct sockaddr_in6*)&local_ss)->sin6_port)
+            : ntohs(((struct sockaddr_in*)&local_ss)->sin_port);
+        unsigned char resp[22];
+        int resp_len = 0;
+        unsigned char resp_port[2] = { (unsigned char)(p >> 8), (unsigned char)(p & 0xFF) };
+        struct sockaddr_storage ss; socklen_t slen = sizeof(ss);
+        if (getsockname(client_fd, (struct sockaddr*)&ss, &slen) == 0) {
+            if (ss.ss_family == AF_INET) {
+                struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
+                resp_len = socks5_encode_reply(resp, 0x00, 0, (const unsigned char *)&s4->sin_addr, resp_port);
+            } else if (ss.ss_family == AF_INET6) {
+                struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
+                if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+                    resp_len = socks5_encode_reply(resp, 0x00, 0, (const unsigned char *)&s6->sin6_addr.s6_addr[12], resp_port);
+                } else {
+                    resp_len = socks5_encode_reply(resp, 0x00, 1, (const unsigned char *)&s6->sin6_addr, resp_port);
+                }
+            }
+        }
+        if (resp_len == 0) {
+            unsigned char zero4[4] = {0,0,0,0};
+            unsigned char zero2[2] = {0,0};
+            resp_len = socks5_encode_reply(resp, 0x00, 0, zero4, zero2);
+        }
+        send(client_fd, resp, resp_len, MSG_NOSIGNAL);
+
+        int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
+        if (remote_udp_fd < 0) { udp_conn_unref(u); return; }
+        u->remote_udp_fd = remote_udp_fd;
+
+        // 控制連線 peer（來源驗證用）
+        u->peer_ss_len = sizeof(u->peer_ss);
+        getpeername(client_fd, (struct sockaddr*)&u->peer_ss, &u->peer_ss_len);
+    } else { // 0x04 UDP-in-TCP
+        int remote_udp_fd = request_java_5g_socket("", 0, 1);
+        if (remote_udp_fd < 0) {
+            send_zero_reply(client_fd, 0x04);
+            udp_conn_unref(u); // finalize 關 client_fd 並歸還額度
+            return;
+        }
+        u->remote_udp_fd = remote_udp_fd;
+        send_zero_reply(client_fd, 0x00);
+    }
+
+    // 非阻塞 + 註冊進 UDP worker epoll
+    udp_worker_t *w = &udp_workers[u->widx];
+    set_nonblocking(client_fd);
+    if (u->local_udp_fd >= 0) set_nonblocking(u->local_udp_fd);
+    set_nonblocking(u->remote_udp_fd);
+
+    // 先入鏈，再註冊（註冊完成前 registered=0，worker 跳過）
+    pthread_mutex_lock(&w->list_lock);
+    u->next = w->conn_list_head;
+    u->prev = NULL;
+    if (w->conn_list_head) w->conn_list_head->prev = u;
+    w->conn_list_head = u;
+    pthread_mutex_unlock(&w->list_lock);
+
+    struct epoll_event ev;
+    u->client_events = EPOLLIN | EPOLLRDHUP;
+    ev.events = u->client_events; ev.data.u64 = u->ep_u64;
+    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) != 0) goto reg_failed;
+    if (u->local_udp_fd >= 0) {
+        ev.events = EPOLLIN; ev.data.u64 = u->ep_u64 | UDP_EV_ROLE_LOCAL_FLAG;
+        if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->local_udp_fd, &ev) != 0) goto reg_failed;
+    }
+    ev.events = EPOLLIN; ev.data.u64 = u->ep_u64 | UDP_EV_ROLE_REMOTE_FLAG;
+    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->remote_udp_fd, &ev) != 0) goto reg_failed;
+
+    atomic_store(&u->registered, 1);
+    return;
+
+reg_failed:
+    pthread_mutex_lock(&w->list_lock);
+    if (!u->closed) {
+        u->closed = 1;
+        if (u->prev) u->prev->next = u->next; else w->conn_list_head = u->next;
+        if (u->next) u->next->prev = u->prev;
+        u->next = NULL; u->prev = NULL;
+    }
+    pthread_mutex_unlock(&w->list_lock);
+    udp_conn_unref(u);
+    return;
+}
+
 
 void socks5_server_set_auth(const char *user, const char *pass) {
     // 安全原則：必須「同時」設定帳號與密碼才啟用認證。
@@ -1208,16 +1463,11 @@ static int do_auth_check(int client_fd, unsigned char *buf, const char *auth_use
 // ================= 執行緒池（item10 改良版） =================
 // 取代「每條連線 spawn 一條執行緒」的作法：
 //  - 固定執行緒數 + 有界佇列 + 縮小 stack（128KB），burst 時以「丟棄連線」替代建立執行緒
-//  - 分兩個池：
-//      g_handshake_pool：只服務「短命」的 SOCKS5 握手（單次最多 5 秒 timeout）
-//      g_udp_pool：      服務「長命」的 UDP session（單次最多 UDP_IDLE_TIMEOUT_SEC）
-//  - 關鍵原因：5G-Proxy-Client 的 tun2socks 對每個 UDP socket（DNS / QUIC 443）
-//    都開一條 session，若與握手共用執行緒，64 條很快被 UDP session 佔死
-//    → 所有 TCP 握手排隊逾時 =「伺服器拒絕服務」。
+//  - 只服務「短命」的 SOCKS5 握手（單次最多 5 秒 timeout）。
+//  - [P2] 長命的 UDP session 已改由 udp_worker_loop（epoll，見上）處理，
+//    不再佔用握手執行緒，也不再有 96 條 session 執行緒上限。
 #define HANDSHAKE_POOL_SIZE 64
 #define HANDSHAKE_QUEUE_SIZE 1024
-#define UDP_POOL_SIZE 96
-#define UDP_QUEUE_SIZE 512
 #define HANDSHAKE_STACK_SIZE (128 * 1024)
 
 typedef struct {
@@ -1238,7 +1488,6 @@ typedef struct {
 } job_pool_t;
 
 static job_pool_t g_handshake_pool;
-static job_pool_t g_udp_pool;
 
 static void handle_handshake_fd(int client_fd);
 
@@ -1324,14 +1573,6 @@ static void job_pool_shutdown(job_pool_t *p) {
 
 static void handle_handshake_job(pool_job_t job) {
     handle_handshake_fd(job.fd);
-}
-
-static void handle_udp_job(pool_job_t job) {
-    if (job.cmd == 0x04) {
-        handle_udp_tcp_session(job.fd);
-    } else {
-        handle_udp_session_full(job.fd);
-    }
 }
 
 // 由握手池 worker 呼叫：握手完成後 TCP 轉交 epoll worker，
@@ -1423,12 +1664,9 @@ static void handle_handshake_fd(int client_fd) {
         
         return;
     } else if (socks5_is_supported_cmd(cmd)) { // UDP / UDP-in-TCP (0x03 / 0x04)
-        // [UDP 池] 轉交專用 UDP session 池；池滿時回 REP=0x04 讓客戶端
-        // 退避/關閉，不讓長命 UDP session 佔死握手執行緒池
-        if (job_pool_enqueue(&g_udp_pool, client_fd, cmd) != 0) {
-            send_zero_reply(client_fd, 0x04);
-            close(client_fd);
-        }
+        // [P2] 直接在此握手執行緒建立 session 並 handoff 給 UDP epoll worker，
+        // 不再經 g_udp_pool（96 執行緒上限）。
+        udp_start_session(client_fd, cmd);
         return;
     }
 err:
@@ -1483,9 +1721,16 @@ static void* listener_task(void* arg) {
         pthread_create(&workers[i].thread_id, NULL, worker_loop_safe, &workers[i]);
     }
 
-    // [執行緒池] 握手池（短命任務）+ UDP session 池（長命任務）
+    // [執行緒池] 握手池（短命任務）
     job_pool_init(&g_handshake_pool, HANDSHAKE_POOL_SIZE, HANDSHAKE_QUEUE_SIZE, handle_handshake_job);
-    job_pool_init(&g_udp_pool, UDP_POOL_SIZE, UDP_QUEUE_SIZE, handle_udp_job);
+    // [P2] UDP session epoll worker（取代 g_udp_pool 的 96 執行緒）
+    udp_slots_init();
+    for (int i = 0; i < UDP_WORKER_COUNT; i++) {
+        udp_workers[i].epoll_fd = epoll_create1(0);
+        udp_workers[i].conn_list_head = NULL;
+        pthread_mutex_init(&udp_workers[i].list_lock, NULL);
+        pthread_create(&udp_workers[i].thread_id, NULL, udp_worker_loop, &udp_workers[i]);
+    }
 
     g_listener_count = 0;
 
@@ -1614,7 +1859,7 @@ void socks5_server_quit(void) {
 
     if (g_shutdown_pipe[1] != -1) {
         char stop_sig = 1;
-        // 寫足量喚醒所有 poller（listener + 96 UDP worker + 64 握手 worker + 4 轉發 worker）
+        // 寫足量喚醒所有 poller（listener + UDP worker + 64 握手 worker + 4 轉發 worker）
         for(int k=0; k<200; k++) write(g_shutdown_pipe[1], &stop_sig, 1);
     }
     pthread_join(listener_thread, NULL);
@@ -1622,7 +1867,11 @@ void socks5_server_quit(void) {
     // 池內的握手任務仍會呼叫 handoff_to_worker 去 lock worker 的 list_lock，
     // 若先 join/destroy worker 再排水，等同對已銷毀的 mutex 上鎖（UB）
     job_pool_shutdown(&g_handshake_pool);
-    job_pool_shutdown(&g_udp_pool);
+    // [P2] UDP worker 取代 g_udp_pool；shutdown pipe 已喚醒它們，此處 join 收尾
+    for (int i = 0; i < UDP_WORKER_COUNT; i++) {
+        pthread_join(udp_workers[i].thread_id, NULL);
+        pthread_mutex_destroy(&udp_workers[i].list_lock);
+    }
     for (int i = 0; i < WORKER_COUNT; i++) {
         pthread_join(workers[i].thread_id, NULL);
         pthread_mutex_destroy(&workers[i].list_lock); // 銷毀鎖

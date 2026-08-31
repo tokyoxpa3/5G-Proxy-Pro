@@ -15,6 +15,8 @@ set(SOURCE_FILES
     src/main/cpp/simple-socks5.c
     src/main/cpp/socks5_protocol.c
     src/main/cpp/conn_state.c
+    src/main/cpp/conn_forward.c
+    src/main/cpp/udp_conn.c
 )
 
 add_library(androidproxy SHARED
