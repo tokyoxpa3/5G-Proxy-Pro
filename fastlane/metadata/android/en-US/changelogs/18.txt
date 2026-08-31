@@ -1,0 +1,8 @@
+- Dual-stack IPv6: UDP ASSOCIATE now supports IPv6, with IPv6-first staggered Happy Eyeballs connect and bounded DNS lookups
+- DNS single-flight to dedupe concurrent same-host lookups; bound Happy Eyeballs connect attempts
+- Fix: reject SOCKS5 CONNECT with non-zero RSV (RFC 1928)
+- Perf: expand UDP epoll workers from 1 to 4; add heavy-traffic UI tip
+- Fix: correct 0x04 UDP-in-TCP outbound frame offset
+- Fix: fd-reuse race; extract ghost purge module
+- Feat: persist engine lifecycle counters to rolling log; surface rolling stats in diagnostics report
+- Chore: extract SOCKS5/UDP/DNS/Happy-Eyeballs logic into pure functions with host & JVM unit tests

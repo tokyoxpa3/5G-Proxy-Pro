@@ -1,0 +1,8 @@
+- 雙棧 IPv6：UDP ASSOCIATE 現支援 IPv6，採 IPv6 優先的 Happy Eyeballs 錯開連線並限制 DNS 查詢
+- DNS single-flight 去重同主機併發查詢；限制 Happy Eyeballs 連線嘗試次數
+- 修正：拒絕帶非零 RSV 的 SOCKS5 CONNECT（RFC 1928）
+- 效能：UDP epoll worker 由 1 擴充至 4，並新增高流量 UI 提示
+- 修正：0x04 UDP-in-TCP 外發幀偏移
+- 修正：fd 重用競態；抽出 ghost 清除模組
+- 新增：引擎生命週期計數器寫入滾動日誌；診斷報告顯示滾動流量統計
+- 重構：將 SOCKS5/UDP/DNS/Happy-Eyeballs 邏輯抽成純函式並補上 host 與 JVM 單元測試
