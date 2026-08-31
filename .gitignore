@@ -39,3 +39,5 @@ tools/apk_extract/
 .zcode/
 tools/mr_note.py
 tools/update_fdroiddata.py
+
+.remote_p4_test.py
