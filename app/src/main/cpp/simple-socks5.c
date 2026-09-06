@@ -1352,10 +1352,10 @@ static int do_auth_check(int client_fd, unsigned char *buf, const char *auth_use
 // ================= 執行緒池（item10 改良版） =================
 // 取代「每條連線 spawn 一條執行緒」的作法：
 //  - 固定執行緒數 + 有界佇列 + 縮小 stack（128KB），burst 時以「丟棄連線」替代建立執行緒
-//  - 只服務「短命」的 SOCKS5 握手（單次最多 5 秒 timeout）。
+//  - 只服務「短命」的 SOCKS5 握手（單次最多 3 秒 timeout）。
 //  - [P2] 長命的 UDP session 已改由 udp_worker_loop（epoll，見上）處理，
 //    不再佔用握手執行緒，也不再有 96 條 session 執行緒上限。
-#define HANDSHAKE_POOL_SIZE 64
+#define HANDSHAKE_POOL_SIZE 192
 #define HANDSHAKE_QUEUE_SIZE 1024
 #define HANDSHAKE_STACK_SIZE (128 * 1024)
 
@@ -1448,7 +1448,7 @@ static void job_pool_shutdown(job_pool_t *p) {
     pthread_cond_broadcast(&p->not_empty);
     pthread_mutex_unlock(&p->lock);
 
-    // 等待所有 worker 結束（進行中的握手最多 5 秒 timeout，
+    // 等待所有 worker 結束（進行中的握手最多 3 秒 timeout，
     // UDP session 會經由 shutdown pipe 立即退出）
     for (int i = 0; i < p->nthreads; i++) {
         pthread_join(p->threads[i], NULL);
@@ -1468,9 +1468,9 @@ static void handle_handshake_job(pool_job_t job) {
 // UDP / UDP-in-TCP 則轉交專用 UDP session 池（避免長命 session 佔死握手執行緒）
 static void handle_handshake_fd(int client_fd) {
     unsigned char buf[1024]; 
-    struct timeval tv = {5, 0};
+    struct timeval tv = {3, 0};
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-    // [健壯性] 回覆寫入同樣設 5 秒超時：握手 socket 為 blocking，慢速客戶端
+    // [健壯性] 回覆寫入同樣設 3 秒超時：握手 socket 為 blocking，慢速客戶端
     // （只連不讀的 slowloris 式）會讓 send() 無限阻塞、佔死握手執行緒。
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
 
