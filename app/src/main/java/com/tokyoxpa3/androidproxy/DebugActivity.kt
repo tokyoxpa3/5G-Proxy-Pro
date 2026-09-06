@@ -1,6 +1,7 @@
 package com.tokyoxpa3.androidproxy
 
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.widget.*
 import android.app.Activity
@@ -41,6 +42,13 @@ class DebugActivity : Activity() {
     private lateinit var selfTestButton: Button
     private lateinit var copyDiagnosticsButton: Button
     private lateinit var selfTestResultText: TextView
+    private lateinit var trafficUploadValue: TextView
+    private lateinit var trafficDownloadValue: TextView
+    private lateinit var trafficUploadTotal: TextView
+    private lateinit var trafficDownloadTotal: TextView
+    private var trafficPollingJob: Job? = null
+    private var lastTrafficSample: LongArray? = null
+    private var lastTrafficTime = 0L
     
     private var isRunning = false
     private var pendingNotificationPermission = false
@@ -117,6 +125,7 @@ class DebugActivity : Activity() {
                 mainButton.background = createButtonDrawable(0xFFDC3545.toInt())
                 statusText.text = getString(R.string.status_proxy_running)
                 statusText.setTextColor(0xFF6C757D.toInt())
+                startTrafficPolling()
             }
             Socks5ProxyService.ProxyStatus.RESTARTING -> {
                 isRunning = true
@@ -138,11 +147,13 @@ class DebugActivity : Activity() {
                 mainButton.background = createButtonDrawable(0xFF6200EE.toInt())
                 statusText.text = getString(R.string.status_stopped)
                 statusText.setTextColor(0xFF6C757D.toInt())
+                stopTrafficPolling()
             }
             Socks5ProxyService.ProxyStatus.FAILED -> {
                 isRunning = false
                 mainButton.text = startText
                 mainButton.background = createButtonDrawable(0xFF6200EE.toInt())
+                stopTrafficPolling()
                 val error = Socks5ProxyService.lastErrorMessage
                 statusText.text = if (error != null) {
                     getString(R.string.status_failed, error)
@@ -415,6 +426,81 @@ class DebugActivity : Activity() {
         rootLayout.addView(limitHintText)
         rootLayout.addView(ipCard)
 
+        // Traffic Card（範本 B：上傳/下載雙欄彩色大數字）
+        val trafficCard = createCard().apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 24 }
+
+            addView(TextView(context).apply {
+                text = getString(R.string.traffic_card_title)
+                textSize = 14f
+                setTextColor(0xFF6C757D.toInt())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setPadding(0, 0, 0, 12)
+            })
+
+            val cols = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+
+            val upCol = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f)
+            }
+            upCol.addView(TextView(context).apply {
+                text = getString(R.string.traffic_upload_label)
+                textSize = 12f
+                setTextColor(0xFF6C757D.toInt())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            })
+            trafficUploadValue = TextView(context).apply {
+                text = getString(R.string.traffic_na)
+                textSize = 22f
+                setTextColor(0xFF28A745.toInt())
+                typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD)
+                setPadding(0, 4, 0, 2)
+            }
+            upCol.addView(trafficUploadValue)
+            trafficUploadTotal = TextView(context).apply {
+                text = getString(R.string.traffic_na)
+                textSize = 12f
+                setTextColor(0xFF6C757D.toInt())
+            }
+            upCol.addView(trafficUploadTotal)
+
+            val downCol = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f)
+            }
+            downCol.addView(TextView(context).apply {
+                text = getString(R.string.traffic_download_label)
+                textSize = 12f
+                setTextColor(0xFF6C757D.toInt())
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            })
+            trafficDownloadValue = TextView(context).apply {
+                text = getString(R.string.traffic_na)
+                textSize = 22f
+                setTextColor(0xFF0D6EFD.toInt())
+                typeface = android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD)
+                setPadding(0, 4, 0, 2)
+            }
+            downCol.addView(trafficDownloadValue)
+            trafficDownloadTotal = TextView(context).apply {
+                text = getString(R.string.traffic_na)
+                textSize = 12f
+                setTextColor(0xFF6C757D.toInt())
+            }
+            downCol.addView(trafficDownloadTotal)
+
+            cols.addView(upCol)
+            cols.addView(downCol)
+            addView(cols)
+        }
+        rootLayout.addView(trafficCard)
+
         // Diagnostics Card（自我檢測 + 複製診斷報告）
         val diagCard = createCard().apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -593,6 +679,90 @@ class DebugActivity : Activity() {
         updateNetworkStatus()
         // 以 Service 實際回報的狀態更新，不依賴 Activity 本地猜測
         onProxyStatusChanged(Socks5ProxyService.currentStatus)
+    }
+
+    // ================= 流量統計（範本 B） =================
+
+    private fun startTrafficPolling() {
+        if (trafficPollingJob?.isActive == true) return
+        lastTrafficSample = null
+        lastTrafficTime = 0L
+        trafficPollingJob = activityScope.launch {
+            while (Socks5ProxyService.isServiceRunning) {
+                updateTrafficStats()
+                delay(1000)
+            }
+        }
+    }
+
+    private fun stopTrafficPolling() {
+        trafficPollingJob?.cancel()
+        trafficPollingJob = null
+        lastTrafficSample = null
+        lastTrafficTime = 0L
+        resetTrafficLabels()
+    }
+
+    private fun resetTrafficLabels() {
+        val na = getString(R.string.traffic_na)
+        trafficUploadValue.text = na
+        trafficDownloadValue.text = na
+        trafficUploadTotal.text = na
+        trafficDownloadTotal.text = na
+    }
+
+    private fun updateTrafficStats() {
+        val bytes = NativeEngine.safeGetTrafficBytes() ?: return
+        val tx = bytes[0]
+        val rx = bytes[1]
+        val prev = lastTrafficSample
+        val now = SystemClock.elapsedRealtime()
+
+        // 引擎重啟會把計數器歸零；總數倒退代表發生 reset，此時只重設基準、
+        // 不計算速率，避免顯示負值/突波。
+        if (prev != null && (tx < prev[0] || rx < prev[1])) {
+            lastTrafficSample = longArrayOf(tx, rx)
+            lastTrafficTime = now
+            trafficUploadValue.text = formatSpeed(0.0)
+            trafficDownloadValue.text = formatSpeed(0.0)
+            trafficUploadTotal.text = formatBytes(tx)
+            trafficDownloadTotal.text = formatBytes(rx)
+            return
+        }
+
+        var upRate = 0.0
+        var downRate = 0.0
+        if (prev != null && lastTrafficTime > 0) {
+            val dtSec = (now - lastTrafficTime) / 1000.0
+            if (dtSec > 0) {
+                upRate = (tx - prev[0]) / dtSec
+                downRate = (rx - prev[1]) / dtSec
+            }
+        }
+        lastTrafficSample = longArrayOf(tx, rx)
+        lastTrafficTime = now
+
+        trafficUploadValue.text = formatSpeed(upRate)
+        trafficDownloadValue.text = formatSpeed(downRate)
+        trafficUploadTotal.text = formatBytes(tx)
+        trafficDownloadTotal.text = formatBytes(rx)
+    }
+
+    private fun formatSpeed(bytesPerSec: Double): String {
+        return when {
+            bytesPerSec >= 1024 * 1024 -> String.format(Locale.US, "%.1f MB/s", bytesPerSec / (1024 * 1024))
+            bytesPerSec >= 1024 -> String.format(Locale.US, "%.1f KB/s", bytesPerSec / 1024)
+            else -> String.format(Locale.US, "%.0f B/s", bytesPerSec)
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        return when {
+            bytes >= 1024L * 1024 * 1024 -> String.format(Locale.US, "%.2f GB", bytes / (1024.0 * 1024 * 1024))
+            bytes >= 1024L * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024))
+            bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+            else -> "$bytes B"
+        }
     }
 
     private fun runSelfTest() {

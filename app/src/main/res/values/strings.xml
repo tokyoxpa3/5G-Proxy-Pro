@@ -101,4 +101,8 @@ Also set this App\'s battery saver to \"No restrictions\".</string>
     <string name="diagnostics_title">5G Proxy Pro Diagnostics</string>
     <string name="diagnostics_copied">Diagnostics copied to clipboard</string>
     <string name="hint_connection_limit">💡 Tip: Avoid opening too many concurrent connections (e.g. high BitTorrent connection limits) to keep the phone proxy stable.</string>
+    <string name="traffic_card_title">📊 Traffic</string>
+    <string name="traffic_upload_label">↑ UPLOAD</string>
+    <string name="traffic_download_label">↓ DOWNLOAD</string>
+    <string name="traffic_na">--</string>
 </resources>

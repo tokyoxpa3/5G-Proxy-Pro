@@ -47,6 +47,7 @@ object NativeEngine {
     external fun setSocks5Auth(user: String, pass: String): String
     external fun isSocks5ServerRunning(): Boolean
     external fun getSocks5Stats(): String
+    external fun getTrafficBytes(): LongArray
 
     // [自檢/診斷] 安全讀取 native 統計；程式庫未載入時回傳說明字串
     fun safeGetStats(): String {
@@ -55,5 +56,16 @@ object NativeEngine {
         } else {
             "native library not loaded"
         }
+    }
+
+    // [流量統計] 安全讀取 tx/rx 累計位元組（[上傳, 下載]）；程式庫未載入或
+    // 讀取失敗回傳 null，由 UI 顯示佔位。
+    fun safeGetTrafficBytes(): LongArray? {
+        return if (libraryLoaded) {
+            try {
+                val arr = getTrafficBytes()
+                if (arr.size >= 2) arr else null
+            } catch (e: Exception) { null }
+        } else null
     }
 }

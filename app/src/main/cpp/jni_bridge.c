@@ -23,6 +23,7 @@ extern void socks5_server_set_auth(const char *user, const char *pass);
 extern void socks5_server_set_bind_addrs(const char **addrs, int count);
 extern int socks5_server_is_running(void);
 extern int socks5_server_get_stats(char *out, size_t out_len);
+extern int socks5_server_get_bytes(long long *tx, long long *rx);
 
 static pthread_t g_server_thread;
 static int g_server_running = 0;
@@ -166,6 +167,18 @@ JNIEXPORT jstring JNICALL native_get_socks5_stats(JNIEnv *env, jobject thiz) {
     return (*env)->NewStringUTF(env, buf);
 }
 
+// [流量統計] 讀取 tx/rx 累計位元組（[上傳, 下載]），供 UI 即時速率顯示。
+JNIEXPORT jlongArray JNICALL native_get_traffic_bytes(JNIEnv *env, jobject thiz) {
+    long long tx = 0, rx = 0;
+    socks5_server_get_bytes(&tx, &rx);
+    jlongArray arr = (*env)->NewLongArray(env, 2);
+    if (arr) {
+        jlong vals[2] = { (jlong)tx, (jlong)rx };
+        (*env)->SetLongArrayRegion(env, arr, 0, 2, vals);
+    }
+    return arr;
+}
+
 static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
     {"startSocks5Server", "(I[Ljava/lang/String;)Ljava/lang/String;", (void *)native_start_socks5_server},
@@ -173,6 +186,7 @@ static const JNINativeMethod gMethods[] = {
     {"setSocks5Auth", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *)native_set_socks5_auth},
     {"isSocks5ServerRunning", "()Z", (void *)native_is_socks5_server_running},
     {"getSocks5Stats", "()Ljava/lang/String;", (void *)native_get_socks5_stats},
+    {"getTrafficBytes", "()[J", (void *)native_get_traffic_bytes},
 };
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {

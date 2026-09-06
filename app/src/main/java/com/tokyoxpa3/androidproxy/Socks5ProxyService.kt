@@ -635,7 +635,7 @@ class Socks5ProxyService : Service() {
                 // （電信商 IPv4 黑洞期間每次逾時都會製造一個，長時間運行下
                 //   FDSize 衝上 16384 的元兇之一）
                 val abandoned = java.util.concurrent.atomic.AtomicBoolean(false)
-                val connectTimeout = 5000L
+                val connectTimeout = 2000L
                 val overallDeadline = connectTimeout + 500L
 
                 HappyEyeballs.race(

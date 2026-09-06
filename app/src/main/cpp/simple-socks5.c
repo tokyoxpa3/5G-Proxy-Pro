@@ -125,6 +125,11 @@ static atomic_llong g_st_stale_skip = 0;   // gen 不符被跳過的事件數（
 static atomic_llong g_st_bad_slot = 0;     // slot 越界 / 槽位未啟用
 static atomic_llong g_st_exhausted = 0;    // 槽位耗盡次數
 static atomic_llong g_st_double_fin = 0;   // 二次 finalize 嘗試
+// [流量統計] per-worker tx/rx 位元組累加器。tx = 經 5G target socket 送出的位元組
+// （上傳），rx = 自 5G target socket 收到的位元組（下載）。各 worker 各自累加，
+// 避免跨執行緒 cache line 競爭；讀取統計時才加總（見 socks5_server_get_bytes）。
+static atomic_llong g_tx_bytes[WORKER_COUNT];
+static atomic_llong g_rx_bytes[WORKER_COUNT];
 
 // 取得空閒槽位並遞增世代。回傳 slot 索引，耗盡回傳 -1。
 // 只在 handoff_to_worker（握手池執行緒）呼叫。
@@ -221,6 +226,13 @@ static int try_send(int fd, unsigned char *buf, ssize_t *len, ssize_t *off) {
     }
     *off = 0; *len = 0;
     return 1;
+}
+
+// [流量統計] 紀錄經 5G target socket 送出的位元組（上傳 tx）。以送出前後的 *off
+// 差值為準，只有實際送出（>0）才累加，避免部分送出被漏計或重複計數。
+static void account_upload(ssize_t off_before, ssize_t off_after, int widx) {
+    long long sent = off_after - off_before;
+    if (sent > 0) atomic_fetch_add(&g_tx_bytes[widx], sent);
 }
 
 // [可測抽離] 事件興趣遮罩的決策核心抽至 conn_forward_interest（純函式，host 可測）。
@@ -416,7 +428,9 @@ static void* worker_loop_safe(void* arg) {
                 }
                 // Buffer flushing (To Target)
                 if (full->c2t_len > 0) {
+                    ssize_t off_before = full->c2t_off;
                     if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off) < 0) fatal_error = 1;
+                    account_upload(off_before, full->c2t_off, my_widx);
                 }
                 // Read from Client
                 if (!fatal_error && full->c2t_len == 0 && !full->client_eof) {
@@ -424,6 +438,7 @@ static void* worker_loop_safe(void* arg) {
                     if (r > 0) {
                         full->c2t_len = r; full->c2t_off = 0;
                         if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off) < 0) fatal_error = 1;
+                        account_upload(0, full->c2t_off, my_widx);
                     } else if (r == 0) {
                         // 客戶端半關閉 (FIN): 停止讀取，但仍須把 target 的剩餘資料轉發回去
                         full->client_eof = 1;
@@ -435,6 +450,7 @@ static void* worker_loop_safe(void* arg) {
                     ssize_t r = recv(full->target_fd, full->t2c_buf, BUFFER_SIZE, 0);
                     if (r > 0) {
                         full->t2c_len = r; full->t2c_off = 0;
+                        atomic_fetch_add(&g_rx_bytes[my_widx], (long long)r);
                         if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off) < 0) fatal_error = 1;
                     } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) fatal_error = 1;
                 }
@@ -811,6 +827,9 @@ static atomic_int g_udp_next_worker = 0;
 static atomic_llong g_udp_st_acquired = 0, g_udp_st_released = 0;
 static atomic_llong g_udp_st_stale = 0, g_udp_st_bad_slot = 0;
 static atomic_llong g_udp_st_exhausted = 0, g_udp_st_double_fin = 0;
+// [流量統計] UDP per-worker tx/rx 位元組累加器（與 TCP 分開宣告，讀取時一併加總）。
+static atomic_llong g_udp_tx_bytes[UDP_WORKER_COUNT];
+static atomic_llong g_udp_rx_bytes[UDP_WORKER_COUNT];
 
 static void udp_slots_init(void) {
     for (int i = 0; i < UDP_SLOT_COUNT; i++) {
@@ -930,8 +949,11 @@ static int udp_local_event(udp_conn_t *u) {
             u->client_src_len = tlen;
             struct sockaddr_storage dst_ss; socklen_t dlen;
             if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && r > hlen) {
-                if (sendto(u->remote_udp_fd, u->in_buf + hlen, r - hlen, 0, (struct sockaddr*)&dst_ss, dlen) < 0) {
+                ssize_t sent = sendto(u->remote_udp_fd, u->in_buf + hlen, r - hlen, 0, (struct sockaddr*)&dst_ss, dlen);
+                if (sent < 0) {
                     LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
+                } else if (sent > 0) {
+                    atomic_fetch_add(&g_udp_tx_bytes[u->widx], (long long)sent);
                 }
             }
         }
@@ -949,6 +971,7 @@ static int udp_remote_event(udp_conn_t *u) {
             ssize_t r = recvfrom(u->remote_udp_fd, u->in_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
             if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
             if (r == 0) continue;
+            atomic_fetch_add(&g_udp_rx_bytes[u->widx], (long long)r);
             if (u->client_src_len > 0) {
                 const unsigned char *addr; int is_v6;
                 if (src6.sin6_family == AF_INET) { addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr; is_v6 = 0; }
@@ -970,6 +993,7 @@ static int udp_remote_event(udp_conn_t *u) {
             ssize_t r = recvfrom(u->remote_udp_fd, u->out_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
             if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
             if (r == 0) continue;
+            atomic_fetch_add(&g_udp_rx_bytes[u->widx], (long long)r);
             const unsigned char *addr; int is_v6;
             if (src6.sin6_family == AF_INET) { addr = (const unsigned char *)&((struct sockaddr_in *)&src6)->sin_addr; is_v6 = 0; }
             else if (IN6_IS_ADDR_V4MAPPED(&src6.sin6_addr)) { addr = (const unsigned char *)&src6.sin6_addr.s6_addr[12]; is_v6 = 0; }
@@ -1025,8 +1049,11 @@ static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
         if (hlen > 0) {
             struct sockaddr_storage dst_ss; socklen_t dlen;
             if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && u->frame_expect > hlen) {
-                if (sendto(u->remote_udp_fd, u->in_buf + hlen, u->frame_expect - hlen, 0, (struct sockaddr*)&dst_ss, dlen) < 0) {
+                ssize_t sent = sendto(u->remote_udp_fd, u->in_buf + hlen, u->frame_expect - hlen, 0, (struct sockaddr*)&dst_ss, dlen);
+                if (sent < 0) {
                     LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
+                } else if (sent > 0) {
+                    atomic_fetch_add(&g_udp_tx_bytes[u->widx], (long long)sent);
                 }
             }
         }
@@ -1723,6 +1750,25 @@ int socks5_server_get_stats(char *out, size_t out_len) {
     return 0;
 }
 
+// [流量統計] 讀取累計 tx/rx 位元組數（跨 TCP + UDP 所有 worker 加總）。server
+// 未啟動或參數非法回傳 -1；否則回傳 0 並寫入 *tx / *rx（未啟動時兩者皆為 0）。
+int socks5_server_get_bytes(long long *tx, long long *rx) {
+    if (!tx || !rx) return -1;
+    long long t = 0, r = 0;
+    if (atomic_load(&server_running)) {
+        for (int i = 0; i < WORKER_COUNT; i++) {
+            t += atomic_load(&g_tx_bytes[i]);
+            r += atomic_load(&g_rx_bytes[i]);
+        }
+        for (int i = 0; i < UDP_WORKER_COUNT; i++) {
+            t += atomic_load(&g_udp_tx_bytes[i]);
+            r += atomic_load(&g_udp_rx_bytes[i]);
+        }
+    }
+    *tx = t; *rx = r;
+    return 0;
+}
+
 int socks5_server_main_dynamic(int port) {
     if (atomic_load(&server_running)) return -1;
     signal(SIGPIPE, SIG_IGN);
@@ -1733,6 +1779,15 @@ int socks5_server_main_dynamic(int port) {
     atomic_store(&g_st_stale_skip, 0); atomic_store(&g_st_bad_slot, 0);
     atomic_store(&g_st_exhausted, 0); atomic_store(&g_st_double_fin, 0);
     ghost_purge_reset();
+    // [流量統計] 每個服務週期重置 tx/rx 位元組累加器
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        atomic_store(&g_tx_bytes[i], 0);
+        atomic_store(&g_rx_bytes[i], 0);
+    }
+    for (int i = 0; i < UDP_WORKER_COUNT; i++) {
+        atomic_store(&g_udp_tx_bytes[i], 0);
+        atomic_store(&g_udp_rx_bytes[i], 0);
+    }
     ListenerArgs *args = malloc(sizeof(ListenerArgs));
     args->port = port;
     pthread_create(&listener_thread, NULL, listener_task, args);
