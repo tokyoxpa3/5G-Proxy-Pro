@@ -97,4 +97,8 @@
     <string name="diagnostics_title">5G Proxy Pro 診斷報告</string>
     <string name="diagnostics_copied">診斷報告已複製到剪貼簿</string>
     <string name="hint_connection_limit">💡 提示：請避免開啟過多並發連線（例如將 BT 連線數設過高），以免手機網路與代理負載過載造成不穩定。</string>
+    <string name="traffic_card_title">📊 流量</string>
+    <string name="traffic_upload_label">↑ 上傳</string>
+    <string name="traffic_download_label">↓ 下載</string>
+    <string name="traffic_na">--</string>
 </resources>
