@@ -1,0 +1,3 @@
+- Feat: real-time traffic stats — upload/download rate and cumulative bytes on the debug screen
+- Perf: increase handshake pool size from 64 to 192 and reduce handshake timeout to 3s
+- Perf: reduce Happy Eyeballs connect timeout from 5s to 2s for faster failover
