@@ -1,7 +1,7 @@
 # 5G Proxy Pro (AndroidProxy)
 
-[![Get it on F-Droid](assets/f-droid-badge.png)](https://f-droid.org/packages/com.tokyoxpa3.androidproxy/)
-[![Get it on GitHub](assets/github-badge.png)](https://github.com/tokyoxpa3/5G-Proxy-Pro/releases/latest)
+[<img src="assets/f-droid-badge.png" alt="Get it on F-Droid" height="80">](https://f-droid.org/packages/com.tokyoxpa3.androidproxy/)
+[<img src="assets/github-badge.png" alt="Get it on GitHub" height="80">](https://github.com/tokyoxpa3/5G-Proxy-Pro/releases/latest)
 
 一個將手機 **5G / 蜂巢式網路流量強制鎖定並透過 SOCKS5 伺服器分享**的 Android App。
 
