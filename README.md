@@ -1,5 +1,8 @@
 # 5G Proxy Pro (AndroidProxy)
 
+![![Get it on F-Droid](assets/f-droid-badge.png)](https://f-droid.org/packages/com.tokyoxpa3.androidproxy/)
+![![Get it on GitHub](assets/github-badge.png)](https://github.com/tokyoxpa3/5G-Proxy-Pro/releases/latest)
+
 一個將手機 **5G / 蜂巢式網路流量強制鎖定並透過 SOCKS5 伺服器分享**的 Android App。
 
 使用 Android 的 `ConnectivityManager.requestNetwork()` 鎖定蜂巢式網路（TRANSPORT_CELLULAR），配合原生 C 實作的 SOCKS5 伺服器（epoll 多路複用），將經由 **5G 網路的 TCP/UDP 流量**透過代理分享給其他裝置（同 Wi-Fi 下的手機、電腦等）。
