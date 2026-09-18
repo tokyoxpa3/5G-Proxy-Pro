@@ -11,12 +11,12 @@
     <string name="btn_start_proxy">🚀 Start 5G Proxy</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: Fetching...</string>
     <string name="hotspot_ip_fetching">🛰️ Hotspot IP: Fetching...</string>
-    <string name="cellular_ip_fetching">📲 5G IP: Fetching...</string>
+    <string name="cellular_ip_fetching">📲 Cellular IP: Fetching...</string>
     <string name="btn_stop_proxy">🛑 Stop Proxy Service</string>
     <string name="status_proxy_running">✅ 5G Proxy Running</string>
     <string name="status_starting">🚀 Starting Service...</string>
     <string name="status_stopped">Service Stopped</string>
-    <string name="status_restarting">🔄 5G IP Changed - Auto Restarting Proxy</string>
+    <string name="status_restarting">🔄 Cellular IP Changed - Auto Restarting Proxy</string>
     <string name="status_waiting_network">📡 5G Network Lost - Waiting to Reconnect</string>
     <string name="status_failed">❌ Proxy Failed to Start: %1$s</string>
     <string name="status_failed_generic">❌ Proxy Failed to Start</string>
@@ -31,9 +31,9 @@
     <string name="wifi_proxy_format">📶 Wi-Fi Proxy: %1$s:%2$d</string>
     <string name="wifi_not_connected">📶 Wi-Fi: Not Connected</string>
     <string name="wifi_fetch_failed">📶 Wi-Fi: Failed</string>
-    <string name="cellular_ip_format">📲 5G IP: %1$s</string>
+    <string name="cellular_ip_format">📲 Cellular IP: %1$s</string>
     <string name="cellular_ip_failed">Failed</string>
-    <string name="cellular_ip_not_locked">📲 5G IP: Not Locked</string>
+    <string name="cellular_ip_not_locked">📲 Cellular IP: Not Locked</string>
     <string name="hotspot_ip_format">🛰️ Hotspot Proxy: %1$s:%2$d</string>
     <string name="hotspot_ip_disabled">🛰️ Hotspot: Not Enabled</string>
     <string name="usb_tether_ip_fetching">🔌 USB Tether IP: Fetching...</string>
@@ -44,7 +44,7 @@
     <string name="notification_proxying">🚀 5G SOCKS5 Proxying</string>
     <string name="notification_init_network">Initializing 5G Network...</string>
     <string name="notification_locked_format">Locked 5G - Listening Port %1$d</string>
-    <string name="notification_restarting">🔄 5G IP Changed - Auto Restarting Proxy</string>
+    <string name="notification_restarting">🔄 Cellular IP Changed - Auto Restarting Proxy</string>
     <string name="notification_waiting_network">📡 5G Network Lost - Waiting to Reconnect</string>
     <string name="notification_channel_name">5G SOCKS5 Proxy Pro</string>
     

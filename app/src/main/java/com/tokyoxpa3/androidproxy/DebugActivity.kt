@@ -838,6 +838,8 @@ class DebugActivity : Activity() {
             Socks5ProxyService.ProxyStatus.FAILED -> "FAILED"
         }
         sb.append("Status: ").append(statusName).append("\n")
+        sb.append("Restarts: ").append(Socks5ProxyService.restartCount).append("\n")
+        Socks5ProxyService.lastHealthCheck?.let { sb.append("LastHealthCheck: ").append(it).append("\n") }
         Socks5ProxyService.lastErrorMessage?.let { sb.append("LastError: ").append(it).append("\n") }
 
         val port = portInput.text.toString().toIntOrNull() ?: 1080

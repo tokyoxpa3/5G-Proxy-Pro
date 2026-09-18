@@ -192,6 +192,10 @@ class Socks5ProxyService : Service() {
 
         @Volatile var currentStatus = ProxyStatus.STOPPED
         @Volatile var lastErrorMessage: String? = null
+        // [診斷] native 生命週期計數器每次重建都歸零，看不出跨重建的歷史。
+        // 這兩個值補上該脈絡，讓使用者複製的報告能直接看出「代理一直在重啟」。
+        @Volatile var restartCount = 0
+        @Volatile var lastHealthCheck: String? = null
         @Volatile var onStatusChanged: ((ProxyStatus) -> Unit)? = null
 
         // 允許監聽的 LAN 介面前綴（Wi-Fi / 熱點 / USB 分享 / 乙太網路 / 藍牙 PAN）。
@@ -262,6 +266,10 @@ class Socks5ProxyService : Service() {
             stopProxy()
         } else {
             stopRequested = false
+            // 使用者主動啟動 = 新的一輪，重建次數與健康檢查結果歸零
+            // （restartProxy 走的是內部路徑，不會經過這裡）
+            restartCount = 0
+            lastHealthCheck = null
             startProxy(port)
         }
         return START_NOT_STICKY
@@ -284,6 +292,8 @@ class Socks5ProxyService : Service() {
     
     private fun startProxy(port: Int) {
         if (stopRequested || isProxyRunning) return
+        // 上一輪的失敗訊息不得殘留，否則診斷報告會同時出現 RUNNING 與舊的 LastError
+        lastErrorMessage = null
         isServiceRunning = true
         proxyPaused = false
         updateStatus(ProxyStatus.STARTING)
@@ -339,8 +349,10 @@ class Socks5ProxyService : Service() {
                         val currentNetwork = cellularNetwork ?: continue
                         if (isNetworkHealthy(currentNetwork)) {
                             consecutiveFailures = 0
+                            lastHealthCheck = "OK"
                         } else {
                             consecutiveFailures++
+                            lastHealthCheck = "FAILED (${consecutiveFailures}/3)"
                             Log.w(TAG, "5G 網路健康檢查失敗 (${consecutiveFailures}/3)，準備自動重建...")
                             if (consecutiveFailures >= 3) {
                                 Log.w(TAG, "5G 網路連續異常，自動重建代理連線...")
@@ -449,6 +461,7 @@ class Socks5ProxyService : Service() {
     private fun restartProxy(port: Int) {
         if (stopRequested || isRestarting || (!isProxyRunning && !proxyPaused)) return
         isRestarting = true
+        restartCount++
         updateStatus(ProxyStatus.RESTARTING)
         serviceScope.launch {
             try {

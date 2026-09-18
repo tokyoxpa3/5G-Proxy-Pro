@@ -11,12 +11,12 @@
     <string name="btn_start_proxy">🚀 一鍵開啟 5G 代理</string>
     <string name="wifi_ip_fetching">📶 Wi-Fi IP: 獲取中...</string>
     <string name="hotspot_ip_fetching">🛰️ 熱點分享 IP: 獲取中...</string>
-    <string name="cellular_ip_fetching">📲 5G 行動 IP: 獲取中...</string>
+    <string name="cellular_ip_fetching">📲 行動網路 IP: 獲取中...</string>
     <string name="btn_stop_proxy">🛑 停止代理服務</string>
     <string name="status_proxy_running">✅ 5G Proxy Running</string>
     <string name="status_starting">🚀 正在啟動服務...</string>
     <string name="status_stopped">服務已停止</string>
-    <string name="status_restarting">🔄 5G IP 已切換，自動重建代理中...</string>
+    <string name="status_restarting">🔄 行動網路 IP 已切換，自動重建代理中...</string>
     <string name="status_waiting_network">📡 5G 網路已中斷，等待恢復中...</string>
     <string name="status_failed">❌ 代理啟動失敗: %1$s</string>
     <string name="status_failed_generic">❌ 代理啟動失敗</string>
@@ -31,9 +31,9 @@
     <string name="wifi_proxy_format">📶 Wi-Fi 代理: %1$s:%2$d</string>
     <string name="wifi_not_connected">📶 Wi-Fi: 未連接</string>
     <string name="wifi_fetch_failed">📶 Wi-Fi: 獲取失敗</string>
-    <string name="cellular_ip_format">📲 5G 行動 IP: %1$s</string>
+    <string name="cellular_ip_format">📲 行動網路 IP: %1$s</string>
     <string name="cellular_ip_failed">獲取失敗</string>
-    <string name="cellular_ip_not_locked">📲 5G 行動 IP: 尚未鎖定</string>
+    <string name="cellular_ip_not_locked">📲 行動網路 IP: 尚未鎖定</string>
     <string name="hotspot_ip_format">🛰️ 熱點分享代理: %1$s:%2$d</string>
     <string name="hotspot_ip_disabled">🛰️ 熱點分享: 未開啟</string>
     <string name="usb_tether_ip_fetching">🔌 USB 分享 IP: 獲取中...</string>
@@ -44,7 +44,7 @@
     <string name="notification_proxying">🚀 5G SOCKS5 代理中</string>
     <string name="notification_init_network">正在初始化 5G 網路...</string>
     <string name="notification_locked_format">已鎖定 5G - 監聽 Port %1$d</string>
-    <string name="notification_restarting">🔄 偵測到 5G IP 切換，正在自動重建代理...</string>
+    <string name="notification_restarting">🔄 偵測到行動網路 IP 切換，正在自動重建代理...</string>
     <string name="notification_waiting_network">📡 5G 網路已中斷，等待恢復後自動重連...</string>
     <string name="notification_channel_name">5G SOCKS5 Proxy Pro</string>
     

@@ -125,6 +125,8 @@ static atomic_llong g_st_stale_skip = 0;   // gen 不符被跳過的事件數（
 static atomic_llong g_st_bad_slot = 0;     // slot 越界 / 槽位未啟用
 static atomic_llong g_st_exhausted = 0;    // 槽位耗盡次數
 static atomic_llong g_st_double_fin = 0;   // 二次 finalize 嘗試
+static atomic_llong g_st_auth_fail = 0;    // 認證失敗（方法未提供或帳密不符）
+static atomic_llong g_st_conn_fail = 0;    // 對外連線建立失敗（回覆 REP=0x04）
 // [流量統計] per-worker tx/rx 位元組累加器。tx = 經 5G target socket 送出的位元組
 // （上傳），rx = 自 5G target socket 收到的位元組（下載）。各 worker 各自累加，
 // 避免跨執行緒 cache line 競爭；讀取統計時才加總（見 socks5_server_get_bytes）。
@@ -558,11 +560,12 @@ static void* worker_loop_safe(void* arg) {
             static time_t last_stats = 0;
             if (my_widx == 0 && now - last_stats >= 30) {
                 last_stats = now;
-                LOGI("stats: conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld",
+                LOGI("stats: conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld auth_fail=%lld conn_fail=%lld",
                      atomic_load(&g_conn_count),
                      (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
                      (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
-                     (long long)atomic_load(&g_st_exhausted), ghost_purge_get_count());
+                     (long long)atomic_load(&g_st_exhausted), ghost_purge_get_count(),
+                     (long long)atomic_load(&g_st_auth_fail), (long long)atomic_load(&g_st_conn_fail));
             }
 #endif
         }
@@ -1520,12 +1523,16 @@ static void handle_handshake_fd(int client_fd) {
     pthread_mutex_unlock(&g_auth_lock);
 
     if (!socks5_method_offered(buf, nmethods, desired_method)) {
+        atomic_fetch_add(&g_st_auth_fail, 1);
         send(client_fd, "\x05\xff", 2, MSG_NOSIGNAL);
         goto err;
     }
     if (desired_method == 0x02) {
         send(client_fd, "\x05\x02", 2, MSG_NOSIGNAL);
-        if (do_auth_check(client_fd, buf, auth_user, auth_pass) != 0) goto err;
+        if (do_auth_check(client_fd, buf, auth_user, auth_pass) != 0) {
+            atomic_fetch_add(&g_st_auth_fail, 1);
+            goto err;
+        }
     } else {
         send(client_fd, "\x05\x00", 2, MSG_NOSIGNAL);
     }
@@ -1570,6 +1577,7 @@ static void handle_handshake_fd(int client_fd) {
         int target_fd = request_java_5g_socket(host, port, 0);
         if (target_fd < 0) {
             atomic_fetch_sub(&g_conn_count, 1);
+            atomic_fetch_add(&g_st_conn_fail, 1);
             send_zero_reply(client_fd, 0x04);
             goto err;
         }
@@ -1742,11 +1750,12 @@ int socks5_server_get_stats(char *out, size_t out_len) {
         return 0;
     }
     snprintf(out, out_len,
-             "conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld",
+             "conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld auth_fail=%lld conn_fail=%lld",
              atomic_load(&g_conn_count),
              (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
              (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
-             (long long)atomic_load(&g_st_exhausted), ghost_purge_get_count());
+             (long long)atomic_load(&g_st_exhausted), ghost_purge_get_count(),
+             (long long)atomic_load(&g_st_auth_fail), (long long)atomic_load(&g_st_conn_fail));
     return 0;
 }
 
@@ -1778,6 +1787,7 @@ int socks5_server_main_dynamic(int port) {
     atomic_store(&g_st_acquired, 0); atomic_store(&g_st_released, 0);
     atomic_store(&g_st_stale_skip, 0); atomic_store(&g_st_bad_slot, 0);
     atomic_store(&g_st_exhausted, 0); atomic_store(&g_st_double_fin, 0);
+    atomic_store(&g_st_auth_fail, 0); atomic_store(&g_st_conn_fail, 0);
     ghost_purge_reset();
     // [流量統計] 每個服務週期重置 tx/rx 位元組累加器
     for (int i = 0; i < WORKER_COUNT; i++) {
