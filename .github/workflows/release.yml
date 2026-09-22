@@ -22,12 +22,25 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - uses: android-actions/setup-android@v3
+      - name: Set up Android SDK
+        run: |
+          # Do not use android-actions/setup-android@v3 here: it runs
+          # `sdkmanager tools`, and the `tools` package was removed from the SDK
+          # repository, so the action now fails with "Failed to find package
+          # 'tools'" on the current runner image. The image already ships an
+          # Android SDK, so just wire its cmdline-tools onto PATH.
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          CT_BIN="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$CT_BIN" ]; then
+            echo "$CT_BIN" >> "$GITHUB_PATH"
+          fi
 
       - name: Install NDK and build-tools
         run: |
-          sdkmanager "ndk;26.3.11579264" "build-tools;34.0.0" "platforms;android-34"
           yes | sdkmanager --licenses
+          sdkmanager "ndk;26.3.11579264" "build-tools;34.0.0" "platforms;android-34"
 
       - name: Restore keystore
         run: |
