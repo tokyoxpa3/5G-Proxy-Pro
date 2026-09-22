@@ -1,0 +1,12 @@
+- Fix: upload traffic counter was massively undercounting (290 MB shown as 1.3 MB) — byte count now taken directly from the send() result
+- Fix: 5G rebuild loop — the cellular PDN is now pinned with requestNetwork instead of being released and re-acquired in a cycle
+- Fix: crash on start on Android 8/9 (minSdk 26) — the 3-arg startForeground overload with a foreground service type is API 29+
+- Fix: file descriptor leaks when binding a socket to the cellular network fails
+- Fix: ghost purge could evict a healthy connection when an fd number was reused (now verified by inode)
+- Fix: worker shutdown race that could register a connection onto an already-closed epoll fd
+- Fix: client-side EPOLLRDHUP hot loop after the client half-closes
+- Stability: restarting no longer accumulates watchdog/stats loops (the old coroutine Job is cancelled and replaced)
+- Stability: health check now treats active traffic as healthy, so a saturated link is no longer torn down after 3 probe timeouts
+- Security: cleartext traffic is denied globally; only the three captive-portal health-check endpoints are exempt
+- Fix: the DNS cache follower could return an expired address; in-flight markers are cleared on service restart
+- Stability: cross-thread visibility for native engine flags; debug screen coroutine exception handling

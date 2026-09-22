@@ -1,0 +1,12 @@
+- 修復：上傳流量嚴重漏計（290MB 只記到 1.3MB），改以 send() 實際回報的位元組累加
+- 修復：5G 網路重建迴圈 — 改以 requestNetwork 持續 pin 住蜂巢式 PDN，不再「拿到就放掉」反覆重建
+- 修復：Android 8/9（minSdk 26）啟動即崩潰 — FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE 三參數重載為 API 29+
+- 修復：綁定蜂巢式網路失敗時的 fd 洩漏
+- 修復：幽靈清除器在 fd 編號被重用時可能誤拔正常連線（加入 inode 比對）
+- 修復：worker 關閉競態 — 避免對已關閉的 epoll fd 註冊連線
+- 修復：客戶端半關閉後 EPOLLRDHUP 熱迴圈
+- 穩定性：重建時取消舊的背景迴圈，不再累積 watchdog / stats 迴圈
+- 穩定性：健康檢查改以實際流量為主要依據，滿載時不再被誤判為斷線而重建
+- 安全性：全域禁止明文流量，僅保留三個健康探測端點例外
+- 修復：DNS 快取 follower 可能回傳過期位址；服務重建時清除 in-flight 標記
+- 穩定性：native 引擎旗標補上跨執行緒可見性；除錯畫面加入協程例外處理
