@@ -34,6 +34,9 @@ class CellularNetworkManager(private val context: Context) {
     @Volatile
     private var cellularNetwork: Network? = null
     private var monitorCallback: ConnectivityManager.NetworkCallback? = null
+    // awaitNetwork 的續體：startMonitoring 的 onAvailable 抵達時喚醒首次等待
+    @Volatile
+    private var pendingNetworkWaiter: ((Network?) -> Unit)? = null
     
     /**
      * 一次性取得目前的行動網路（電信端切換 5G IP 時系統通常會重建 Network 物件，
@@ -125,8 +128,8 @@ class CellularNetworkManager(private val context: Context) {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
                 try {
-                    if (network == cellularNetwork) return
                     cellularNetwork = network
+                    pendingNetworkWaiter?.invoke(network)
                     onAvailable(network)
                 } catch (e: Exception) {
                     android.util.Log.e("CellularNetwork", "Error in monitor onAvailable", e)
@@ -147,16 +150,47 @@ class CellularNetworkManager(private val context: Context) {
         }
         monitorCallback = callback
         try {
-            connectivityManager.registerNetworkCallback(
-                NetworkRequest.Builder()
-                    .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .build(),
-                callback
-            )
+            // [重建迴圈根因] 用 requestNetwork（非 registerNetworkCallback）：請求本身
+            // 會讓系統持續為本 app 維持此蜂巢式 PDN，直到 stopMonitoring 解除註冊。
+            // 舊寫法是「一次性 requestNetwork 拿到網路後立刻放掉」＋另一個 LISTEN
+            // 監控，但 LISTEN 只被動觀察、不會 pin 住網路；在 WiFi 為預設網路的裝置上
+            // 蜂巢式 PDN 會被系統收回 → onLost → 代理重建 → 新一輪 request → 再度收回，
+            // 形成重建迴圈（實測 5 分鐘內重建 16 次、onLost 時有 163 條連線被切斷）。
+            connectivityManager.requestNetwork(cellularRequest(), callback)
         } catch (e: Exception) {
             android.util.Log.e("CellularNetwork", "Failed to register network monitor", e)
             monitorCallback = null
+        }
+    }
+
+    private fun cellularRequest(): NetworkRequest = NetworkRequest.Builder()
+        .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        .build()
+
+    /**
+     * 等待 [startMonitoring] 回報第一個可用行動網路；若已有網路立即回傳。
+     * 逾時回傳 null，呼叫端據此判定「找不到行動網路」。
+     */
+    suspend fun awaitNetwork(timeoutMs: Long = 15000L): Network? {
+        cellularNetwork?.let { return it }
+        return try {
+            withTimeoutOrNull(timeoutMs) {
+                suspendCancellableCoroutine { continuation ->
+                    val resumed = AtomicBoolean(false)
+                    fun resumeOnce(network: Network?) {
+                        if (resumed.compareAndSet(false, true)) continuation.resume(network)
+                    }
+                    pendingNetworkWaiter = { network -> resumeOnce(network) }
+                    continuation.invokeOnCancellation { pendingNetworkWaiter = null }
+                    // [競態修復] onAvailable 可能恰在「上面的初始檢查」與「安裝 waiter」之間
+                    // 抵達：此時 waiter 還沒裝好、不會被喚醒，awaitNetwork 會白白等到逾時，
+                    // 讓 startProxy 誤判「找不到行動網路」。安裝完 waiter 後補一次檢查即可。
+                    cellularNetwork?.let { resumeOnce(it) }
+                }
+            }
+        } finally {
+            pendingNetworkWaiter = null
         }
     }
     
@@ -169,6 +203,7 @@ class CellularNetworkManager(private val context: Context) {
             android.util.Log.e("CellularNetwork", "Error unregistering network monitor", e)
         }
         monitorCallback = null
+        pendingNetworkWaiter = null
     }
     
     fun releaseCellularNetwork() {

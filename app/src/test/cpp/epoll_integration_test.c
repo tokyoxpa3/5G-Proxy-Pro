@@ -34,6 +34,7 @@ extern void socks5_server_set_bind_addrs(const char **addrs, int count);
 extern int  socks5_server_main_dynamic(int port);
 extern int  socks5_server_is_running(void);
 extern int  socks5_server_get_stats(char *out, size_t out_len);
+extern int  socks5_server_get_bytes(long long *tx, long long *rx);
 extern void socks5_server_quit(void);
 
 // ---------- 測試參數 ----------
@@ -296,6 +297,38 @@ int main(void) {
         failed = 1;
     } else {
         printf("PASS: single round-trip echo\n");
+    }
+
+    // 4b. [流量統計回歸] 送出一段已知大小的資料，確認 tx（上傳）與 rx（下載）都
+    //     真的被計到。舊寫法以 try_send 前後的 *off 差值推導上傳量，但完整排空時
+    //     *off 會被歸零，差值變成 0 或負數 → 上傳幾乎完全不計（實測 290MB 只記到
+    //     1.3MB），下載因在 recv 後直接累加而正常。此處以真實資料流同時鎖住兩者。
+    {
+        enum { ACCT_LEN = 64 * 1024 };
+        static char big[ACCT_LEN];
+        for (int i = 0; i < ACCT_LEN; i++) big[i] = (char)(i * 31 + 7);
+
+        long long tx0 = 0, rx0 = 0;
+        socks5_server_get_bytes(&tx0, &rx0);
+        if (do_roundtrip(big, ACCT_LEN) != 0) {
+            fprintf(stderr, "FAIL: 64KB round-trip echo\n");
+            failed = 1;
+        } else {
+            long long tx = 0, rx = 0;
+            socks5_server_get_bytes(&tx, &rx);
+            long long dtx = tx - tx0, drx = rx - rx0;
+            printf("traffic delta: tx=%lld rx=%lld (payload=%d)\n", dtx, drx, ACCT_LEN);
+            if (dtx < ACCT_LEN) {
+                fprintf(stderr, "FAIL: upload tx undercounted: %lld < %d\n", dtx, ACCT_LEN);
+                failed = 1;
+            } else {
+                printf("PASS: upload tx counted (%lld bytes)\n", dtx);
+            }
+            if (drx < ACCT_LEN) {
+                fprintf(stderr, "FAIL: download rx undercounted: %lld < %d\n", drx, ACCT_LEN);
+                failed = 1;
+            }
+        }
     }
 
     // 5. 高併發 churn

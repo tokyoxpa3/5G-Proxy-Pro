@@ -55,7 +55,21 @@ class DebugActivity : Activity() {
     private val REQUEST_NOTIFICATION_PERMISSION = 1002
     private val networkManager by lazy { CellularNetworkManager(this) }
     private val ipChecker by lazy { PublicIPChecker() }
-    private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    // [例外處理] SupervisorJob 讓單一子協程失敗不影響其他；CoroutineExceptionHandler
+    // 攔下未捕捉例外並記 log，避免冒到 process 預設 handler 直接崩潰（背景 IP/網路查詢）。
+    private val activityScope = CoroutineScope(
+        Dispatchers.Main + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+            Log.e("DebugActivity", "activityScope uncaught exception", e)
+        }
+    )
+    // [序列化] updateNetworkStatus 會被 onCreate/start/stop/refresh 多處呼叫；保留
+    // 目前這次的 Job，新呼叫先取消舊的，避免多個協程競寫同一組 TextView。
+    private var networkStatusJob: Job? = null
+    // [狀態回呼] 保留自身回呼的參考，onDestroy 只清掉「還是自己」的那個；避免兩個
+    // Activity 實例並存時，較舊的被銷毀卻把較新的 listener 清成 null。
+    private val statusListener: (Socks5ProxyService.ProxyStatus) -> Unit = { status ->
+        activityScope.launch { onProxyStatusChanged(status) }
+    }
     
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -66,9 +80,7 @@ class DebugActivity : Activity() {
         setupUI()
         
         // 訂閱 Service 狀態變更，UI 與真實狀態同步
-        Socks5ProxyService.onStatusChanged = { status ->
-            activityScope.launch { onProxyStatusChanged(status) }
-        }
+        Socks5ProxyService.onStatusChanged = statusListener
         
         // 檢查上次退出原因
         checkLastExitReason()
@@ -103,7 +115,9 @@ class DebugActivity : Activity() {
     }
 
     override fun onDestroy() {
-        Socks5ProxyService.onStatusChanged = null
+        if (Socks5ProxyService.onStatusChanged === statusListener) {
+            Socks5ProxyService.onStatusChanged = null
+        }
         activityScope.cancel()
         super.onDestroy()
     }
@@ -881,7 +895,8 @@ class DebugActivity : Activity() {
         if (s.length <= 2) "*" else s.take(1) + "*".repeat(s.length - 2) + s.takeLast(1)
 
     private fun updateNetworkStatus() {
-        activityScope.launch {
+        networkStatusJob?.cancel()
+        networkStatusJob = activityScope.launch {
             try {
                 val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
                 val ip = wifiManager.connectionInfo.ipAddress
@@ -896,36 +911,42 @@ class DebugActivity : Activity() {
                 wifiIPText.text = getString(R.string.wifi_fetch_failed)
             }
 
-            val hotspotIP = withContext(Dispatchers.IO) {
-                HotspotManager.getHotspotIP(applicationContext)
-            }
-            if (hotspotIP != null) {
-                val port = portInput.text.toString().toIntOrNull() ?: 1080
-                hotspotIPText.text = getString(R.string.hotspot_ip_format, hotspotIP, port)
-            } else {
-                hotspotIPText.text = getString(R.string.hotspot_ip_disabled)
-            }
+            // 以下區段先前沒有 try/catch：CellularNetworkManager 的 ConnectivityManager
+            // 轉型失敗或網路查詢拋例外時會直接冒到 activityScope。這裡整段包起來。
+            try {
+                val hotspotIP = withContext(Dispatchers.IO) {
+                    HotspotManager.getHotspotIP(applicationContext)
+                }
+                if (hotspotIP != null) {
+                    val port = portInput.text.toString().toIntOrNull() ?: 1080
+                    hotspotIPText.text = getString(R.string.hotspot_ip_format, hotspotIP, port)
+                } else {
+                    hotspotIPText.text = getString(R.string.hotspot_ip_disabled)
+                }
 
-            val usbTetherIP = withContext(Dispatchers.IO) {
-                HotspotManager.getUsbTetherIP(applicationContext)
-            }
-            if (usbTetherIP != null) {
-                val port = portInput.text.toString().toIntOrNull() ?: 1080
-                usbTetherIPText.text = getString(R.string.usb_tether_ip_format, usbTetherIP, port)
-            } else {
-                usbTetherIPText.text = getString(R.string.usb_tether_ip_disabled)
-            }
+                val usbTetherIP = withContext(Dispatchers.IO) {
+                    HotspotManager.getUsbTetherIP(applicationContext)
+                }
+                if (usbTetherIP != null) {
+                    val port = portInput.text.toString().toIntOrNull() ?: 1080
+                    usbTetherIPText.text = getString(R.string.usb_tether_ip_format, usbTetherIP, port)
+                } else {
+                    usbTetherIPText.text = getString(R.string.usb_tether_ip_disabled)
+                }
 
-            cellularIPText.text = getString(R.string.cellular_ip_fetching)
-            val cellularNetwork = withContext(Dispatchers.IO) {
-                networkManager.requestCellularNetwork(5000)
-            }
-            
-            if (cellularNetwork != null) {
-                val publicIP = ipChecker.getPublicIP(cellularNetwork)
-                cellularIPText.text = getString(R.string.cellular_ip_format, publicIP ?: getString(R.string.cellular_ip_failed))
-            } else {
-                cellularIPText.text = getString(R.string.cellular_ip_not_locked)
+                cellularIPText.text = getString(R.string.cellular_ip_fetching)
+                val cellularNetwork = withContext(Dispatchers.IO) {
+                    networkManager.requestCellularNetwork(5000)
+                }
+
+                if (cellularNetwork != null) {
+                    val publicIP = ipChecker.getPublicIP(cellularNetwork)
+                    cellularIPText.text = getString(R.string.cellular_ip_format, publicIP ?: getString(R.string.cellular_ip_failed))
+                } else {
+                    cellularIPText.text = getString(R.string.cellular_ip_not_locked)
+                }
+            } catch (e: Exception) {
+                Log.e("DebugActivity", "updateNetworkStatus failed", e)
             }
         }
     }

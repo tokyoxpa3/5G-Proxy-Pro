@@ -26,10 +26,23 @@ class Socks5ProxyService : Service() {
     private var proxyPaused = false
     @Volatile
     private var stopRequested = false
+    // [啟動競態] startProxy 的引擎啟動是非同步的；在它完成前擋下任何重建請求，
+    // 否則「引擎好像掛了」的偵測會在啟動空窗期再觸發一次重建。
+    @Volatile
+    private var engineStarting = false
+    // [協程生命週期] 每次 startProxy 的三個背景迴圈（健康檢查/watchdog/stats）綁在
+    // 此 Job 上；重建或停止前先取消舊的，避免舊迴圈因 isProxyRunning 快速 false→true
+    // 而漏看、與新迴圈並存累積。
+    @Volatile
+    private var loopsJob: Job? = null
     private var wakeLock: android.os.PowerManager.WakeLock? = null
     
     private val networkManager by lazy { 
         com.tokyoxpa3.androidproxy.network.CellularNetworkManager(this) 
+    }
+    // 驗證 Network 是否仍有效（避免拿已失效的 Network 去 bindSocket → EPERM）
+    private val connectivityManager by lazy {
+        getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
     }
     @Volatile
     private var cellularNetwork: android.net.Network? = null
@@ -296,9 +309,16 @@ class Socks5ProxyService : Service() {
         lastErrorMessage = null
         isServiceRunning = true
         proxyPaused = false
+        engineStarting = true
         updateStatus(ProxyStatus.STARTING)
-        startForeground(NOTIFICATION_ID, createNotification(getString(R.string.notification_proxying), getString(R.string.notification_init_network)), 
-            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        // startForeground(id, notification, type) 的三參數重載是 API 29 才加入；
+        // minSdk 26 的裝置（Android 8/9）呼叫會 NoSuchMethodError 讓服務崩潰。
+        val startNotif = createNotification(getString(R.string.notification_proxying), getString(R.string.notification_init_network))
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIFICATION_ID, startNotif, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(NOTIFICATION_ID, startNotif)
+        }
         
         serviceScope.launch {
             try {
@@ -306,16 +326,18 @@ class Socks5ProxyService : Service() {
                 // 立即退出，避免把 UI 已顯示「已停止」的狀態又翻回運行中
                 if (stopRequested) { stopSelf(); return@launch }
                 isProxyRunning = true
-                val network = withTimeoutOrNull(15000) { networkManager.requestCellularNetwork() }
-                if (network == null) { failStop(getString(R.string.error_cellular_unavailable)); return@launch }
-                if (stopRequested) { stopSelf(); return@launch }
-                cellularNetwork = network
-                
-                // 監控電信端切換 5G IP / 網路重建事件，偵測到變更時自動恢復代理
+                // [重建迴圈修復] 先開始長期請求並監控：startMonitoring 用 requestNetwork
+                // 把蜂巢式 PDN 在服務期間 pin 住，避免「一次性 request 拿到就放掉」造成
+                // PDN 被系統收回 → onLost → 重建的自激迴圈。設定後再等目前可用的網路。
                 networkManager.startMonitoring(
                     onAvailable = { newNetwork -> handleNetworkChange(port, newNetwork) },
                     onLost = { handleNetworkChange(port, null) }
                 )
+                networkManager.awaitNetwork(15000)
+                if (stopRequested) { stopSelf(); return@launch }
+                val network = networkManager.currentNetwork()
+                if (network == null) { failStop(getString(R.string.error_cellular_unavailable)); return@launch }
+                cellularNetwork = network
                 
                 NativeEngine.socketProvider = { host, p, isUdp -> 
                     createSocketBoundToNetwork(host, p, isUdp) 
@@ -341,53 +363,76 @@ class Socks5ProxyService : Service() {
                 }
                 if (stopRequested) { try { NativeEngine.stopSocks5Server() } catch (e: Exception) {}; stopSelf(); return@launch }
 
-                launch {
-                    var consecutiveFailures = 0
-                    while (isProxyRunning) {
-                        delay(15000)
-                        if (!isProxyRunning) break
-                        val currentNetwork = cellularNetwork ?: continue
-                        if (isNetworkHealthy(currentNetwork)) {
-                            consecutiveFailures = 0
-                            lastHealthCheck = "OK"
-                        } else {
-                            consecutiveFailures++
-                            lastHealthCheck = "FAILED (${consecutiveFailures}/3)"
-                            Log.w(TAG, "5G 網路健康檢查失敗 (${consecutiveFailures}/3)，準備自動重建...")
-                            if (consecutiveFailures >= 3) {
-                                Log.w(TAG, "5G 網路連續異常，自動重建代理連線...")
+                // [協程生命週期] 三個背景迴圈綁在同一個 Job；每次啟動先取消舊的。
+                // 否則 restart 時舊迴圈只檢查 isProxyRunning，而它在 restartProxy 設
+                // false 後幾乎立刻被 startProxy 設回 true，舊迴圈看不到 false 就永遠
+                // 活著——每重建一次累積一組 watchdog / stats 迴圈。
+                loopsJob?.cancel()
+                loopsJob = serviceScope.launch {
+                    launch {
+                        var consecutiveFailures = 0
+                        var lastRxBytes = NativeEngine.safeGetTrafficBytes()?.getOrNull(1) ?: 0L
+                        while (isProxyRunning) {
+                            delay(15000)
+                            if (!isProxyRunning) break
+                            // [滿載誤判] 只要 target 端仍有位元組在進來，線路顯然是通的。
+                            // 滿載時 generate_204 探測容易逾時；若照舊連續 3 次失敗就重建，
+                            // 會把正在下載的連線整批切斷。改以實際流量為主要健康依據。
+                            val rxBytes = NativeEngine.safeGetTrafficBytes()?.getOrNull(1) ?: lastRxBytes
+                            val trafficFlowing = rxBytes > lastRxBytes
+                            lastRxBytes = rxBytes
+                            if (trafficFlowing) {
+                                consecutiveFailures = 0
+                                lastHealthCheck = "OK (traffic)"
+                                continue
+                            }
+                            val currentNetwork = cellularNetwork
+                            if (currentNetwork == null) {
+                                lastHealthCheck = "WAITING_NETWORK"
+                                continue
+                            }
+                            if (isNetworkHealthy(currentNetwork)) {
+                                consecutiveFailures = 0
+                                lastHealthCheck = "OK"
+                            } else {
+                                consecutiveFailures++
+                                lastHealthCheck = "FAILED (${consecutiveFailures}/3)"
+                                Log.w(TAG, "5G 網路健康檢查失敗 (${consecutiveFailures}/3)，準備自動重建...")
+                                if (consecutiveFailures >= 3) {
+                                    Log.w(TAG, "5G 網路連續異常，自動重建代理連線...")
+                                    restartProxy(port)
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    launch {
+                        while (isProxyRunning && !stopRequested) {
+                            delay(10000)
+                            if (stopRequested || !isProxyRunning) break
+                            if (NativeEngine.isLibraryLoaded() && !isNativeThreadAlive() && !isRestarting && !engineStarting) {
+                                Log.e(TAG, "偵測到 Native 引擎異常停止，嘗試重啟...")
                                 restartProxy(port)
                                 break
                             }
                         }
                     }
-                }
 
-                launch {
-                    while (isProxyRunning && !stopRequested) {
-                        delay(10000)
-                        if (stopRequested || !isProxyRunning) break
-                        if (NativeEngine.isLibraryLoaded() && !isNativeThreadAlive() && !isRestarting) {
-                             Log.e(TAG, "偵測到 Native 引擎異常停止，嘗試重啟...")
-                             restartProxy(port)
-                             break
+                    // [偵測落檔] 每 5 分鐘把生命週期計數器 snapshot 落檔（release 版也有）
+                    launch {
+                        while (isProxyRunning && !stopRequested) {
+                            delay(5 * 60 * 1000L)
+                            if (stopRequested || !isProxyRunning) break
+                            appendEngineStatsToFile()
                         }
-                    }
-                }
-
-                // [偵測落檔] 每 5 分鐘把生命週期計數器 snapshot 落檔（release 版也有）
-                launch {
-                    while (isProxyRunning && !stopRequested) {
-                        delay(5 * 60 * 1000L)
-                        if (stopRequested || !isProxyRunning) break
-                        appendEngineStatsToFile()
                     }
                 }
 
                 updateStatus(ProxyStatus.RUNNING)
                 val nm = getSystemService(NotificationManager::class.java)
                 nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.status_proxy_running), getString(R.string.notification_locked_format, port)))
-            } catch (e: Exception) { failStop(e.message) }
+            } catch (e: Exception) { failStop(e.message) } finally { engineStarting = false }
         }
     }
 
@@ -401,6 +446,7 @@ class Socks5ProxyService : Service() {
         lastErrorMessage = message
         isProxyRunning = false
         proxyPaused = false
+        loopsJob?.cancel(); loopsJob = null
         isServiceRunning = false
         updateStatus(ProxyStatus.FAILED)
         stopNativeEngineSafely()
@@ -437,19 +483,35 @@ class Socks5ProxyService : Service() {
     }
     
     /**
-     * 電信端切換 5G IP / 行動網路變更時被呼叫。
-     * 新網路就緒 → 自動重建代理；網路失效 → 暫停代理等待恢復（不停止服務）。
+     * 電信端行動網路變更（換 5G IP、PDN 重建、暫時失效…）。
+     *
+     * 只切換「新連線」要綁定的 Network，**不重建代理**：listener 綁的是 Wi-Fi/熱點等
+     * LAN 位址，與蜂巢式無關；既有 target socket 綁在舊網路上，會由 worker 自然偵測
+     * 錯誤並回收，新連線改用新 Network 即可。舊設計每個 onLost/onAvailable 都整台拆掉
+     * 重建（join 192 條握手執行緒 + 關閉所有連線），在電信端換 IP 或高負載 PDN 重建時
+     * 形成重建迴圈，把正在下載的連線（實測 163 條）整批切斷。
      */
     private fun handleNetworkChange(port: Int, network: android.net.Network?) {
-        if (!isProxyRunning && !proxyPaused) return
-        serviceScope.launch {
-            if (network != null) {
-                if (network == cellularNetwork) return@launch
-                Log.w(TAG, "偵測到電信端更換 5G IP / 行動網路，自動重建代理連線...")
-                restartProxy(port)
-            } else {
-                Log.w(TAG, "行動網路已失效 (onLost)，暫停代理並等待網路恢復...")
-                pauseProxy()
+        if (!isProxyRunning) return
+        if (network != null) {
+            if (network == cellularNetwork) return
+            Log.w(TAG, "行動網路已更新，切換新連線使用的網路（不重建代理）")
+            cellularNetwork = network
+            if (currentStatus == ProxyStatus.PAUSED) {
+                serviceScope.launch {
+                    updateStatus(ProxyStatus.RUNNING)
+                    val nm = getSystemService(NotificationManager::class.java)
+                    nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.status_proxy_running), getString(R.string.notification_locked_format, port)))
+                }
+            }
+        } else {
+            if (cellularNetwork == null) return
+            Log.w(TAG, "行動網路暫時失效，等待恢復（不重建代理）")
+            cellularNetwork = null
+            serviceScope.launch {
+                updateStatus(ProxyStatus.PAUSED)
+                val nm = getSystemService(NotificationManager::class.java)
+                nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.notification_waiting_network), getString(R.string.notification_waiting_network)))
             }
         }
     }
@@ -459,7 +521,7 @@ class Socks5ProxyService : Service() {
      * 但不會停止服務與前台通知。
      */
     private fun restartProxy(port: Int) {
-        if (stopRequested || isRestarting || (!isProxyRunning && !proxyPaused)) return
+        if (stopRequested || isRestarting || engineStarting || !isProxyRunning) return
         isRestarting = true
         restartCount++
         updateStatus(ProxyStatus.RESTARTING)
@@ -486,25 +548,8 @@ class Socks5ProxyService : Service() {
         }
     }
     
-    /**
-     * 行動網路失效時暫停代理（停止 server 與 socket），但保留服務與網路監控，
-     * 等網路恢復（onAvailable）時自動重建。
-     */
-    private fun pauseProxy() {
-        if (!isProxyRunning) return
-        isProxyRunning = false
-        proxyPaused = true
-        stopNativeEngineSafely()
-        activeSockets.values.forEach { 
-            if (it is Closeable) try { it.close() } catch (e: Exception) {} 
-        }
-        activeSockets.clear()
-        dnsCache.clear()
-        cellularNetwork = null
-        updateStatus(ProxyStatus.PAUSED)
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.notification_waiting_network), getString(R.string.notification_waiting_network)))
-    }
+    // 註：行動網路失效不再「停止引擎」。listener 綁的是 LAN 位址，與蜂巢式無關；
+    // 由 handleNetworkChange 切換新連線要用的 Network 即可，既有連線讓 worker 自然回收。
     
     // 健康檢查端點：依序嘗試，任一成功即視為網路健康。gstatic 在部分地區可能無法連通
     // （Google 網域被封鎖），因此補上非 Google 的備援端點，避免誤判「5G 斷線」進而
@@ -556,9 +601,11 @@ class Socks5ProxyService : Service() {
         // 停止意圖，代理在使用者按下停止後照常啟動。startProxy 的各個檢查點
         // 會讀取此旗標自行退出。
         stopRequested = true
+        loopsJob?.cancel(); loopsJob = null
         if (!isProxyRunning && !proxyPaused) {
             // 服務可能是被本 STOP intent 建立的（先前早已停止）：直接收掉，
             // 否則 onCreate 拿走的 wakelock 與服務本身永遠不會釋放
+            isServiceRunning = false
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -598,10 +645,11 @@ class Socks5ProxyService : Service() {
         val line = "${statsTimeFormat.format(java.util.Date())} $stats\n"
         try {
             engineStatsFile.appendText(line)
-            if (engineStatsFile.length() > STATS_LOG_MAX_BYTES) {
-                val content = engineStatsFile.readText()
-                val keep = maxOf(0, content.length - STATS_LOG_KEEP_BYTES.toInt())
-                engineStatsFile.writeText(content.substring(keep))
+            val content = engineStatsFile.readText()
+            // 統計行皆為 ASCII，char 數 == byte 數；統一以 content 長度判斷與截斷，
+            // 避免 file.length()（bytes）與 substring（chars）混用。
+            if (content.length > STATS_LOG_MAX_BYTES) {
+                engineStatsFile.writeText(content.takeLast(STATS_LOG_KEEP_BYTES.toInt()))
             }
         } catch (e: Exception) {
             Log.e(TAG, "engine stats 落檔失敗", e)
@@ -610,6 +658,14 @@ class Socks5ProxyService : Service() {
 
     private fun createSocketBoundToNetwork(host: String, port: Int, isUdp: Boolean): Int {
         val network = cellularNetwork ?: return -1
+        // 換 IP / PDN 重建後舊 Network 物件會失效，直接 bindSocket 會 EPERM
+        // （實機 log: "Binding socket to network 176 failed: EPERM"）。先驗證仍具
+        // INTERNET 能力，失效就快速失敗讓 client 重試，而不是每次拋例外、連帶讓
+        // PublicIPChecker 也失敗（UI 因此顯示不出行動網路 IP）。
+        val caps = try { connectivityManager.getNetworkCapabilities(network) } catch (e: Exception) { null }
+        if (caps == null || !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+            return -1
+        }
         return try {
             if (isUdp) {
                 // 雙棧 UDP socket：IPv4-only 的 DatagramSocket 無法對 IPv6 目標 sendto
@@ -622,11 +678,18 @@ class Socks5ProxyService : Service() {
                 } catch (e: Exception) {
                     java.net.DatagramSocket()
                 }
-                network.bindSocket(ds)
-                val pfd = android.os.ParcelFileDescriptor.fromDatagramSocket(ds)
-                val fd = pfd.detachFd()
-                activeSockets[fd] = ds
-                fd
+                try {
+                    network.bindSocket(ds)
+                    val pfd = android.os.ParcelFileDescriptor.fromDatagramSocket(ds)
+                    val fd = pfd.detachFd()
+                    activeSockets[fd] = ds
+                    fd
+                } catch (e: Exception) {
+                    // bindSocket / fromDatagramSocket 失敗時 ds 尚未交給 activeSockets，
+                    // 必須在此關閉，否則外層 catch 只記錄、fd 就洩漏了。
+                    try { ds.close() } catch (e2: Exception) {}
+                    throw e
+                }
             }
             else {
                 val addresses = resolveWithCache(network, host)
@@ -694,7 +757,13 @@ class Socks5ProxyService : Service() {
                     }
                     return -1
                 }
-                val pfd = android.os.ParcelFileDescriptor.fromSocket(socket)
+                val pfd = try {
+                    android.os.ParcelFileDescriptor.fromSocket(socket)
+                } catch (e: Exception) {
+                    // 勝出的 socket 尚未交給 activeSockets，失敗時必須自行關閉
+                    try { socket.close() } catch (e2: Exception) {}
+                    return -1
+                }
                 val fd = pfd.detachFd()
                 activeSockets[fd] = socket
                 if (isDebuggable) android.util.Log.d("FdAudit", "created fd=$fd map=${activeSockets.size}")
@@ -720,6 +789,7 @@ class Socks5ProxyService : Service() {
         stopRequested = true
         isProxyRunning = false
         proxyPaused = false
+        loopsJob?.cancel(); loopsJob = null
         isServiceRunning = false
         // 兜底清理：服務可能未經 ACTION_STOP_PROXY 就被銷毀（系統回收等），
         // 之後 serviceScope 已取消、stopProxy 的清理協程不會再執行，

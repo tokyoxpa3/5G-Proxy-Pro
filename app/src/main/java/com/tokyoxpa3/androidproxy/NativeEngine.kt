@@ -4,11 +4,14 @@ import android.util.Log
 
 object NativeEngine {
     private const val TAG = "NativeEngine"
-    private var libraryLoaded = false
-    private var initialized = false
+    @Volatile private var libraryLoaded = false
+    @Volatile private var initialized = false
     
-    var socketProvider: ((String, Int, Boolean) -> Int)? = null
-    var onSocketClosed: ((Int) -> Unit)? = null
+    // 由 Java 執行緒寫入、native worker 執行緒讀取（createSocketFromNative /
+    // notifySocketClosed）：必須 @Volatile 保證跨執行緒可見性，否則重建後 native 端
+    // 可能仍看到舊的 provider，或呼叫到已 teardown 的 callback。
+    @Volatile var socketProvider: ((String, Int, Boolean) -> Int)? = null
+    @Volatile var onSocketClosed: ((Int) -> Unit)? = null
 
     init {
         try {

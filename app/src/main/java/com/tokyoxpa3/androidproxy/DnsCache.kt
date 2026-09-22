@@ -36,9 +36,12 @@ class DnsCache(
         val leaderLatch = CountDownLatch(1)
         val existing = inFlight.putIfAbsent(key, leaderLatch)
         if (existing != null) {
-            // follower：等待 leader 完成（有界，避免 leader 卡死時連帶卡住）
+            // follower：等待 leader 完成（有界，避免 leader 卡死時連帶卡住）。
+            // 等待後必須重新檢查 TTL——leader 可能已完成但條目在等待期間過期，
+            // 直接把過期位址回給呼叫端會讓新連線指向已失效的 IP。
             try { existing.await(followerWaitMs, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
-            return cache[key]?.addresses ?: emptyList()
+            val followerHit = cache[key]
+            return if (followerHit != null && followerHit.expiresAt > nowMs) followerHit.addresses else emptyList()
         }
         try {
             if (cache.size >= maxEntries) cache.clear()
@@ -53,6 +56,9 @@ class DnsCache(
     /** 清空快取（服務停止/重建時呼叫）；進行中的查詢不受影響，由 leader 的 finally 自然收尾。 */
     fun clear() {
         cache.clear()
+        // 一併清 in-flight 標記：否則重建後若舊 leader 尚未收尾，新查詢會被誤當
+        // follower 而等待一個已無意義的 leader。
+        inFlight.clear()
     }
 
     private fun put(key: String, nowMs: Long, addresses: List<InetAddress>): List<InetAddress> {

@@ -20,6 +20,7 @@
 #define STUCK_TRACK_MASK (STUCK_TRACK_SLOTS - 1)
 typedef struct { uint64_t u64; long long count; time_t last_log; int used; } stuck_ent_t;
 static stuck_ent_t g_stuck[STUCK_TRACK_SLOTS];
+static pthread_mutex_t g_stuck_lock = PTHREAD_MUTEX_INITIALIZER; // [data race 修復] g_stuck 由 4 條 worker 共用
 
 // [幽靈清除器] 記錄每個註冊戳記對應的 fd 對。當某戳記的殘留事件超過門檻
 //（代表其底層 fd 因任何未知路徑仍開著且永久就緒），直接對兩個記錄的 fd 做
@@ -83,7 +84,7 @@ static int stamp_purge(uint64_t u64) {
     int found = 0;
     unsigned long long cino = 0, tino = 0;
     int cfd = -1, tfd = -1;
-    struct epoll_event ev;
+    struct epoll_event ev = {0}; // EPOLL_CTL_DEL 不使用 event，但初始化避免讀未初始化記憶體
     pthread_mutex_lock(&g_stamp_lock);
     for (int i = 0; i < STAMP_RING_SIZE; i++) {
         if (g_stamp_ring[i].u64 == u64) {
@@ -96,10 +97,22 @@ static int stamp_purge(uint64_t u64) {
     pthread_mutex_unlock(&g_stamp_lock);
     if (!found) return 0;
 
-    // 直接編號先試（多數情況描述已死、編號未重用）
+    // 快速路徑：直接用記錄的 fd 編號 DEL，但必須先用 inode 確認該編號仍指向
+    // 同一個開啟描述。否則編號若已被新連線重用，會把無辜連線從 epoll 拔掉
+    // （註解聲稱「無害失敗」只在描述已死時成立）。cino/tino 為 0（記錄時 fstat
+    // 失敗）則跳過快速路徑，交由下方 inode 反查。
+    int c_match = 0, t_match = 0;
+    if (cfd >= 0 && cino) {
+        struct stat st;
+        if (fstat(cfd, &st) == 0 && (((unsigned long long)st.st_dev << 32) | st.st_ino) == cino) c_match = 1;
+    }
+    if (tfd >= 0 && tino) {
+        struct stat st;
+        if (fstat(tfd, &st) == 0 && (((unsigned long long)st.st_dev << 32) | st.st_ino) == tino) t_match = 1;
+    }
     for (int w = 0; w < g_purge_epoll_count; w++) {
-        if (cfd >= 0) epoll_ctl(g_purge_epoll_fds[w], EPOLL_CTL_DEL, cfd, &ev);
-        if (tfd >= 0) epoll_ctl(g_purge_epoll_fds[w], EPOLL_CTL_DEL, tfd, &ev);
+        if (c_match) epoll_ctl(g_purge_epoll_fds[w], EPOLL_CTL_DEL, cfd, &ev);
+        if (t_match) epoll_ctl(g_purge_epoll_fds[w], EPOLL_CTL_DEL, tfd, &ev);
     }
 
     // [節流] inode 掃描成本高（opendir + 每個 fd fstat），全域每 200ms 限一次；
@@ -136,27 +149,42 @@ void ghost_stuck_track(uint64_t u64, const char *why,
                        uint32_t egen, uint32_t gennow, uint32_t magicv, int widx_v,
                        uint32_t ev, time_t now) {
     stuck_ent_t *e = &g_stuck[(u64 >> 13) & STUCK_TRACK_MASK];
+    long long c;
+    int do_log = 0, do_purge = 0;
+
+    // [data race 修復] g_stuck 由 4 條 worker 並發存取，整個讀-改-寫必須在鎖內。
+    // 決策（是否 log/purge）在鎖內算出，實際 log 與 stamp_purge 移到鎖外——後者會
+    // 取 g_stamp_lock，若在 g_stuck_lock 內呼叫會形成鎖序問題。
+    pthread_mutex_lock(&g_stuck_lock);
     if (!e->used || e->u64 != u64) {
         // 槽被別的 u64 佔走或首次：直接重置（碰撞時統計略低估可接受）
         e->u64 = u64; e->count = 0; e->used = 1; e->last_log = 0;
     }
     e->count++;
-    long long c = e->count;
+    c = e->count;
     if (ghost_stuck_should_log(c) && now - e->last_log >= 1) {
         e->last_log = now;
+        do_log = 1;
+    }
+    if (ghost_stuck_should_purge(c)) do_purge = 1;
+    pthread_mutex_unlock(&g_stuck_lock);
+
+    if (do_log) {
         LOGE("STUCK %s u64=%llx slot=%u gen_evt=%u gen_now=%u magic=%x widx=%d events=%x count=%lld",
              why, (unsigned long long)u64, (uint32_t)(u64 & 0xFFFFFFFFu),
              egen, gennow, magicv, widx_v, ev, c);
     }
     // [幽靈清除器] 同一戳記殘留過多 = 底層 fd 未被正常回收且永久就緒，
     // 主動從所有 worker 的 epoll 拔除，杜絕熱迴圈（fd 本體留給洩漏追蹤）
-    if (ghost_stuck_should_purge(c)) {
+    if (do_purge) {
         int purged = stamp_purge(u64);
         if (purged) {
             atomic_fetch_add(&g_ghost_purged, 1);
             LOGE("GHOST PURGED u64=%llx slot=%u after %lld residual events",
                  (unsigned long long)u64, (uint32_t)(u64 & 0xFFFFFFFFu), c);
+            pthread_mutex_lock(&g_stuck_lock);
             e->count = 0; // 重置計數，若又出現代表另有來源
+            pthread_mutex_unlock(&g_stuck_lock);
         }
     }
 }

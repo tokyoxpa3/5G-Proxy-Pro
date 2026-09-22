@@ -93,9 +93,16 @@ void release_java_socket(int fd) {
 
 JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     (*env)->GetJavaVM(env, &g_jvm);
+    // [執行緒安全] registerInstance 只在服務首次啟動時呼叫一次（NativeEngine 的
+    // initialized 旗標），且註冊發生在任何 worker 執行緒建立之前。若萬一被重複
+    // 呼叫，這裡直接返回，避免在 worker 正透過 request_java_5g_socket 使用舊
+    // global ref / MethodID 時把它們刪除替換（會是 use-after-free）。
+    if (g_native_engine_instance != NULL && g_mid_createSocket != NULL && g_mid_notifyClosed != NULL) {
+        return;
+    }
     if (g_native_engine_instance) (*env)->DeleteGlobalRef(env, g_native_engine_instance);
     g_native_engine_instance = (*env)->NewGlobalRef(env, thiz);
-    
+
     // 初始化 MethodID 快取
     jclass cls = (*env)->GetObjectClass(env, thiz);
     g_mid_createSocket = (*env)->GetMethodID(env, cls, "createSocketFromNative", "(Ljava/lang/String;IZ)I");

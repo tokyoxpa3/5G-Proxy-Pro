@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  全域禁止明文流量；僅健康檢查用的三個 HTTP 探測端點例外（它們只有 http 端點，
+  其餘對外連線如 PublicIPChecker 皆為 https）。先前的 usesCleartextTraffic="true"
+  是全域開放，健康探測可被中間人回報成「健康」而延後真正的斷線偵測。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">connectivitycheck.gstatic.com</domain>
+        <domain includeSubdomains="true">captive.apple.com</domain>
+        <domain includeSubdomains="true">connect.rom.miui.com</domain>
+    </domain-config>
+</network-security-config>

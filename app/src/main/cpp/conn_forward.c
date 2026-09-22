@@ -6,10 +6,13 @@ void conn_forward_interest(int closed, int client_eof, int target_eof,
     uint32_t c_ev = 0, t_ev = 0;
 
     if (!closed) {
-        // client fd：RDHUP 恆 arm（偵測客戶端半關閉）；c2t 緩衝清空且未半關閉
-        // 才需要 IN（可再讀入）；t2c 緩衝有待送出資料才需要 OUT（可寫回）。
-        c_ev = CONN_FWD_RDHUP;
-        if (!c2t_pending && !client_eof) c_ev |= CONN_FWD_IN;
+        // client fd：未半關閉才 arm RDHUP/IN；半關閉後不再 arm RDHUP——否則
+        // level-triggered EPOLLRDHUP 會持續就緒而反覆觸發（熱迴圈）。這與 target
+        // 側對稱，先前只處理了 target 側、client 側是漏的。t2c 有待送資料才需 OUT。
+        if (!client_eof) {
+            c_ev |= CONN_FWD_RDHUP;
+            if (!c2t_pending) c_ev |= CONN_FWD_IN;
+        }
         if (t2c_pending) c_ev |= CONN_FWD_OUT;
 
         // target fd：未半關閉才 arm RDHUP/IN（半關閉後不會再有資料送達，

@@ -97,6 +97,7 @@ typedef struct {
     pthread_t thread_id;
     full_conn_t *conn_list_head;
     pthread_mutex_t list_lock; // [關鍵] 保護鏈表結構的鎖
+    atomic_int stopping;       // [關閉競態] worker 退出時在鎖內設 1；handoff 在鎖內檢查
 } worker_t;
 
 // [H2 修復] workers 陣列必須宣告在槽位表之後：finalize/handoff 都會以
@@ -215,26 +216,34 @@ static void list_remove_locked(worker_t *w, full_conn_t *conn) {
     conn->prev = NULL;
 }
 
-static int try_send(int fd, unsigned char *buf, ssize_t *len, ssize_t *off) {
-    if (fd < 0) return -1;
+// 送出緩衝內容。回傳 -1 = 不可回復錯誤；0 = 尚未排空（等 EPOLLOUT）；1 = 已完全排空。
+// *sent_out（可為 NULL）一律收到「本次實際送出的位元組數」，上傳計數必須用它。
+// 不可改用 *off 的前後差值推導：完整排空時這裡會把 *off 歸零，差值會變成 0
+// （剛 recv 完就一次送完）或負數（補送完成），導致整批被丟棄——這正是過去
+// 「下載計得準、上傳幾乎完全不計」的根因（實測 290MB 只記到 1.3MB）。
+static int try_send(int fd, unsigned char *buf, ssize_t *len, ssize_t *off, ssize_t *sent_out) {
+    if (fd < 0) { if (sent_out) *sent_out = 0; return -1; }
+    ssize_t total = 0;
     while (*off < *len) {
         ssize_t sent = send(fd, buf + *off, *len - *off, MSG_NOSIGNAL);
         if (sent > 0) {
             *off += sent;
+            total += sent;
         } else {
+            if (sent_out) *sent_out = total;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
     }
     *off = 0; *len = 0;
+    if (sent_out) *sent_out = total;
     return 1;
 }
 
-// [流量統計] 紀錄經 5G target socket 送出的位元組（上傳 tx）。以送出前後的 *off
-// 差值為準，只有實際送出（>0）才累加，避免部分送出被漏計或重複計數。
-static void account_upload(ssize_t off_before, ssize_t off_after, int widx) {
-    long long sent = off_after - off_before;
-    if (sent > 0) atomic_fetch_add(&g_tx_bytes[widx], sent);
+// [流量統計] 累計經 5G target socket 實際送出的位元組（上傳 tx）。sent 直接取自
+// try_send 的回報，不再以緩衝位移差值推導（見上方 try_send 的漏計說明）。
+static void account_upload(ssize_t sent, int widx) {
+    if (sent > 0) atomic_fetch_add(&g_tx_bytes[widx], (long long)sent);
 }
 
 // [可測抽離] 事件興趣遮罩的決策核心抽至 conn_forward_interest（純函式，host 可測）。
@@ -426,21 +435,22 @@ static void* worker_loop_safe(void* arg) {
             if (!fatal_error) {
                 // Buffer flushing (To Client)
                 if (full->t2c_len > 0) {
-                    if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off) < 0) fatal_error = 1;
+                    if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off, NULL) < 0) fatal_error = 1;
                 }
                 // Buffer flushing (To Target)
                 if (full->c2t_len > 0) {
-                    ssize_t off_before = full->c2t_off;
-                    if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off) < 0) fatal_error = 1;
-                    account_upload(off_before, full->c2t_off, my_widx);
+                    ssize_t sent = 0;
+                    if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off, &sent) < 0) fatal_error = 1;
+                    account_upload(sent, my_widx);
                 }
                 // Read from Client
                 if (!fatal_error && full->c2t_len == 0 && !full->client_eof) {
                     ssize_t r = recv(full->client_fd, full->c2t_buf, BUFFER_SIZE, 0);
                     if (r > 0) {
                         full->c2t_len = r; full->c2t_off = 0;
-                        if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off) < 0) fatal_error = 1;
-                        account_upload(0, full->c2t_off, my_widx);
+                        ssize_t sent = 0;
+                        if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off, &sent) < 0) fatal_error = 1;
+                        account_upload(sent, my_widx);
                     } else if (r == 0) {
                         // 客戶端半關閉 (FIN): 停止讀取，但仍須把 target 的剩餘資料轉發回去
                         full->client_eof = 1;
@@ -453,7 +463,7 @@ static void* worker_loop_safe(void* arg) {
                     if (r > 0) {
                         full->t2c_len = r; full->t2c_off = 0;
                         atomic_fetch_add(&g_rx_bytes[my_widx], (long long)r);
-                        if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off) < 0) fatal_error = 1;
+                        if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off, NULL) < 0) fatal_error = 1;
                     } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) fatal_error = 1;
                 }
             }
@@ -578,6 +588,13 @@ static void* worker_loop_safe(void* arg) {
     }
 
 exit_worker:
+    // [關閉競態] 先在鎖內設 stopping，讓仍在進行的 handoff_to_worker 於鎖內看到後
+    // 放棄註冊。必須在排空鏈表與 close(epoll_fd) 之前，否則 handoff 可能在
+    // epoll_fd 關閉後才 ADD，註冊到已關閉/被重用的 epoll。
+    pthread_mutex_lock(&me->list_lock);
+    atomic_store(&me->stopping, 1);
+    pthread_mutex_unlock(&me->list_lock);
+
     // 清理剩餘連線（退出時執行緒池已先排水，沒有並發的 handoff 競爭；
     // JNI release_java_socket 在鎖外呼叫同樣安全：Java 端只碰 ConcurrentHashMap）。
     // [H2 修復] 鎖內只做「取出 + 標記 closed」，conn_unref 一律移到鎖外：
@@ -618,7 +635,6 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     // [item1] next_worker_idx 以 atomic 取用，避免多個 handshake 執行緒的資料競態
     int idx = atomic_fetch_add(&next_worker_idx, 1) % WORKER_COUNT;
     worker_t *w = &workers[idx];
-    int removed_worker_ref = 0; // add_failed 回滾用（C 不允許 label 後直接宣告）
 
     // [Slot 修復] 從固定槽位表取一槽（本體永不釋放）；耗盡時拒絕連線。
     // g_conn_count 已由 handle_handshake 預佔，此路徑需歸還
@@ -667,41 +683,44 @@ static void handoff_to_worker(int client_fd, int target_fd) {
     full->client_events = EPOLLIN | EPOLLRDHUP;
     full->target_events = EPOLLIN | EPOLLRDHUP;
 
-    // [H2 修復] 先入鏈表，再做兩個 epoll ADD。
-    // ADD 完成前 registered=0：worker 的事件處理與 timeout 掃描都會跳過
-    // 未註冊的 conn，銷毀只會發生在下列兩個路徑之一，closed 旗標 + list_lock
-    // 保證 list_remove 只執行一次
+    // [H2 修復] 先入鏈表，再做兩個 epoll ADD。ADD 完成前 registered=0：worker 的
+    // 事件處理與 timeout 掃描都會跳過未註冊的 conn。
+    // [關閉競態] 檢查 stopping、入鏈、兩個 ADD 必須在同一把 list_lock 內完成：
+    // worker 退出時也在鎖內設 stopping 並排空，兩者互斥，不會發生「worker 已關閉
+    // epoll_fd 後 handoff 才 ADD」（註冊到已關閉/被重用的 epoll，或連線永遠無人 unref）。
     pthread_mutex_lock(&w->list_lock);
+    if (atomic_load(&w->stopping)) {
+        pthread_mutex_unlock(&w->list_lock);
+        conn_unref(full); // 尚未入鏈、registered=0；handoff 持有 base ref
+        return;
+    }
     list_add_locked(w, full);
-    pthread_mutex_unlock(&w->list_lock);
 
     struct epoll_event ev;
     ev.events = full->client_events; ev.data.u64 = full->ep_u64;
-    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) != 0) goto add_failed;
-    // [CLOSE_WAIT 修復] target fd 額外帶 CONN_EV_TARGET_FLAG（bit31），
-    // worker 事件迴圈以此區分 EPOLLRDHUP 是 client 或 target 的對端半關閉
-    ev.events = full->target_events; ev.data.u64 = full->ep_u64 | CONN_EV_TARGET_FLAG;
-    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev) != 0) goto add_failed;
-    // client_fd 已 ADD 成功的情境：close 時核心會自動把它從 epoll 移除，無需 DEL
+    int add_ok = (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == 0);
+    if (add_ok) {
+        // [CLOSE_WAIT 修復] target fd 額外帶 CONN_EV_TARGET_FLAG（bit31），
+        // worker 事件迴圈以此區分 EPOLLRDHUP 是 client 或 target 的對端半關閉
+        ev.events = full->target_events; ev.data.u64 = full->ep_u64 | CONN_EV_TARGET_FLAG;
+        add_ok = (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev) == 0);
+    }
+    if (!add_ok) {
+        // 回滾只扣一次：仍在鎖內，標記 closed 並移出鏈表（registered 仍為 0，
+        // worker 不會看到它）；解鎖後才 unref（finalize 會再鎖 list_lock）
+        full->closed = 1;
+        list_remove_locked(w, full);
+        pthread_mutex_unlock(&w->list_lock);
+        conn_unref(full); // 扣 base ref（1→0）→ conn_finalize
+        return;
+    }
+    pthread_mutex_unlock(&w->list_lock);
 
     ghost_stamp_record(full->ep_u64, client_fd, target_fd, idx); // [幽靈清除器] 記錄戳記→fd 對應
     atomic_store(&full->registered, 1); // 事件從此可交付 worker
     // [H2 修復 v2] 成功路徑不再扣 ref：conn 的 base ref（=1）由 worker 持有，
     // 待 worker 日後垃圾回收時 unref（1→0）→ finalize
     return;
-
-add_failed:
-    // [H2 修復 v2] 回滾只扣一次：搶到 list_remove 的一方扣掉 base ref（1→0 finalize）。
-    // 若 worker 已先收集（closed=1、已移除鏈表），worker 的 step-3 會負責扣，
-    // handoff 此處完全不扣 —— 確保每條 conn 恰好 unref 一次
-    pthread_mutex_lock(&w->list_lock);
-    if (!full->closed) {
-        full->closed = 1;
-        list_remove_locked(w, full);
-        removed_worker_ref = 1;
-    }
-    pthread_mutex_unlock(&w->list_lock);
-    if (removed_worker_ref) conn_unref(full); // 扣 base ref（1→0）→ conn_finalize
 }
 
 // [IPv6 支援] 判斷兩個 sockaddr 的 IP 是否相同，v4 與 v4-mapped v6 視為相同。
@@ -799,6 +818,8 @@ typedef struct udp_conn_t {
     int out_len, out_off; // 0x04 出向 frame：總長 / 已送出
 
     uint32_t client_events; // 目前 client fd 的興趣遮罩（MOD 比對用）
+    uint32_t local_events;  // 0x03 local UDP fd 的興趣遮罩（MOD 比對用）
+    uint32_t remote_events; // 5G remote UDP fd 的興趣遮罩（0x04 背壓時遮罩 EPOLLIN）
 
     int closed;
     atomic_int refs;
@@ -815,6 +836,7 @@ typedef struct {
     pthread_t thread_id;
     udp_conn_t *conn_list_head;
     pthread_mutex_t list_lock;
+    atomic_int stopping; // [關閉競態] 同 worker_t：退出時鎖內設 1
 } udp_worker_t;
 
 static udp_worker_t udp_workers[UDP_WORKER_COUNT];
@@ -928,8 +950,12 @@ static int udp_flush_out(udp_conn_t *u) {
 static int udp_ctrl_event(udp_conn_t *u, uint32_t ev) {
     if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) return -1;
     if (ev & EPOLLIN) {
-        char tmp;
-        if (recv(u->client_fd, &tmp, 1, MSG_PEEK) <= 0) return -1;
+        // 控制連線理論上不承載資料；若客戶端送了就消費丟棄。不可用 MSG_PEEK——
+        // 資料留著會讓 level-triggered EPOLLIN 永久就緒而熱迴圈。
+        char tmp[256];
+        ssize_t n = recv(u->client_fd, tmp, sizeof(tmp), 0);
+        if (n == 0) return -1;
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
     }
     return 0;
 }
@@ -1070,12 +1096,26 @@ static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
 
 static void udp_update_events(udp_worker_t *w, udp_conn_t *u) {
     if (u->closed) return;
-    uint32_t c_ev = EPOLLIN | EPOLLRDHUP;
+    // 0x03 控制連線不承載資料（RFC 1928）：只 arm RDHUP 偵測對端關閉，不 arm EPOLLIN。
+    // 若 arm 了 EPOLLIN，客戶端在控制連線上送任何資料都會讓 level-triggered EPOLLIN
+    // 永久就緒（探測不消費）→ worker 100% CPU 熱迴圈。0x04 資料連線才需要 EPOLLIN。
+    uint32_t c_ev = (u->local_udp_fd >= 0) ? EPOLLRDHUP : (EPOLLIN | EPOLLRDHUP);
     if (u->local_udp_fd < 0 && u->out_len > 0) c_ev |= EPOLLOUT; // 0x04 出向未排空
     if (u->client_events != c_ev) {
         struct epoll_event ev;
         ev.events = c_ev; ev.data.u64 = u->ep_u64;
         if (epoll_ctl(w->epoll_fd, EPOLL_CTL_MOD, u->client_fd, &ev) == 0) u->client_events = c_ev;
+    }
+    // [0x04 背壓] 出向 frame 未排空（客戶端不讀）時遮罩 remote 的 EPOLLIN：否則
+    // remote socket 持續可讀、udp_remote_event 又因 out_len>0 直接返回 → 熱迴圈。
+    // 出向排空後再 arm 回來讀下一筆 datagram。
+    if (u->local_udp_fd < 0 && u->remote_udp_fd >= 0) {
+        uint32_t r_ev = (u->out_len > 0) ? 0 : EPOLLIN;
+        if (u->remote_events != r_ev) {
+            struct epoll_event ev;
+            ev.events = r_ev; ev.data.u64 = u->ep_u64 | UDP_EV_ROLE_REMOTE_FLAG;
+            if (epoll_ctl(w->epoll_fd, EPOLL_CTL_MOD, u->remote_udp_fd, &ev) == 0) u->remote_events = r_ev;
+        }
     }
 }
 
@@ -1166,6 +1206,12 @@ static void* udp_worker_loop(void* arg) {
     }
 
 exit_udp_worker:
+    // [關閉競態] 同 TCP worker：先鎖內設 stopping，之後 udp_start_session 在鎖內
+    // 看到就會放棄註冊，避免對已關閉的 epoll 做 EPOLL_CTL_ADD。
+    pthread_mutex_lock(&me->list_lock);
+    atomic_store(&me->stopping, 1);
+    pthread_mutex_unlock(&me->list_lock);
+
     // 清空剩餘 session（分批取出、鎖外 unref，避免 finalize 重入 list_lock 死鎖）
     for (;;) {
         int n = 0;
@@ -1297,38 +1343,47 @@ static void udp_start_session(int client_fd, int cmd) {
     if (u->local_udp_fd >= 0) set_nonblocking(u->local_udp_fd);
     set_nonblocking(u->remote_udp_fd);
 
-    // 先入鏈，再註冊（註冊完成前 registered=0，worker 跳過）
+    // [關閉競態] 檢查 stopping、入鏈、epoll ADD 全在同一把 list_lock 內完成：
+    // udp_worker 退出時也在鎖內設 stopping 並排空，兩者互斥，不會對已關閉的
+    // epoll 做 EPOLL_CTL_ADD（或註冊後無人 unref 而洩漏 session）。
     pthread_mutex_lock(&w->list_lock);
+    if (atomic_load(&w->stopping)) {
+        pthread_mutex_unlock(&w->list_lock);
+        udp_conn_unref(u);
+        return;
+    }
     u->next = w->conn_list_head;
     u->prev = NULL;
     if (w->conn_list_head) w->conn_list_head->prev = u;
     w->conn_list_head = u;
-    pthread_mutex_unlock(&w->list_lock);
 
     struct epoll_event ev;
-    u->client_events = EPOLLIN | EPOLLRDHUP;
+    // 0x03 控制連線只 arm RDHUP（不讀資料）；0x04 資料連線需要 EPOLLIN 讀 frame。
+    u->client_events = (u->local_udp_fd >= 0) ? EPOLLRDHUP : (EPOLLIN | EPOLLRDHUP);
     ev.events = u->client_events; ev.data.u64 = u->ep_u64;
-    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) != 0) goto reg_failed;
-    if (u->local_udp_fd >= 0) {
-        ev.events = EPOLLIN; ev.data.u64 = u->ep_u64 | UDP_EV_ROLE_LOCAL_FLAG;
-        if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->local_udp_fd, &ev) != 0) goto reg_failed;
+    int reg_ok = (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == 0);
+    if (reg_ok && u->local_udp_fd >= 0) {
+        u->local_events = EPOLLIN;
+        ev.events = u->local_events; ev.data.u64 = u->ep_u64 | UDP_EV_ROLE_LOCAL_FLAG;
+        reg_ok = (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->local_udp_fd, &ev) == 0);
     }
-    ev.events = EPOLLIN; ev.data.u64 = u->ep_u64 | UDP_EV_ROLE_REMOTE_FLAG;
-    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->remote_udp_fd, &ev) != 0) goto reg_failed;
-
-    atomic_store(&u->registered, 1);
-    return;
-
-reg_failed:
-    pthread_mutex_lock(&w->list_lock);
-    if (!u->closed) {
+    if (reg_ok) {
+        u->remote_events = EPOLLIN;
+        ev.events = u->remote_events; ev.data.u64 = u->ep_u64 | UDP_EV_ROLE_REMOTE_FLAG;
+        reg_ok = (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->remote_udp_fd, &ev) == 0);
+    }
+    if (!reg_ok) {
         u->closed = 1;
         if (u->prev) u->prev->next = u->next; else w->conn_list_head = u->next;
         if (u->next) u->next->prev = u->prev;
         u->next = NULL; u->prev = NULL;
+        pthread_mutex_unlock(&w->list_lock);
+        udp_conn_unref(u);
+        return;
     }
     pthread_mutex_unlock(&w->list_lock);
-    udp_conn_unref(u);
+
+    atomic_store(&u->registered, 1);
     return;
 }
 
@@ -1638,27 +1693,12 @@ static void* listener_task(void* arg) {
     // [Slot 修復] 每次啟動重建空閒槽位堆疊（gen 延續遞增，跨重啟仍不混淆）
     slots_init();
 
-    int worker_ep_fds[WORKER_COUNT];
-    for (int i = 0; i < WORKER_COUNT; i++) {
-        workers[i].epoll_fd = epoll_create1(0);
-        worker_ep_fds[i] = workers[i].epoll_fd;
-        workers[i].conn_list_head = NULL;
-        pthread_mutex_init(&workers[i].list_lock, NULL); // [關鍵] 初始化鎖
-        pthread_create(&workers[i].thread_id, NULL, worker_loop_safe, &workers[i]);
-    }
-    ghost_purge_set_epoll_fds(worker_ep_fds, WORKER_COUNT);
-
-    // [執行緒池] 握手池（短命任務）
-    job_pool_init(&g_handshake_pool, HANDSHAKE_POOL_SIZE, HANDSHAKE_QUEUE_SIZE, handle_handshake_job);
-    // [P2] UDP session epoll worker（取代 g_udp_pool 的 96 執行緒）
-    udp_slots_init();
-    for (int i = 0; i < UDP_WORKER_COUNT; i++) {
-        udp_workers[i].epoll_fd = epoll_create1(0);
-        udp_workers[i].conn_list_head = NULL;
-        pthread_mutex_init(&udp_workers[i].list_lock, NULL);
-        pthread_create(&udp_workers[i].thread_id, NULL, udp_worker_loop, &udp_workers[i]);
-    }
-
+    // [啟動順序修復] 先綁定 listeners，再建立任何 worker/執行緒池。舊順序先建了
+    // 4 條 TCP worker + 192 條握手執行緒 + 4 條 UDP worker，之後才檢查
+    // g_listener_count；若沒有可綁定的 LAN 位址就提早 return，192 條握手執行緒
+    // 永遠卡在 pthread_cond_wait（job_pool_shutdown 從未被呼叫），而
+    // socks5_server_quit 又因 server_running==0 提早返回、join 不到 —— 每次啟動
+    // 失敗就洩漏 192 條執行緒。先綁定即可讓失敗路徑只涉及一個 pipe。
     g_listener_count = 0;
 
     // 本機 loopback（供健康檢查與本機使用，不對外暴露）
@@ -1683,11 +1723,34 @@ static void* listener_task(void* arg) {
     if (g_listener_count == 0) {
         LOGE("沒有可綁定的 LAN 位址，SOCKS5 伺服器無法啟動");
         atomic_store(&server_running, 0);
-        if (g_shutdown_pipe[1] != -1) {
-            char stop_sig = 1;
-            write(g_shutdown_pipe[1], &stop_sig, 1);
-        }
+        // 此時尚未建立任何執行緒，只需收掉 pipe（listener fd 全數綁定失敗）
+        if (g_shutdown_pipe[0] != -1) { close(g_shutdown_pipe[0]); g_shutdown_pipe[0] = -1; }
+        if (g_shutdown_pipe[1] != -1) { close(g_shutdown_pipe[1]); g_shutdown_pipe[1] = -1; }
         return NULL;
+    }
+
+    // listeners 就緒，才建立 worker 與執行緒池（此後關閉由 socks5_server_quit 收拾）
+    int worker_ep_fds[WORKER_COUNT];
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        workers[i].epoll_fd = epoll_create1(0);
+        worker_ep_fds[i] = workers[i].epoll_fd;
+        workers[i].conn_list_head = NULL;
+        atomic_store(&workers[i].stopping, 0);
+        pthread_mutex_init(&workers[i].list_lock, NULL); // [關鍵] 初始化鎖
+        pthread_create(&workers[i].thread_id, NULL, worker_loop_safe, &workers[i]);
+    }
+    ghost_purge_set_epoll_fds(worker_ep_fds, WORKER_COUNT);
+
+    // [執行緒池] 握手池（短命任務）
+    job_pool_init(&g_handshake_pool, HANDSHAKE_POOL_SIZE, HANDSHAKE_QUEUE_SIZE, handle_handshake_job);
+    // [P2] UDP session epoll worker（取代 g_udp_pool 的 96 執行緒）
+    udp_slots_init();
+    for (int i = 0; i < UDP_WORKER_COUNT; i++) {
+        udp_workers[i].epoll_fd = epoll_create1(0);
+        udp_workers[i].conn_list_head = NULL;
+        atomic_store(&udp_workers[i].stopping, 0);
+        pthread_mutex_init(&udp_workers[i].list_lock, NULL);
+        pthread_create(&udp_workers[i].thread_id, NULL, udp_worker_loop, &udp_workers[i]);
     }
 
     struct pollfd pfds[MAX_LISTENERS + 1];

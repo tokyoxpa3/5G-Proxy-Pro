@@ -42,15 +42,16 @@ static void test_interest(void) {
     /* 閒置（無半關閉、無緩衝待送）：兩側皆 RDHUP|IN（正常雙向待命） */
     check_interest(0, 0, 0, 0, 0, RDHUP | IN, RDHUP | IN);
 
-    /* 客戶端半關閉：client 側不再讀（無 IN），target 側不變 */
-    check_interest(0, 1, 0, 0, 0, RDHUP, RDHUP | IN);
+    /* 客戶端半關閉：client 側完全 disarm（無 RDHUP/IN）——半關閉後 level-triggered
+     * EPOLLRDHUP 會持續就緒，持續 arm 會熱迴圈；target 側不變。 */
+    check_interest(0, 1, 0, 0, 0, 0, RDHUP | IN);
 
     /* 目標端半關閉：[CLOSE_WAIT 修復] target 側完全 disarm（無 RDHUP/IN），
      * 否則 level-triggered RDHUP 反覆觸發 = 熱迴圈。client 側不變。 */
     check_interest(0, 0, 1, 0, 0, RDHUP | IN, 0);
 
-    /* 兩側皆半關閉：client 無 IN、target 全 0 */
-    check_interest(0, 1, 1, 0, 0, RDHUP, 0);
+    /* 兩側皆半關閉：兩側皆完全 disarm（無 RDHUP/IN） */
+    check_interest(0, 1, 1, 0, 0, 0, 0);
 
     /* t2c 緩衝有待送資料（target→client）：client 加 OUT；target 因 t2c 非空
      * 停止再讀（無 IN），也無 c2t 待送故無 OUT */
@@ -63,8 +64,9 @@ static void test_interest(void) {
     /* 雙向緩衝皆有待送資料：兩側都只有 OUT（皆停止再讀） */
     check_interest(0, 0, 0, 1, 1, RDHUP | OUT, RDHUP | OUT);
 
-    /* 客戶端半關閉 + t2c 待送（最後一批回應回給已 FIN 的 client） */
-    check_interest(0, 1, 0, 0, 1, RDHUP | OUT, RDHUP);
+    /* 客戶端半關閉 + t2c 待送（最後一批回應回給已 FIN 的 client）：
+     * client 只剩 OUT（不再 arm RDHUP/IN），target 側不變 */
+    check_interest(0, 1, 0, 0, 1, OUT, RDHUP);
 
     /* 目標端半關閉 + c2t 待送（半關閉的 target 仍可接收，排空剩餘 c2t） */
     check_interest(0, 0, 1, 1, 0, RDHUP, OUT);
