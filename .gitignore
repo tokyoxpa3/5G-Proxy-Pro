@@ -44,3 +44,6 @@ tools/update_fdroiddata.py
 
 # Local dev credentials / machine-specific notes (never commit)
 .local/
+
+# Local agent memory — machine-specific, never publish
+AGENTS.md
