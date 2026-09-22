@@ -41,3 +41,6 @@ tools/mr_note.py
 tools/update_fdroiddata.py
 
 .remote_p4_test.py
+
+# Local dev credentials / machine-specific notes (never commit)
+.local/
