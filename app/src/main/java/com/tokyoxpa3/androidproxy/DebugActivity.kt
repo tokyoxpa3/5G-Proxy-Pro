@@ -354,6 +354,26 @@ class DebugActivity : Activity() {
         }
         authUserInput.addTextChangedListener(authWatcher)
         authPassInput.addTextChangedListener(authWatcher)
+
+        // 開機自動啟動：只還原「使用者上次沒按停止」的代理，見 BootReceiver
+        val autoStartLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 16)
+            addView(TextView(context).apply {
+                text = getString(R.string.switch_auto_start_on_boot)
+                textSize = 16f
+                setTextColor(0xFF212529.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(Switch(context).apply {
+                // 先設 isChecked 再掛 listener，避免初始化時就觸發一次寫入。
+                isChecked = authPrefs.getBoolean(Socks5ProxyService.PREF_AUTO_START, true)
+                setOnCheckedChangeListener { _, checked ->
+                    authPrefs.edit().putBoolean(Socks5ProxyService.PREF_AUTO_START, checked).apply()
+                }
+            })
+        }
         
         // Main Action Button
         mainButton = Button(this).apply {
@@ -437,6 +457,7 @@ class DebugActivity : Activity() {
         rootLayout.addView(portLayout)
         rootLayout.addView(authLayout)
         rootLayout.addView(passLayout)
+        rootLayout.addView(autoStartLayout)
         rootLayout.addView(mainButton)
         rootLayout.addView(limitHintText)
         rootLayout.addView(ipCard)

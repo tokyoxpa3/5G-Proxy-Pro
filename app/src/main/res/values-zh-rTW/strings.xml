@@ -88,6 +88,7 @@
 
     <string name="btn_self_test">🧪 自我檢測</string>
     <string name="btn_copy_diagnostics">📋 複製診斷報告</string>
+    <string name="switch_auto_start_on_boot">重新開機後自動啟動（若關機前正在執行）</string>
     <string name="switch_udp_verbose_log">開發者：逐行 UDP 拆除記錄</string>
     <string name="self_test_running">⏳ 檢測代理中...</string>
     <string name="self_test_not_running">請先啟動代理</string>

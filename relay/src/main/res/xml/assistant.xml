@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="com.tokyoxpa3.androidproxy.relay.AirplaneSessionService"
+    android:recognitionService="com.tokyoxpa3.androidproxy.relay.StubRecognitionService"
+    android:settingsActivity="com.tokyoxpa3.androidproxy.relay.RelayActivity"
+    android:supportsAssist="true" />

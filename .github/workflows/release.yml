@@ -67,14 +67,18 @@ jobs:
 
       - name: Verify signature
         run: |
-          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$APK"
+          for APK in $(ls app/build/outputs/apk/release/*.apk | head -1) $(ls relay/build/outputs/apk/release/*.apk | head -1); do
+            echo "== $APK"
+            "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs "$APK"
+          done
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            relay/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
       - name: Build release notes from changelog + commits
@@ -117,6 +121,7 @@ jobs:
             fi
 
             echo "Signed APK attached below (reproducible F-Droid build)."
+            echo "\`5G-Proxy-Tailnet-Relay\` is optional: install it only to reach the proxy through Tailscale (see README)."
             echo
 
             # Commit subjects stay for traceability, but collapsed: most of them
@@ -138,8 +143,9 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           cp "$(ls app/build/outputs/apk/release/*.apk | head -1)" "5G-Proxy-Pro-${TAG}.apk"
+          cp "$(ls relay/build/outputs/apk/release/*.apk | head -1)" "5G-Proxy-Tailnet-Relay-${TAG}.apk"
           gh release create "$TAG" --title "$TAG" --target "${GITHUB_SHA}" --notes-file RELEASE_NOTES.md 2>/dev/null || \
             gh release edit "$TAG" --notes-file RELEASE_NOTES.md
-          gh release upload "$TAG" "5G-Proxy-Pro-${TAG}.apk" --clobber
+          gh release upload "$TAG" "5G-Proxy-Pro-${TAG}.apk" "5G-Proxy-Tailnet-Relay-${TAG}.apk" --clobber
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">5G Proxy Tailnet Relay</string>
+    <string name="hint_port">SOCKS port (same as 5G Proxy Pro)</string>
+    <string name="hint_control_port">Control API port</string>
+    <string name="hint_socks_user">5G Proxy Pro username (only if auth is set)</string>
+    <string name="hint_socks_pass">5G Proxy Pro password (only if auth is set)</string>
+    <string name="btn_start">Start relay</string>
+    <string name="btn_stop">Stop relay</string>
+    <string name="btn_battery">Disable battery optimization</string>
+    <string name="btn_assistant">Set as default digital assistant (for IP rotation)</string>
+    <string name="btn_assistant_active">✅ Default digital assistant</string>
+    <string name="btn_usage_access">Allow usage access (data usage in /status)</string>
+    <string name="btn_usage_access_granted">✅ Usage access granted</string>
+    <string name="btn_rotate">Rotate IP now (airplane mode)</string>
+    <string name="toast_rotate_unavailable">Rotation already running, or relay not started</string>
+    <string name="toast_port_conflict">SOCKS port and control port must differ</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_waiting">Running — waiting for a Tailscale address (is Tailscale connected?)</string>
+    <string name="status_running">Running\nListening: %1$s\nSOCKS → 127.0.0.1:%2$d (active: %3$d)\nControl API: :%4$d</string>
+    <string name="status_rotation">\n\nIP rotation: %1$s\n%2$s → %3$s (attempt %4$d) %5$s</string>
+    <string name="setup_hint">Setup:\n1. In Tailscale, keep THIS app included (not excluded).\n2. In Tailscale, EXCLUDE 5G Proxy Pro so it can use cellular.\n3. Start 5G Proxy Pro on the same SOCKS port.\nClients then use socks5://&lt;tailscale-ip&gt;:&lt;port&gt;.\n\nRemote IP rotation:\ncurl -X POST http://&lt;tailscale-ip&gt;:&lt;control-port&gt;/rotate\nThen poll GET /status (Tailscale drops for ~10–30 s while airplane mode is on).\nGET /status also reports OS internet validation (network) and device-wide cellular data usage (data_usage).</string>
+    <string name="notif_channel">Relay</string>
+    <string name="notif_title">Tailnet relay running</string>
+    <string name="notif_text">Tailscale :%1$d → 127.0.0.1:%1$d</string>
+</resources>
