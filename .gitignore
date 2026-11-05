@@ -48,3 +48,8 @@ tools/update_fdroiddata.py
 # Local agent memory — machine-specific, never publish
 AGENTS.md
 .workbuddy-ai/
+
+# 測試截圖 / 量測腳本，以及對貢獻者的內部回覆草稿（含未公開的評估筆記）
+.test-artifacts/
+docs/pr-6-*.md
+docs/pr-ci-body.md

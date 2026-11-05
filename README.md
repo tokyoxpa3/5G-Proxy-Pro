@@ -23,6 +23,7 @@ It uses Android's `ConnectivityManager.requestNetwork()` to pin the cellular net
 - 🛡️ **Native engine health check** — verifies the SOCKS5 server every 10 seconds and restarts it on failure. A built-in stop flag prevents a race with "user pressed stop" from leaving zombie listeners
 - 📢 **Real status reporting** — the service reports its actual state via callback (starting / running / paused / restarting / stopped / failed). The UI never guesses
 - 🔔 **Notification permission** — on Android 13+ the app requests `POST_NOTIFICATIONS` before starting, so the foreground service notification displays properly
+- 🔌 **Optional auto-start after reboot** — **off by default**. When enabled, the proxy is restored only if it was still running when the device shut down; pressing Stop clears that flag, so a stop is never silently undone. If the network is not ready yet at boot it retries every 15 seconds (up to 5 times) instead of giving up
 - 🧪 **Built-in SOCKS5 self-test + one-tap diagnostic report** — walks the full proxy path (TCP connect → SOCKS5 handshake → auth → CONNECT → data return) and marks each step pass/fail to pinpoint the failing stage; the diagnostic report copies with one tap
 - 📶 Shows the Wi-Fi LAN IP / hotspot IP / 5G public IP, with a "Refresh status" button and the last exit reason (low memory, crash, etc.)
 

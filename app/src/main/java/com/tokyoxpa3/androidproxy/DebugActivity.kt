@@ -354,6 +354,27 @@ class DebugActivity : Activity() {
         }
         authUserInput.addTextChangedListener(authWatcher)
         authPassInput.addTextChangedListener(authWatcher)
+
+        // [開機自動啟動] 預設關。代理預設無認證，預設開等於每次開機都在區域網路上
+        // 自動開一個開放式 SOCKS5，使用者不在場也不會知道。實際啟動條件見 BootReceiver。
+        val autoStartLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 16)
+            addView(TextView(this@DebugActivity).apply {
+                text = getString(R.string.switch_auto_start_on_boot)
+                textSize = 16f
+                setTextColor(0xFF212529.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(Switch(this@DebugActivity).apply {
+                // 先設 isChecked 再掛 listener，避免初始化時就觸發一次寫入。
+                isChecked = authPrefs.getBoolean(Socks5ProxyService.PREF_AUTO_START, false)
+                setOnCheckedChangeListener { _, checked ->
+                    authPrefs.edit().putBoolean(Socks5ProxyService.PREF_AUTO_START, checked).apply()
+                }
+            })
+        }
         
         // Main Action Button
         mainButton = Button(this).apply {
@@ -437,6 +458,7 @@ class DebugActivity : Activity() {
         rootLayout.addView(portLayout)
         rootLayout.addView(authLayout)
         rootLayout.addView(passLayout)
+        rootLayout.addView(autoStartLayout)
         rootLayout.addView(mainButton)
         rootLayout.addView(limitHintText)
         rootLayout.addView(ipCard)

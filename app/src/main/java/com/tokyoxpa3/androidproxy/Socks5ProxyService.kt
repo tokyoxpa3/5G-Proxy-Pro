@@ -29,6 +29,9 @@ class Socks5ProxyService : Service() {
     private var proxyPaused = false
     @Volatile
     private var stopRequested = false
+    // [開機自動啟動] 剩餘重試次數；使用者手動啟動 / 停止都會歸零。
+    @Volatile private var autoStartRetriesLeft = 0
+    @Volatile private var autoStartPort = 1080
     // [啟動競態] startProxy 的引擎啟動是非同步的；在它完成前擋下任何重建請求，
     // 否則「引擎好像掛了」的偵測會在啟動空窗期再觸發一次重建。
     @Volatile
@@ -222,6 +225,20 @@ class Socks5ProxyService : Service() {
         // 預設 false：一般使用者不需要逐行明細，開了只會把 logcat 沖掉。拆除的
         // 「分類計數」不受此開關影響，永遠落檔 —— 所以預設也不會回到完全靜默。
         const val PREF_UDP_VERBOSE_LOG = "udp_verbose_log"
+
+        // [開機自動啟動] 兩個鍵都存在 "proxy_config"。
+        // PREF_AUTO_START：使用者開關，**預設關**（代理預設無認證，預設開等於每次開機
+        // 在區域網路上自動開一個開放式 SOCKS5）。PREF_WAS_RUNNING：使用者最後的意圖 ——
+        // 收到 START 設 true、收到 STOP 設 false；失敗或被系統殺掉不改它，
+        // 所以「使用者按過停止」的代理開機後不會被悄悄拉起來。
+        const val PREF_AUTO_START = "auto_start_on_boot"
+        const val PREF_WAS_RUNNING = "was_running"
+        // 由 BootReceiver 發出的啟動帶此 extra：開機初期蜂巢式 / Wi-Fi 常常還沒就緒，
+        // 這種啟動失敗時改為延遲重試，而不是直接 FAILED 收掉。
+        const val EXTRA_AUTO_START = "AUTO_START"
+        private const val AUTO_START_RETRIES = 5
+        private const val AUTO_START_RETRY_DELAY_MS = 15_000L
+
         @Volatile var isServiceRunning = false
 
         @Volatile var currentStatus = ProxyStatus.STOPPED
@@ -295,10 +312,17 @@ class Socks5ProxyService : Service() {
             return START_NOT_STICKY
         }
         val port = intent.getIntExtra(EXTRA_PORT, 1080)
-        
+
+        val prefs = getSharedPreferences("proxy_config", MODE_PRIVATE)
         if (intent.action == ACTION_STOP_PROXY) {
+            autoStartRetriesLeft = 0
+            prefs.edit().putBoolean(PREF_WAS_RUNNING, false).apply()
             stopProxy()
         } else {
+            prefs.edit().putBoolean(PREF_WAS_RUNNING, true).apply()
+            autoStartRetriesLeft =
+                if (intent.getBooleanExtra(EXTRA_AUTO_START, false)) AUTO_START_RETRIES else 0
+            autoStartPort = port
             stopRequested = false
             // 使用者主動啟動 = 新的一輪，重建次數與健康檢查結果歸零
             // （restartProxy 走的是內部路徑，不會經過這裡）
@@ -541,6 +565,16 @@ class Socks5ProxyService : Service() {
         try { networkManager.releaseCellularNetwork() } catch (e: Exception) {}
         cellularNetwork = null
         lanBindAddrs = null
+        if (autoStartRetriesLeft > 0 && !stopRequested) {
+            // 開機自動啟動：保留前景服務與 wakelock，稍後重來（網路多半只是還沒起來）
+            autoStartRetriesLeft--
+            Log.w(TAG, "開機自動啟動失敗，${AUTO_START_RETRY_DELAY_MS / 1000}s 後重試（剩 $autoStartRetriesLeft 次）")
+            serviceScope.launch {
+                delay(AUTO_START_RETRY_DELAY_MS)
+                if (!stopRequested) startProxy(autoStartPort)
+            }
+            return
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
