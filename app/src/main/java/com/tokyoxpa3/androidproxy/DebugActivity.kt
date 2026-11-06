@@ -41,7 +41,7 @@ class DebugActivity : Activity() {
     private lateinit var mainButton: Button
     private lateinit var selfTestButton: Button
     private lateinit var copyDiagnosticsButton: Button
-    private lateinit var udpVerboseSwitch: Switch
+    private lateinit var udpVerboseCheck: CheckBox
     private lateinit var selfTestResultText: TextView
     private lateinit var trafficUploadValue: TextView
     private lateinit var trafficDownloadValue: TextView
@@ -357,22 +357,32 @@ class DebugActivity : Activity() {
 
         // [開機自動啟動] 預設關。代理預設無認證，預設開等於每次開機都在區域網路上
         // 自動開一個開放式 SOCKS5，使用者不在場也不會知道。實際啟動條件見 BootReceiver。
+        //
+        // 這裡用 CheckBox 而不是 Switch：勾選框「有打勾 = 開」在任何主題、任何螢幕尺寸下
+        // 都能一眼看出狀態；滑桿只靠顏色與位置差異，深色模式或小螢幕上很容易誤讀。
+        // 兩行式（標題 + 灰色說明）也讓「按過停止就不會還原」這條規則不必擠在標題裡。
         val autoStartLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             setPadding(0, 0, 0, 16)
-            addView(TextView(this@DebugActivity).apply {
-                text = getString(R.string.switch_auto_start_on_boot)
+            addView(CheckBox(this@DebugActivity).apply {
+                text = getString(R.string.label_auto_start_on_boot)
                 textSize = 16f
                 setTextColor(0xFF212529.toInt())
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            addView(Switch(this@DebugActivity).apply {
+                setPadding(0, 0, 0, 0)
+                // 預設 tint 在淺色底上偏灰，勾起來與沒勾差別很小 —— 明確指定主題紫，
+                // 讓「有打勾」在任何亮度下都看得出來。
+                buttonTintList = android.content.res.ColorStateList.valueOf(0xFF6200EE.toInt())
                 // 先設 isChecked 再掛 listener，避免初始化時就觸發一次寫入。
                 isChecked = authPrefs.getBoolean(Socks5ProxyService.PREF_AUTO_START, false)
                 setOnCheckedChangeListener { _, checked ->
                     authPrefs.edit().putBoolean(Socks5ProxyService.PREF_AUTO_START, checked).apply()
                 }
+            })
+            addView(TextView(this@DebugActivity).apply {
+                text = getString(R.string.hint_auto_start_on_boot)
+                textSize = 12f
+                setTextColor(0xFF6C757D.toInt())
+                setPadding(8, 0, 8, 0)
             })
         }
         
@@ -551,17 +561,15 @@ class DebugActivity : Activity() {
             // 開了只會把 logcat 沖掉。拆除的「分類計數」不受此開關影響 ——
             // 它永遠寫進 engine_stats.log，所以預設也不會回到完全靜默。
             val udpVerboseRow = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                orientation = LinearLayout.VERTICAL
                 setPadding(0, 0, 0, 8)
             }
-            udpVerboseRow.addView(TextView(context).apply {
+            udpVerboseCheck = CheckBox(context).apply {
                 text = getString(R.string.switch_udp_verbose_log)
                 textSize = 14f
                 setTextColor(0xFF495057.toInt())
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            })
-            udpVerboseSwitch = Switch(context).apply {
+                setPadding(0, 0, 0, 0)
+                buttonTintList = android.content.res.ColorStateList.valueOf(0xFF6200EE.toInt())
                 // 先設 isChecked 再掛 listener，避免初始化時就觸發一次寫入。
                 isChecked = getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
                     .getBoolean(Socks5ProxyService.PREF_UDP_VERBOSE_LOG, false)
@@ -572,7 +580,7 @@ class DebugActivity : Activity() {
                     NativeEngine.safeSetUdpVerboseLog(checked)
                 }
             }
-            udpVerboseRow.addView(udpVerboseSwitch)
+            udpVerboseRow.addView(udpVerboseCheck)
             addView(udpVerboseRow)
 
             selfTestButton = Button(context).apply {
