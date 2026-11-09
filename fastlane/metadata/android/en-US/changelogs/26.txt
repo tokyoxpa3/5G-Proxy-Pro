@@ -1,0 +1,6 @@
+- Fixed: after an IP rotation the proxy kept using TCP connections bound to the old cellular gateway, so downloads stalled instead of reconnecting. Stale TCP egress sockets are now shut down cleanly and the client reconnects on the new egress. UDP is never touched, so game sessions are unaffected
+- Fixed: carrier-initiated IP changes were invisible to Android (CGNAT rebind, same Network object, no callback). Three layers now cover it: public egress IP probing (15s while active / 30s idle), LinkProperties change detection, and a conservative per-connection stall detector as a last resort. The stall detector only fires after 1MB in a 5s window followed by 30s of zero bytes, and only recycles that single connection
+- Fixed: DNS/UDP sessions stayed stuck on a dead PDN after a network switch (sendto ENETUNREACH), which made every speed test crawl. Failed sessions are now retired so new lookups use the working egress
+- Fixed: the displayed cellular IP came from a different PDN than the one the proxy actually used, and never refreshed. It now reuses the pinned network and follows the probe result live
+- Fixed: a client-side FIN was ignored in the native event loop, leaving connections in CLOSE-WAIT forever
+- New: a narrow UID-checked ContentProvider lets the relay notify Pro when a rotation completed, for ROMs that reuse the same Network object

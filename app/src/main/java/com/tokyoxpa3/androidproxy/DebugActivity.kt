@@ -115,7 +115,38 @@ class DebugActivity : Activity() {
         updateNetworkStatus()
     }
 
+    // [IP 即時顯示] 出口 IP 由服務每 15~30 秒探測一次；這裡只輪詢結果、不另外發請求。
+    // 過去只在 onCreate / 開始 / 停止時更新，換 IP 後畫面會一直停在舊值，
+    // 看起來就像「Pro 沒跟上」，其實功能早就生效了。
+    private val ipRefreshHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val ipRefreshRunnable = object : Runnable {
+        override fun run() {
+            try {
+                val live = Socks5ProxyService.instance?.currentEgressIp()
+                if (live != null && this@DebugActivity::cellularIPText.isInitialized) {
+                    val text = getString(R.string.cellular_ip_format, live)
+                    if (cellularIPText.text != text) cellularIPText.text = text
+                }
+            } catch (e: Exception) {
+                Log.e("DebugActivity", "ip refresh failed", e)
+            }
+            ipRefreshHandler.postDelayed(this, 2000)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ipRefreshHandler.removeCallbacks(ipRefreshRunnable)
+        ipRefreshHandler.post(ipRefreshRunnable)
+    }
+
+    override fun onPause() {
+        ipRefreshHandler.removeCallbacks(ipRefreshRunnable)
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        ipRefreshHandler.removeCallbacks(ipRefreshRunnable)
         if (Socks5ProxyService.onStatusChanged === statusListener) {
             Socks5ProxyService.onStatusChanged = null
         }

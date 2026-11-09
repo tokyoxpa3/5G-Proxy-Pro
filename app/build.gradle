@@ -11,8 +11,14 @@ android {
         applicationId "com.tokyoxpa3.androidproxy"
         minSdk 26
         targetSdk 34
-        versionCode 24
-        versionName "1.7.4"
+        // 1.7.5：換 IP 後主動清理綁在舊 PDP context 的 TCP 出口連線
+        //        （handleNetworkChange 自動 + Relay 的 RotationBridgeProvider 明確通知）。
+        // 1.7.6：電信端「主動」換 IP 的三條路徑補齊 —— onLinkPropertiesChanged 處理
+        //        同 Network 只換本地 IP；native 出口停滯偵測（雙窗口 + 30 秒 + 1MB 門檻）
+        //        兜住 framework 完全不回呼的 NAT 重綁，且只回收單條連線、不誤殺遊戲。
+        //        簽章排除 IPv6 隱私臨時位址，避免位址輪換造成全切。
+        versionCode 26
+        versionName "1.7.6"
         
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'

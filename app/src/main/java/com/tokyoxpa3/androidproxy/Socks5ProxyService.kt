@@ -12,6 +12,7 @@ import android.util.Log
 import android.content.SharedPreferences
 import com.tokyoxpa3.androidproxy.network.NetworkHealthClassifier
 import com.tokyoxpa3.androidproxy.network.NetworkHealthStatus
+import com.tokyoxpa3.androidproxy.network.PublicIPChecker
 import com.tokyoxpa3.androidproxy.network.VpnDetector
 import kotlinx.coroutines.*
 import java.io.Closeable
@@ -52,6 +53,10 @@ class Socks5ProxyService : Service() {
     }
     @Volatile
     private var cellularNetwork: android.net.Network? = null
+    @Volatile private var lastAutoEgressResetAt = 0L
+    /** 上次探測到的公網出口 IP；null 代表還沒建立基線（首次只記錄、不觸發）。 */
+    @Volatile private var lastEgressIp: String? = null
+    private val publicIpChecker = PublicIPChecker()
     // [LAN 監聽重建] 最後一次送給 native 引擎的 LAN 綁定位址集合。用來判斷介面位址
     // 是否真的變了 —— 位址沒變時不重送，避免無謂地動 listener（同一位址的介面
     // 「關掉再開」由 native 每秒對帳自行修復，不需要 Java 插手）。
@@ -239,7 +244,35 @@ class Socks5ProxyService : Service() {
         private const val AUTO_START_RETRIES = 5
         private const val AUTO_START_RETRY_DELAY_MS = 15_000L
 
+        /**
+         * 自動清理（NetworkCallback 觸發）的最短間隔。
+         * 換 IP 期間系統可能連續回報數個 Network 變動，節流可避免把剛重連的
+         * 下載又切一次；由 Relay 明確送來的通知不走這條限制。
+         */
+        const val AUTO_RESET_THROTTLE_MS = 5_000L
+
+        /**
+         * 出口 IP 探測間隔。
+         *
+         * 電信端在核心網側換出口（CGNAT 重綁 / 錨點遷移）時，Network 物件與本地
+         * IP 都不變，framework 完全不回呼 —— 實測同一個蜂巢 Network 建了 8 小時沒重建，
+         * 公網出口 IP 卻已經換過好幾次。沒有這個探測就只能等 300 秒 idle 逾時，
+         * 期間所有舊連線都是黑洞。
+         */
+        private const val EGRESS_PROBE_INTERVAL_MS = 15_000L
+
+        /** 閒置（沒有活躍連線）時的探測間隔：降到 30 秒省流量與電量。 */
+        private const val EGRESS_PROBE_IDLE_MS = 30_000L
+
         @Volatile var isServiceRunning = false
+
+        /**
+         * 目前活著的服務實例，供 [RotationBridgeProvider] 這類同 App 內的窄介面取得。
+         * 不用 startService 轉送 Intent，是因為清理連線需要直接碰到 activeSockets；
+         * onCreate / onDestroy 一對一維護，不會跨服務重建殘留。
+         */
+        @Volatile var instance: Socks5ProxyService? = null
+            private set
 
         @Volatile var currentStatus = ProxyStatus.STOPPED
         @Volatile var lastErrorMessage: String? = null
@@ -259,6 +292,7 @@ class Socks5ProxyService : Service() {
     
     override fun onCreate() {
         super.onCreate()
+        instance = this
         
         val originalHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -372,12 +406,15 @@ class Socks5ProxyService : Service() {
                 if (stopRequested) { stopSelf(); return@launch }
 
                 isProxyRunning = true
+                // 每次啟動都重新建立出口 IP 基線：首次探測只記錄，不觸發清理。
+                lastEgressIp = null
                 // [重建迴圈修復] 先開始長期請求並監控：startMonitoring 用 requestNetwork
                 // 把蜂巢式 PDN 在服務期間 pin 住，避免「一次性 request 拿到就放掉」造成
                 // PDN 被系統收回 → onLost → 重建的自激迴圈。設定後再等目前可用的網路。
                 networkManager.startMonitoring(
                     onAvailable = { newNetwork -> handleNetworkChange(port, newNetwork) },
-                    onLost = { handleNetworkChange(port, null) }
+                    onLost = { handleNetworkChange(port, null) },
+                    onLinkChanged = { handleLinkChanged() }
                 )
                 networkManager.awaitNetwork(15000)
                 if (stopRequested) { stopSelf(); return@launch }
@@ -531,6 +568,36 @@ class Socks5ProxyService : Service() {
                         }
                     }
 
+                    // [出口變更偵測] 見 EGRESS_PROBE_INTERVAL_MS 的說明。這是唯一能
+                    // 覆蓋「CGNAT 只換公網出口」的手段：onAvailable 與
+                    // onLinkPropertiesChanged 在這種情況下都不會觸發。
+                    launch {
+                        var lastProbeAt = 0L
+                        while (isProxyRunning && !stopRequested) {
+                            delay(5_000)
+                            if (stopRequested || !isProxyRunning) break
+                            val now = System.currentTimeMillis()
+                            // 有活躍連線時 15 秒一次（切換後要盡快恢復）；閒置時降到
+                            // 30 秒。即使閒置也要探，否則 UI 的 IP 會一直停在舊值。
+                            val interval =
+                                if (activeSockets.isEmpty()) EGRESS_PROBE_IDLE_MS else EGRESS_PROBE_INTERVAL_MS
+                            if (now - lastProbeAt < interval) continue
+                            // 先記時間再探測：探測失敗也等一個間隔，不要每 5 秒重打。
+                            lastProbeAt = now
+                            val net = cellularNetwork ?: continue
+                            val ip = publicIpChecker.getPublicIP(net) ?: continue
+                            val previous = lastEgressIp
+                            lastEgressIp = ip
+                            if (previous == null) {
+                                // 基線只記錄不觸發：啟動當下不該清掉任何連線。
+                                Log.i(TAG, "出口 IP 基線: $ip（之後每 ${EGRESS_PROBE_INTERVAL_MS / 1000}s 比對）")
+                            } else if (previous != ip) {
+                                Log.w(TAG, "出口 IP 已變更（$previous → $ip），清理綁在舊出口的連線")
+                                resetStaleConnections("egress_ip_changed")
+                            }
+                        }
+                    }
+
                     // [偵測落檔] 每 5 分鐘把生命週期計數器 snapshot 落檔（release 版也有）
                     launch {
                         while (isProxyRunning && !stopRequested) {
@@ -640,6 +707,16 @@ class Socks5ProxyService : Service() {
             if (network == cellularNetwork) return
             Log.w(TAG, "行動網路已更新，切換新連線使用的網路（不重建代理）")
             cellularNetwork = network
+            // ★ 換 IP / PDN 重建時，「既有連線讓 worker 自然回收」這句話不成立：
+            //   舊 PDP context 消失後 TCP 不會立刻 EOF，綁在舊出口的 socket 會持續
+            //   重傳、cwnd 縮到最小，下載看起來就是「沒斷線但極慢」。這裡主動把它們
+            //   推一把，讓客戶端改用新 Network 重連；只切連線、不重建引擎，所以不會
+            //   回到當初 requestNetwork / onLost 的自激重建迴圈。
+            val now = System.currentTimeMillis()
+            if (now - lastAutoEgressResetAt >= AUTO_RESET_THROTTLE_MS) {
+                lastAutoEgressResetAt = now
+                resetStaleConnections("network_changed")
+            }
             if (currentStatus == ProxyStatus.PAUSED) {
                 serviceScope.launch {
                     updateStatus(ProxyStatus.RUNNING)
@@ -651,6 +728,10 @@ class Socks5ProxyService : Service() {
             if (cellularNetwork == null) return
             Log.w(TAG, "行動網路暫時失效，等待恢復（不重建代理）")
             cellularNetwork = null
+            // 刻意**不在這裡清理連線**。此刻沒有可用出口，切掉連線後客戶端會立刻
+            // 重連、但每一條都連不上（cellularNetwork == null），反而更容易觸發
+            // 遊戲／通話的「連線中斷」判定。正確時機是等 onAvailable 拿到新出口
+            // 再清 —— 那時客戶端重連一次就成功。
             serviceScope.launch {
                 updateStatus(ProxyStatus.PAUSED)
                 val nm = getSystemService(NotificationManager::class.java)
@@ -658,7 +739,67 @@ class Socks5ProxyService : Service() {
             }
         }
     }
-    
+
+    /**
+     * 同一個 Network 物件、只換了本地 IP（電信端重新 attach / PDN 位址變更）。
+     *
+     * 這條路徑不會觸發 onAvailable，所以 [handleNetworkChange] 收不到；但舊 TCP
+     * 連線的四元組已經失效，必須在這裡清掉，否則要等 300 秒 idle 才回收。
+     *
+     * 只清連線、不動代理：listener 綁的是 Wi-Fi/熱點位址，與蜂巢式無關；
+     * 重建引擎會把 192 條握手執行緒一起 join 掉，回到當初的重建迴圈。
+     */
+    private fun handleLinkChanged() {
+        if (!isProxyRunning) return
+        val now = System.currentTimeMillis()
+        // 與 handleNetworkChange 共用同一組節流：位址變更常與 onAvailable 連續
+        // 抵達，兩者各清一次等於把剛重連的連線又切一次。
+        if (now - lastAutoEgressResetAt < AUTO_RESET_THROTTLE_MS) return
+        lastAutoEgressResetAt = now
+        resetStaleConnections("link_changed")
+    }
+
+    /**
+     * 目前探測到的公網出口 IP，供 UI 即時顯示。
+     * 直接回傳探測結果（不另外發請求），UI 輪詢這個值就不會顯示到舊 IP。
+     */
+    fun currentEgressIp(): String? = lastEgressIp
+
+    /**
+     * 切斷所有進行中的 TCP 出口連線，讓客戶端改用新的行動網路出口重連。
+     *
+     * ## 為什麼是 shutdown，不是 close
+     *
+     * `ParcelFileDescriptor.fromSocket().detachFd()` 是 **dup** 語意：同一個 socket
+     * 有兩個 fd —— Java 的 `Socket` 持有原生 fd，C 層持有副本（見 conn_finalize 的
+     * [根因修復 v2] 註解）。只 `close()` 任一邊，另一邊會讓描述存活成 CLOSE_WAIT
+     * 幽靈、留在 epoll 永久就緒，過去就是這樣引爆 level-triggered 事件風暴與 SIGSEGV。
+     *
+     * `shutdownInput()/shutdownOutput()` 作用在 **socket 本身**，所有 dup 共用：
+     * C 層 worker 的 recv 會讀到 EOF、send 會拿到 EPIPE，於是走原本就正確的
+     * conn_unref → conn_finalize → 「release_java_socket + close(target_fd)」
+     * 雙邊回收流程，client_fd 也一併關閉，客戶端收到 FIN 後自然重連。
+     * 我們一個 fd 都不 close，因此不會製造幽靈。
+     *
+     * UDP（`DatagramSocket`）刻意跳過：它沒有 shutdown，硬 close 會踩到同一個 dup
+     * 陷阱；UDP session 本來就有 idle timeout，交給既有機制回收。
+     *
+     * @return 被切斷的 TCP 出口連線數
+     */
+    fun resetStaleConnections(reason: String): Int {
+        if (!isProxyRunning || stopRequested) return 0
+        var reset = 0
+        for (obj in activeSockets.values) {
+            val s = obj as? java.net.Socket ?: continue
+            try { s.shutdownInput() } catch (e: Exception) {}
+            try { s.shutdownOutput() } catch (e: Exception) {}
+            reset++
+        }
+        Log.w(TAG, "[$reason] shut down $reset in-flight TCP egress socket(s); " +
+            "clients will reconnect on the new cellular egress (map=${activeSockets.size})")
+        return reset
+    }
+
     /**
      * 等同於使用者手動「停止代理 → 一鍵開啟」：重新取得新的行動網路並重建代理，
      * 但不會停止服務與前台通知。
@@ -994,6 +1135,7 @@ class Socks5ProxyService : Service() {
     }
 
     override fun onDestroy() {
+        if (instance === this) instance = null
         stopRequested = true
         isProxyRunning = false
         proxyPaused = false

@@ -47,4 +47,35 @@ void conn_forward_interest(int closed, int client_eof, int target_eof,
  * 確保 5 秒掃描與事件迴圈內的回收判定永遠一致、不會各自漂移。 */
 int conn_forward_grace_expired(time_t now, time_t eof_since, time_t grace);
 
+/* ================= 出口停滯（stall）判定 =================
+ *
+ * 為什麼需要：電信端在核心網側換出口（NAT 重綁、PGW/UPF 錨點遷移）時，
+ * Android framework 不會給任何回呼，舊 TCP 連線也收不到 FIN/RST。封包被
+ * 中途的 NAT 丟棄，kernel 持續重傳並指數退避，使用者看到的就是「沒斷線但
+ * 極慢」，要等 IDLE_TIMEOUT_SEC(300s) 才回收。
+ *
+ * 為什麼不能只看「N 秒無流量」：HTTP keep-alive、SSE、長輪詢、遊戲長連線
+ * 本來就可能長時間沒有資料，用無流量判定會把它們整批誤殺。
+ *
+ * 判定的三個條件（缺一不可）：
+ *   1. 這條連線曾經有過實際轉發（last_progress != 0）
+ *   2. 上一個 5 秒窗口的流量 >= min_bytes（剛才還在做高速傳輸）
+ *   3. 距離最後一次實際轉發 >= stall_sec（之後完全沒有進展）
+ *
+ * 條件 2 是防誤殺的核心：門檻設在 1MB/5s（≈200KB/s）之後，遊戲、SSE、
+ * keep-alive、語音這類低速連線永遠達不到，只有「剛才還在做高速下載、
+ * 突然完全停」才會被判定。因此可以安全地對單條連線動手，不需要連坐
+ * 其他健康連線。
+ *
+ * 參數刻意保守（30 秒 + 1MB）：誤殺一條正在連線中的遊戲，比讓一條下載
+ * 多卡 30 秒嚴重得多。代價是低速下載（<200KB/s）停滯時仍會退回 300 秒
+ * 的 IDLE_TIMEOUT —— 這是刻意接受的取捨。 */
+#define CONN_STALL_SEC 30
+#define CONN_STALL_MIN_BYTES (1024ULL * 1024ULL)
+
+/* 回 1 表示出口已停滯、應回收該連線。純函式，無 socket / epoll 依賴。 */
+int conn_stall_expired(time_t now, time_t last_progress,
+                       uint64_t prev_window_bytes, int stall_sec,
+                       uint64_t min_bytes);
+
 #endif /* CONN_FORWARD_H */

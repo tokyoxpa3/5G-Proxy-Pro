@@ -2,6 +2,7 @@ package com.tokyoxpa3.androidproxy.network
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -34,6 +35,9 @@ class CellularNetworkManager(private val context: Context) {
     @Volatile
     private var cellularNetwork: Network? = null
     private var monitorCallback: ConnectivityManager.NetworkCallback? = null
+    /** 目前 LinkProperties 的簽章：只用來判斷「同一個 Network 的位址是否真的變了」。 */
+    @Volatile
+    private var linkSignature: String? = null
     // awaitNetwork 的續體：startMonitoring 的 onAvailable 抵達時喚醒首次等待
     @Volatile
     private var pendingNetworkWaiter: ((Network?) -> Unit)? = null
@@ -43,6 +47,10 @@ class CellularNetworkManager(private val context: Context) {
      * 因此每次都需要重新請求）。取得結果後會自動移除 callback，避免累積註冊。
      */
     suspend fun requestCellularNetwork(timeoutMs: Long = 10000L): Network? = try {
+        // 已經有 pin 住的蜂巢網路時直接回傳。UI 顯示的 IP 必須與代理實際使用的
+        // Network 一致 —— 重新 requestNetwork 可能拿到另一個 PDN（出口 IP 不同），
+        // 實測就出現「畫面顯示的公網 IP 與代理實際出口完全不同」的脫節。
+        cellularNetwork?.let { return it }
         var callback: ConnectivityManager.NetworkCallback? = null
         var unregistered = false
         fun unregisterOnce(cb: ConnectivityManager.NetworkCallback) {
@@ -122,20 +130,53 @@ class CellularNetworkManager(private val context: Context) {
      *  - onLost：目前鎖定的行動網路已失效
      * 註冊時系統會立即回報目前的網路，若與既有網路相同則不會觸發 onAvailable。
      */
-    fun startMonitoring(onAvailable: (Network) -> Unit, onLost: () -> Unit) {
+    fun startMonitoring(
+        onAvailable: (Network) -> Unit,
+        onLost: () -> Unit,
+        onLinkChanged: () -> Unit = {}
+    ) {
         stopMonitoring()
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 super.onAvailable(network)
                 try {
                     cellularNetwork = network
+                    // 記下初始簽章：onAvailable 之後系統通常還會再送一次
+                    // onLinkPropertiesChanged，內容相同就不該觸發清理。
+                    linkSignature = signatureOf(network)
                     pendingNetworkWaiter?.invoke(network)
                     onAvailable(network)
                 } catch (e: Exception) {
                     android.util.Log.e("CellularNetwork", "Error in monitor onAvailable", e)
                 }
             }
-            
+
+            /**
+             * 同一個 Network 物件、只換了本地 IP（電信端重新 attach、PDN 位址變更）。
+             *
+             * 這種情況不會再觸發 onAvailable，但舊 TCP 連線的四元組已經失效，
+             * 必須通知上層清理。只比對 IP 與介面名稱 —— DNS 或 MTU 變動不影響
+             * 既有連線，納入比較會把正在連線中的遊戲／語音一起切斷。
+             */
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                super.onLinkPropertiesChanged(network, lp)
+                try {
+                    val signature = signatureOf(lp)
+                    val previous = linkSignature
+                    linkSignature = signature
+                    // previous == null 代表註冊後的第一次回報（初始值），不是變更。
+                    if (previous != null && previous != signature && network == cellularNetwork) {
+                        android.util.Log.w(
+                            "CellularNetwork",
+                            "行動網路位址已變更（$previous → $signature），通知上層清理舊出口"
+                        )
+                        onLinkChanged()
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("CellularNetwork", "Error in onLinkPropertiesChanged", e)
+                }
+            }
+
             override fun onLost(network: Network) {
                 super.onLost(network)
                 try {
@@ -204,7 +245,27 @@ class CellularNetworkManager(private val context: Context) {
         }
         monitorCallback = null
         pendingNetworkWaiter = null
+        linkSignature = null
     }
+
+    private fun signatureOf(network: Network): String? = try {
+        connectivityManager.getLinkProperties(network)?.let { signatureOf(it) }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun signatureOf(lp: LinkProperties): String = LinkSignature.from(
+        lp.linkAddresses.mapNotNull { la ->
+            val addr = la.address ?: return@mapNotNull null
+            // 排除 IPv6 隱私臨時位址（privacy extension，flags bit0 = IFA_F_TEMPORARY）。
+            // 它會週期性輪換，但 IPv4 出口通常完全沒變；把它算進簽章會讓
+            // 「只是換了臨時位址」被當成換 IP，進而全切所有連線、誤殺遊戲。
+            // 真正走 IPv6 的連線若因此失效，由 native 的停滯偵測兜底。
+            if (addr is java.net.Inet6Address && (la.flags and 0x01) != 0) null
+            else addr.hostAddress ?: ""
+        },
+        lp.interfaceName
+    )
     
     fun releaseCellularNetwork() {
         stopMonitoring()

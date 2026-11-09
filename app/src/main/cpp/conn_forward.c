@@ -33,3 +33,17 @@ int conn_forward_grace_expired(time_t now, time_t eof_since, time_t grace) {
     if (eof_since == 0) return 0; /* 尚未 FIN */
     return (now - eof_since >= grace) ? 1 : 0;
 }
+
+int conn_stall_expired(time_t now, time_t last_progress,
+                       uint64_t prev_window_bytes, int stall_sec,
+                       uint64_t min_bytes) {
+    /* 從未轉發過任何位元組：連線剛建立或握手階段，不屬於「停滯」。 */
+    if (last_progress == 0) return 0;
+
+    /* 上一個窗口沒有達到高速門檻 → 本來就是低速/閒置連線，不是出口故障。
+     * 這一條是防誤殺遊戲、SSE、keep-alive 的關鍵，不可放寬。 */
+    if (prev_window_bytes < min_bytes) return 0;
+
+    /* 剛才還在高流量、現在卻完全沒有進展 → 出口已死。 */
+    return (now - last_progress >= stall_sec) ? 1 : 0;
+}

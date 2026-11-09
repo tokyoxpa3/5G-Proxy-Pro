@@ -39,6 +39,18 @@
             android:enabled="true"
             android:exported="false" />
 
+        <!--
+          Tailnet Relay 換 IP 完成後的單一用途通知入口。
+          只接受 METHOD_IP_ROTATED，且在 call() 內以 Binder.getCallingUid() 驗證
+          呼叫者必須是 com.tokyoxpa3.tailnetrelay；不開放任何資料讀寫。
+          不用 signature permission：Relay 可能先於本 App 安裝，那時權限不會被授予。
+        -->
+        <provider
+            android:name=".RotationBridgeProvider"
+            android:authorities="com.tokyoxpa3.androidproxy.rotation"
+            android:enabled="true"
+            android:exported="true" />
+
         <!-- 開機 / App 更新後還原代理。只在「開機自動啟動」開啟且使用者上次沒按停止時才會啟動，
              見 BootReceiver 與 Socks5ProxyService.PREF_WAS_RUNNING。 -->
         <receiver

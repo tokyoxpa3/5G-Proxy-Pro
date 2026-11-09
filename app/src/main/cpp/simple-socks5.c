@@ -92,6 +92,14 @@ typedef struct full_conn_t {
     atomic_int registered;
 
     time_t last_active;
+    /* [出口停滯偵測] last_active 由「任何 epoll 事件」刷新（含對端可讀但無資料、
+     * 純事件喚醒），last_progress 只在「真的把位元組推給對端」時刷新。
+     * 電信端換出口後 epoll 可能完全安靜，兩者都不會動 —— 差別在於我們要的是
+     * 「有沒有實際進展」，而不是「有沒有被喚醒」。 */
+    time_t last_progress;
+    uint64_t total_bytes;       /* 累計成功轉發位元組（單調遞增，僅本 worker 寫） */
+    uint64_t sampled_bytes;     /* 上次 5 秒掃描時的 total_bytes */
+    uint64_t prev_window_bytes; /* 上一個 5 秒窗口的增量（停滯判定的門檻來源） */
     struct full_conn_t *next;
     struct full_conn_t *prev;
     int widx; // [H2 修復] 擁有此 conn 的 worker 索引（退休鏈路由該 worker 的鎖保護）
@@ -458,13 +466,16 @@ static void* worker_loop_safe(void* arg) {
             if (!fatal_error) {
                 // Buffer flushing (To Client)
                 if (full->t2c_len > 0) {
-                    if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off, NULL) < 0) fatal_error = 1;
+                    ssize_t sent = 0;
+                    if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off, &sent) < 0) fatal_error = 1;
+                    if (sent > 0) { full->total_bytes += (uint64_t)sent; full->last_progress = now; }
                 }
                 // Buffer flushing (To Target)
                 if (full->c2t_len > 0) {
                     ssize_t sent = 0;
                     if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off, &sent) < 0) fatal_error = 1;
                     account_upload(sent, my_widx);
+                    if (sent > 0) { full->total_bytes += (uint64_t)sent; full->last_progress = now; }
                 }
                 // Read from Client
                 if (!fatal_error && full->c2t_len == 0 && !full->client_eof) {
@@ -474,6 +485,7 @@ static void* worker_loop_safe(void* arg) {
                         ssize_t sent = 0;
                         if (try_send(full->target_fd, full->c2t_buf, &full->c2t_len, &full->c2t_off, &sent) < 0) fatal_error = 1;
                         account_upload(sent, my_widx);
+                        if (sent > 0) { full->total_bytes += (uint64_t)sent; full->last_progress = now; }
                     } else if (r == 0) {
                         // 客戶端半關閉 (FIN): 停止讀取，但仍須把 target 的剩餘資料轉發回去
                         full->client_eof = 1;
@@ -486,7 +498,9 @@ static void* worker_loop_safe(void* arg) {
                     if (r > 0) {
                         full->t2c_len = r; full->t2c_off = 0;
                         atomic_fetch_add(&g_rx_bytes[my_widx], (long long)r);
-                        if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off, NULL) < 0) fatal_error = 1;
+                        ssize_t sent = 0;
+                        if (try_send(full->client_fd, full->t2c_buf, &full->t2c_len, &full->t2c_off, &sent) < 0) fatal_error = 1;
+                        if (sent > 0) { full->total_bytes += (uint64_t)sent; full->last_progress = now; }
                     } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) fatal_error = 1;
                 }
             }
@@ -499,6 +513,18 @@ static void* worker_loop_safe(void* arg) {
             if (!fatal_error && is_target && !full->target_eof_since &&
                 (ev & EPOLLRDHUP) && full->target_fd >= 0) {
                 full->target_eof_since = now;
+            }
+
+            // [CLOSE_WAIT 根因] client 側的 RDHUP 過去完全被忽略。當 c2t_len > 0
+            // （client 還有資料待送）時事件迴圈會跳過 recv(client_fd)，client 的 FIN
+            // 就沒有任何路徑能被偵測 → client_eof 永不置位 → conn 不 finalize →
+            // client_fd 卡在 CLOSE_WAIT 直到 idle 逾時。實測切換 IP 三次後累積
+            // 1120 條 CLOSE-WAIT，fd 耗盡使新連線變慢。此處與 target 側對稱處理。
+            if (!fatal_error && !is_target && (ev & EPOLLRDHUP) && full->client_fd >= 0) {
+                if (!full->client_eof) {
+                    full->client_eof = 1;
+                    full->eof_since = now;
+                }
             }
 
             // 緩衝清空後以 MSG_PEEK 偵測對端是否已 FIN:
@@ -581,6 +607,38 @@ static void* worker_loop_safe(void* arg) {
                         garbage_count = 0;
                         pthread_mutex_lock(&me->list_lock);
                         garbage_list[garbage_count++] = curr;
+                    }
+                }
+
+                // [出口停滯偵測] 電信端在核心網側換出口（NAT 重綁 / 錨點遷移）時，
+                // framework 不給任何回呼，舊連線也收不到 FIN/RST，只能等 300 秒
+                // IDLE_TIMEOUT 才回收 —— 這段時間下載就是「沒斷線但極慢」。
+                // 這裡只回收「這一條」，不動其他健康連線：換出口時不是所有連線
+                // 都同時死，一次全切會把正在連線中的遊戲／語音一起打斷。
+                if (curr->magic == CONN_MAGIC && !curr->closed && atomic_load(&curr->registered)) {
+                    uint64_t window = curr->total_bytes - curr->sampled_bytes;
+                    // 半關閉的連線不適用停滯判定：client 已 FIN 代表請求已結束、
+                    // 本來就不該再有下載流量；target 已 FIN 則走既有的 grace 回收。
+                    // 排除這兩種情況可再降低誤殺機率。
+                    if (!curr->client_eof && !curr->target_eof_since &&
+                        conn_stall_expired(now, curr->last_progress, curr->prev_window_bytes,
+                                           CONN_STALL_SEC, CONN_STALL_MIN_BYTES)) {
+                        LOGI("stall: slot=%d 出口停滯 %llds（上個窗口 %llu bytes），只回收此連線",
+                             curr->slot, (long long)(now - curr->last_progress),
+                             (unsigned long long)curr->prev_window_bytes);
+                        curr->closed = 1;
+                        list_remove_locked(me, curr);
+                        if (garbage_count < MAX_EVENTS) garbage_list[garbage_count++] = curr;
+                        else {
+                            pthread_mutex_unlock(&me->list_lock);
+                            for (int g = 0; g < garbage_count; g++) conn_unref(garbage_list[g]);
+                            garbage_count = 0;
+                            pthread_mutex_lock(&me->list_lock);
+                            garbage_list[garbage_count++] = curr;
+                        }
+                    } else {
+                        curr->prev_window_bytes = window;
+                        curr->sampled_bytes = curr->total_bytes;
                     }
                 }
                 curr = next;
@@ -693,6 +751,10 @@ static void handoff_to_worker(int client_fd, int target_fd) {
         return;
     }
     full->last_active = time(NULL);
+    full->last_progress = 0;
+    full->total_bytes = 0;
+    full->sampled_bytes = 0;
+    full->prev_window_bytes = 0;
     full->closed = 0;
     full->client_eof = 0;
     full->eof_since = 0;
@@ -961,6 +1023,11 @@ typedef struct udp_conn_t {
     // [診斷] 拆除原因分類（見 udp_close_kind_t）。刻意放在 closed 之後 —— 這裡本來
     // 就是 4 B 對齊洞，所以這個欄位不增加 struct 大小（以 NDK clang 佈局 dump 驗證）。
     int close_kind;
+    // [出口切換] sendto 回 ENETUNREACH/ENETDOWN 時設 1。電信端換出口後，綁在舊
+    // PDN 上的 socket 會持續不可達；只記 log 的話這個 session 會永遠卡在壞掉的
+    // fd 上（實測 DNS 失敗率 88%：enq=59 ok=7 fail=52）。標記後由 5 秒掃描回收，
+    // Client 重送時會用目前出口重建 session。僅 worker 執行緒寫入。
+    int egress_failed;
     // [診斷] 拆除原因。由觸發拆除的那條路徑設定（一律指向字串常值，不涉所有權），
     // 統一在 udp_conn_finalize 印一次。補這個洞的理由：先前**所有**拆除路徑都不留
     // 任何痕跡，UDP-in-TCP 的會話反覆重建在伺服器端完全隱形，只能靠推測。
@@ -1169,7 +1236,14 @@ static void udp_send_5g(udp_conn_t *u, const unsigned char *payload, size_t plen
     ssize_t sent = sendto(u->remote_udp_fd, payload, plen, 0,
                           (const struct sockaddr *)dst, dlen);
     if (sent < 0) {
-        LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
+        int e = errno;
+        LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", e, strerror(e));
+        // [出口切換] ENETUNREACH/ENETDOWN 代表綁定的 PDN 已失效（電信端換出口後
+        // 舊 socket 會一直回這個錯誤）。標記後由 5 秒掃描回收，Client 重送時
+        // 就會用目前出口重建 session；否則 DNS 會永遠卡在壞掉的 fd 上。
+        if (e == ENETUNREACH || e == ENETDOWN || e == EHOSTUNREACH) {
+            u->egress_failed = 1;
+        }
     } else if (sent > 0) {
         atomic_fetch_add(&g_udp_tx_bytes[u->widx], (long long)sent);
     }
@@ -1770,7 +1844,20 @@ static void* udp_worker_loop(void* arg) {
                 if (cur->magic == UDP_CONN_MAGIC && !cur->closed && cur->out_len > 0) {
                     cur->last_active = now;
                 }
+                // [出口切換] sendto 已回報 ENETUNREACH：這個 session 綁在失效的 PDN 上，
+                // 留著只會讓 DNS / QUIC 全部黑洞（實測 DNS 失敗率 88%）。立刻回收，
+                // Client 重送時會用目前出口重建 session。
                 if (cur->magic == UDP_CONN_MAGIC && !cur->closed &&
+                    atomic_load(&cur->registered) && cur->egress_failed) {
+                    cur->close_kind = UDP_CLOSE_IO;
+                    cur->close_reason = "出口不可達（sendto ENETUNREACH），回收讓 Client 重建";
+                    cur->close_errno = ENETUNREACH;
+                    cur->closed = 1;
+                    if (cur->prev) cur->prev->next = cur->next; else me->conn_list_head = cur->next;
+                    if (cur->next) cur->next->prev = cur->prev;
+                    cur->next = NULL; cur->prev = NULL;
+                    if (garbage_count < MAX_EVENTS) garbage[garbage_count++] = cur;
+                } else if (cur->magic == UDP_CONN_MAGIC && !cur->closed &&
                     atomic_load(&cur->registered) &&
                     // [非同步解析] 有待補送的 frame 時同樣不可回收
                     udp_dns_pend_count(cur->pend, UDP_DNS_PEND_SLOTS) == 0 &&
@@ -1868,6 +1955,7 @@ static void udp_start_session(int client_fd, int cmd) {
     u->close_kind = UDP_CLOSE_NONE;
     u->close_reason = NULL;
     u->close_errno = 0;
+    u->egress_failed = 0;
     u->last_active = time(NULL);
     u->created = u->last_active;
     u->in_buf = malloc(BUFFER_SIZE + 64);
