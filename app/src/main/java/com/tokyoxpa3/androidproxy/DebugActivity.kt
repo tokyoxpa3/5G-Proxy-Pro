@@ -1040,6 +1040,11 @@ class DebugActivity : Activity() {
         // [非同步解析] UDP 網域解析計數。drop/qfull/jobfull/lost 只要非 0，
         // 就代表有 frame 沒被送出（上層只能重傳）—— 這是「驗證頁卡住」的量化證據。
         sb.append("DnsStats: ").append(NativeEngine.safeGetDnsStats()).append("\n")
+        // DnsStats 只統計 native 的 UDP 網域佇列；API 29+ 走 DnsResolver 時它永遠是 0。
+        // 沒有這一行，讀報告的人會把全 0 讀成「DNS 沒跑過」，而實際上每個 CONNECT 都查了。
+        Socks5ProxyService.instance?.let {
+            sb.append("DnsPath: ").append(it.currentDnsPath()).append("\n")
+        }
 
         // 附上滾動落檔的歷史痕跡（release 版可直接看，不需 root / debug 版）
         try {

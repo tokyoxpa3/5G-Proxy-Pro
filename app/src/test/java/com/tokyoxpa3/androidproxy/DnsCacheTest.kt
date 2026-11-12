@@ -1,6 +1,7 @@
 package com.tokyoxpa3.androidproxy
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.InetAddress
@@ -101,37 +102,38 @@ class DnsCacheTest {
         leader.join(5000)
     }
 
-    // --- lookupDetailed：回報結果來源（issue #8 用來分辨「真的查了」與「快取命中」） ---
+    // --- lookupDetailed：回報「這次有沒有真的送出查詢」（issue #8 用來分辨「真的查了」與「快取命中」） ---
 
     @Test
-    fun detailedReportsFreshThenCache() {
+    fun reportsQueriedForRealLookupThenNotForCache() {
         val cache = DnsCache()
         val now = 1_000_000L
         val first = cache.lookupDetailed("a.com", now) { listOf(addr("1.2.3.4")) }
-        assertEquals(DnsCache.Source.FRESH, first.source)
+        assertTrue(first.queried)
         assertEquals(listOf(addr("1.2.3.4")), first.addresses)
 
         val second = cache.lookupDetailed("a.com", now + 1000) { listOf(addr("5.6.7.8")) }
-        assertEquals(DnsCache.Source.CACHE, second.source)
+        assertFalse(second.queried)
         assertEquals(listOf(addr("1.2.3.4")), second.addresses)
     }
 
     @Test
-    fun detailedReportsNegativeForEmptyResultAndNegativeCache() {
+    fun reportsQueriedForFailedLookupButNotForNegativeCacheHit() {
         val cache = DnsCache()
         val now = 1_000_000L
         val fresh = cache.lookupDetailed("nx.com", now) { emptyList() }
-        assertEquals(DnsCache.Source.NEGATIVE, fresh.source)
+        // 真的查了、但沒有任何結果 → 必須標成 queried，否則診斷會把「查了失敗」
+        // 讀成「負快取命中」，而後者代表根本沒驗證過網路
+        assertTrue(fresh.queried)
         assertTrue(fresh.addresses.isEmpty())
 
-        // 負快取命中：仍然標成 NEGATIVE（不是 CACHE），避免被讀成「有效位址」
         val cached = cache.lookupDetailed("nx.com", now + 1000) { listOf(addr("1.2.3.4")) }
-        assertEquals(DnsCache.Source.NEGATIVE, cached.source)
+        assertFalse(cached.queried)
         assertTrue(cached.addresses.isEmpty())
     }
 
     @Test
-    fun detailedReportsFollower() {
+    fun followerDoesNotClaimToHaveQueried() {
         val cache = DnsCache()
         val now = 1_000_000L
         val resolveStarted = CountDownLatch(1)
@@ -155,7 +157,8 @@ class DnsCacheTest {
         val follower = cache.lookupDetailed("a.com", now) { listOf(addr("9.9.9.9")) }
         releaser.join(5000)
         leader.join(5000)
-        assertEquals(DnsCache.Source.FOLLOWER, follower.source)
+        // follower 等的是別人的查詢，自己一個封包都沒發
+        assertFalse(follower.queried)
         assertEquals(listOf(addr("1.2.3.4")), follower.addresses)
     }
 }

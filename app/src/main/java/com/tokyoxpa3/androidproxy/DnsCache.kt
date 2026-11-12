@@ -19,22 +19,16 @@ class DnsCache(
 ) {
     private class Entry(val addresses: List<InetAddress>, val expiresAt: Long)
 
-    /** 這次查詢的結果是從哪裡來的（診斷用，不影響快取行為）。 */
-    enum class Source {
-        /** 正快取命中，沒有發出查詢。 */
-        CACHE,
-
-        /** 真的發出了查詢（leader）。 */
-        FRESH,
-
-        /** 併發等待別人查完後讀快取。 */
-        FOLLOWER,
-
-        /** 沒有任何位址：可能是負快取命中，或 leader 查詢失敗。 */
-        NEGATIVE,
-    }
-
-    data class Lookup(val addresses: List<InetAddress>, val source: Source)
+    /**
+     * 一次查詢的結果。
+     *
+     * [queried] 表示**這一次呼叫有沒有真的送出 DNS 查詢**。這是診斷唯一需要的資訊：
+     * 快取命中（正或負）與 follower 等待都算「沒查」，只有 leader 真的查了。
+     *
+     * 為什麼不能只看位址清單：空清單可能是「負快取命中」（根本沒發查詢），也可能是
+     * 「查了但失敗」，兩者在 issue #8 那種「DNS 到底通不通」的判斷裡意義完全相反。
+     */
+    data class Lookup(val addresses: List<InetAddress>, val queried: Boolean)
 
     private val cache = ConcurrentHashMap<String, Entry>()
     private val inFlight = ConcurrentHashMap<String, CountDownLatch>()
@@ -50,11 +44,11 @@ class DnsCache(
         lookupDetailed(key, nowMs, resolve).addresses
 
     /**
-     * 與 [lookup] 相同，但額外回報結果來源。
+     * 與 [lookup] 相同，但額外回報「這次有沒有真的送出查詢」。
      *
      * 為什麼需要：issue #8 那台機器「可 bind、可握手、卻收不到位元組」，此時
      * 「DNS 到底有沒有真的查成功」是判斷資料平面是否活著的關鍵證據 —— 但快取
-     * 命中會讓呼叫端誤以為剛才有一次成功的查詢。把來源分開才不會讀錯。
+     * 命中會讓呼叫端誤以為剛才有一次成功的查詢。
      */
     fun lookupDetailed(
         key: String,
@@ -63,10 +57,7 @@ class DnsCache(
     ): Lookup {
         val hit = cache[key]
         if (hit != null && hit.expiresAt > nowMs) {
-            return Lookup(
-                hit.addresses,
-                if (hit.addresses.isEmpty()) Source.NEGATIVE else Source.CACHE
-            )
+            return Lookup(hit.addresses, queried = false)
         }
 
         val leaderLatch = CountDownLatch(1)
@@ -78,19 +69,16 @@ class DnsCache(
             try { existing.await(followerWaitMs, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
             val followerHit = cache[key]
             return if (followerHit != null && followerHit.expiresAt > nowMs) {
-                Lookup(followerHit.addresses, Source.FOLLOWER)
+                Lookup(followerHit.addresses, queried = false)
             } else {
-                Lookup(emptyList(), Source.NEGATIVE)
+                Lookup(emptyList(), queried = false)
             }
         }
         try {
             if (cache.size >= maxEntries) cache.clear()
             val addresses = resolve()
             put(key, nowMs, addresses)
-            return Lookup(
-                addresses,
-                if (addresses.isEmpty()) Source.NEGATIVE else Source.FRESH
-            )
+            return Lookup(addresses, queried = true)
         } finally {
             inFlight.remove(key, leaderLatch)
             leaderLatch.countDown()

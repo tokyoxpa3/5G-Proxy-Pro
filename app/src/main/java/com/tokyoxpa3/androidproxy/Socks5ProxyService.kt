@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import android.content.SharedPreferences
+import com.tokyoxpa3.androidproxy.network.EgressProbeBackoff
 import com.tokyoxpa3.androidproxy.network.NetworkHealthClassifier
 import com.tokyoxpa3.androidproxy.network.NetworkHealthStatus
 import com.tokyoxpa3.androidproxy.network.PublicIPChecker
@@ -77,6 +78,14 @@ class Socks5ProxyService : Service() {
     @Volatile private var lastEchoCalibrationAt = 0L
     /** 最近一次探測的摘要（位址 / 來源 / 耗時），供診斷報告顯示。 */
     @Volatile private var lastProbeSummary: String? = null
+    /**
+     * 最近一次 DNS 查詢實際走的路徑。
+     *
+     * `DnsStats` 是 native 引擎的 UDP 網域佇列計數；API 29+ 的查詢走 `DnsResolver`，
+     * 完全不經過它，所以報告裡 `enq=0 ok=0 fail=0` 全部是 0。那很容易被讀成
+     * 「DNS 從沒跑過」，而實際上每一次 CONNECT 都查了 —— 這一行就是用來消除誤讀。
+     */
+    @Volatile private var lastDnsPath: String = "unknown"
     /**
      * 上次成功的健康檢查端點。
      *
@@ -151,15 +160,16 @@ class Socks5ProxyService : Service() {
             doResolve(network, host)
         }
         // [issue #8] 只有「真的發了查詢」才寫一行：這一行的存在就等於證明
-        // 「這個網路上小封包（UDP DNS）還通」。快取命中刻意不記，否則會把
-        // 1500 行的緩衝沖掉，而快取命中本來也不代表網路現在還能用。
-        val elapsed = System.currentTimeMillis() - startedAt
-        when (result.source) {
-            DnsCache.Source.FRESH ->
+        // 「這個網路上小封包（UDP DNS）還通」。快取命中（含負快取）刻意不記，
+        // 否則會把 1500 行的緩衝沖掉，而快取命中本來也不代表網路現在還能用。
+        // 區分「查了但失敗」與「負快取命中」很重要：兩者的處置完全相反。
+        if (result.queried) {
+            val elapsed = System.currentTimeMillis() - startedAt
+            if (result.addresses.isEmpty()) {
+                AppLog.w("Dns", "failed $host ${elapsed}ms（查詢失敗，負快取 3 秒）")
+            } else {
                 AppLog.i("Dns", "fresh $host -> ${result.addresses.size} addr ${elapsed}ms")
-            DnsCache.Source.NEGATIVE ->
-                AppLog.w("Dns", "failed $host ${elapsed}ms（負快取 3 秒）")
-            else -> Unit
+            }
         }
         return result.addresses
     }
@@ -169,6 +179,7 @@ class Socks5ProxyService : Service() {
         // [DNS 背壓] 先搶並發額度：額度滿代表 DNS 正在劣化（多個 leader 各自等滿逾時），
         // 此時與其讓這個握手執行緒再卡 2 秒，不如立刻失敗 → 負快取 → REP=host unreachable。
         if (!dnsConcurrency.tryAcquire()) {
+            lastDnsPath = "rejected (concurrency full)"
             return emptyList()
         }
         try {
@@ -179,11 +190,13 @@ class Socks5ProxyService : Service() {
             // DnsResolver 內建逾時 + CancellationSignal 可真正取消，不留卡死執行緒。
             if (android.os.Build.VERSION.SDK_INT >= 29) {
                 // 逾時/失敗 → 回空清單，交由 DnsCache 負快取 3 秒
+                lastDnsPath = "DnsResolver"
                 return resolveWithDnsResolver(network, host) ?: emptyList()
             }
             // 5G 網路劣化時 DNS 可能長時間無回應；加上 1 秒 timeout，
             // 避免 handshake 線程被 DNS 卡死（線程池全滿時新連線會被直接拒絕）。
             // 失敗（超時/無結果）也回空清單，交由 DnsCache 負快取 3 秒。
+            lastDnsPath = "getAllByName"
             return try {
                 val future = dnsExecutor.submit<List<java.net.InetAddress>> {
                     HappyEyeballs.orderIpv6First(
@@ -749,8 +762,10 @@ class Socks5ProxyService : Service() {
                             val now = System.currentTimeMillis()
                             // 有活躍連線時 15 秒一次（切換後要盡快恢復）；閒置時降到
                             // 30 秒。即使閒置也要探，否則 UI 的 IP 會一直停在舊值。
-                            val interval =
+                            // 連續失敗時再往後退避（見 probeInterval）。
+                            val base =
                                 if (activeSockets.isEmpty()) EGRESS_PROBE_IDLE_MS else EGRESS_PROBE_INTERVAL_MS
+                            val interval = probeInterval(base, consecutiveProbeFailures)
                             if (now - lastProbeAt < interval) continue
                             // 先記時間再探測：探測失敗也等一個間隔，不要每 5 秒重打。
                             lastProbeAt = now
@@ -944,6 +959,18 @@ class Socks5ProxyService : Service() {
 
     /** 最近一次出口探測的摘要：`位址 [來源] 耗時`，供診斷報告使用。 */
     fun currentProbeSummary(): String? = lastProbeSummary
+
+    /** 最近一次 DNS 查詢走的路徑，供診斷報告使用（見 [lastDnsPath]）。 */
+    fun currentDnsPath(): String = lastDnsPath
+
+    /**
+     * 依連續失敗次數把探測間隔指數拉長（策略見 [EgressProbeBackoff]）。
+     *
+     * 成功一次就由 [handleEgressProbe] 把 `consecutiveProbeFailures` 歸零，
+     * 間隔立刻回到正常節奏 —— 恢復不需要任何額外的「解除退避」路徑。
+     */
+    private fun probeInterval(baseMs: Long, consecutiveFailures: Int): Long =
+        EgressProbeBackoff.interval(baseMs, consecutiveFailures)
 
     /**
      * 出口探測結果的狀態機。
