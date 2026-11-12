@@ -27,8 +27,12 @@ android {
         //        —— 導頁、302、5xx 都證明資料平面活著，重建修不了它們。端點改
         //        「上次成功先打」，消掉被封鎖地區每輪固定白吃的 timeout。出口探測
         //        補 8 秒總預算（全失敗原本可拖 20 秒，而它每 15 秒跑一次）。
-        versionCode 28
-        versionName "1.7.8"
+        // 1.8.0：換 IP 數次後掉到 40 Mbps 的根因修復。拆線時送佇列還有數 MB 的
+        //        socket 被 close 成 orphan，在背景對已消失的目標重傳、RTO 退避到
+        //        120 秒，灌爆蜂巢上行並把核心 TCP 記憶體推過壓力門檻。現在 close
+        //        前先問 TIOCOUTQ，有積壓就 SO_LINGER(0) 直接 RST 丟棄佇列。
+        versionCode 30
+        versionName "1.8.0"
         
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'

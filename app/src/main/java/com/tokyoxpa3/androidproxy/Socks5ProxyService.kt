@@ -1080,6 +1080,25 @@ class Socks5ProxyService : Service() {
      * 雙邊回收流程，client_fd 也一併關閉，客戶端收到 FIN 後自然重連。
      * 我們一個 fd 都不 close，因此不會製造幽靈。
      *
+     * ## ★ 為什麼還要先設 SO_LINGER(0)（2026-11-12 修）
+     *
+     * 只 shutdown 不夠。關閉當下送不出去的資料（目標已死、客戶端讀不動）會留在
+     * socket 的送佇列裡；`close()` 之後 Linux 把它變成 **orphan socket 在背景繼續
+     * 重傳**，RTO 指數退避一路拉到 120 秒。實測（rodin / A15，換 IP 三～四次後）：
+     *
+     *   62 條 orphan、63 條 FIN-WAIT-1、**積壓 69.3 MB 送不出去的資料**，
+     *   `/proc/net/sockstat` 的 TCP mem 從 ~0 漲到 84280 頁。
+     *
+     * 這些 orphan 會把手機的**蜂巢上行**當成重傳通道持續灌資料 —— 下行 ACK 因此
+     * 排不出去，每條新連線的 cwnd 長不起來（實測單條 TCP 卡在 ~290 KB/s，
+     * 多條並行各 290 KB/s，speedtest 十幾條流加起來剛好 ~40 Mbps）。
+     * 這也是「換 IP 沒用、等一陣子自己好、重開機最徹底」的成因：
+     * orphan 只能等重傳次數耗盡，reboot 才一次清空。
+     *
+     * `SO_LINGER(0)` 讓 close 直接送 RST 並丟棄佇列，不會產生 orphan；
+     * 客戶端收到 RST 立刻結束（不再留 CLOSE_WAIT），重連即走新出口。
+     * 換 IP 當下那批資料本來就送不完（目標連線已隨舊 PDP 消失），丟掉是正確的。
+     *
      * UDP（`DatagramSocket`）刻意跳過：它沒有 shutdown，硬 close 會踩到同一個 dup
      * 陷阱；UDP session 本來就有 idle timeout，交給既有機制回收。
      *
@@ -1088,14 +1107,24 @@ class Socks5ProxyService : Service() {
     fun resetStaleConnections(reason: String): Int {
         if (!isProxyRunning || stopRequested) return 0
         var reset = 0
+        var aborted = 0
         for (obj in activeSockets.values) {
             val s = obj as? java.net.Socket ?: continue
+            // 先掛 SO_LINGER(0)：關閉時 RST 並丟棄佇列，避免變成 orphan 在蜂巢上
+            // 重傳（見上方說明）。設定失敗不影響 shutdown 的原有行為。
+            try {
+                s.setSoLinger(true, 0)
+                aborted++
+            } catch (e: Exception) {
+                Log.w(TAG, "setSoLinger(0) 失敗，該連線關閉時可能留下 orphan", e)
+            }
             try { s.shutdownInput() } catch (e: Exception) {}
             try { s.shutdownOutput() } catch (e: Exception) {}
             reset++
         }
-        Log.w(TAG, "[$reason] shut down $reset in-flight TCP egress socket(s); " +
-            "clients will reconnect on the new cellular egress (map=${activeSockets.size})")
+        Log.w(TAG, "[$reason] shut down $reset in-flight TCP egress socket(s) " +
+            "(linger0=$aborted); clients will reconnect on the new cellular egress " +
+            "(map=${activeSockets.size})")
         return reset
     }
 

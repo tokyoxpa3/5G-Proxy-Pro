@@ -11,6 +11,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <signal.h>
 #include <android/log.h>
 #include <stdatomic.h>
@@ -144,6 +145,39 @@ static atomic_llong g_st_bad_slot = 0;     // slot 越界 / 槽位未啟用
 static atomic_llong g_st_exhausted = 0;    // 槽位耗盡次數
 static atomic_llong g_st_double_fin = 0;   // 二次 finalize 嘗試
 static atomic_llong g_st_auth_fail = 0;    // 認證失敗（方法未提供或帳密不符）
+static atomic_llong g_st_abort_rst = 0;    // 關閉時仍有積壓資料、改用 RST 丟棄的次數
+
+/**
+ * [orphan 修復 2026-11-12] 關閉 fd 前，若送佇列還有資料就改成 RST。
+ *
+ * 為什麼：`close()` 一個還有幾 MB 送不出去的 socket，Linux 不會立刻放掉，
+ * 而是把它變成 **orphan 在背景繼續重傳**，重傳逾時指數退避一路到 120 秒。
+ * 換 IP 當下目標連線已隨舊 PDP 消失、客戶端也讀不動，這些資料永遠送不到，
+ * 只是白白灌在蜂巢上行，把下行 ACK 餓死。
+ *
+ * 實測（rodin / A15，換 IP 第四次掉到 40 Mbps 時）：
+ *   126 條 FIN-WAIT-1、131 條 orphan、`/proc/net/sockstat` 的 TCP mem
+ *   漲到 **201903 頁**（pressure 門檻 178847、上限 268266）→ 核心開始丟封包
+ *   → 每條新連線只剩 ~280 KB/s，speedtest 十幾條流加起來剛好 ~40 Mbps。
+ *
+ * `SO_LINGER(0)` 讓 close 直接送 RST 並丟棄佇列；佇列本來就是空的連線不受影響
+ * （照常走正常 FIN，客戶端仍能完整收到最後一段資料）。
+ */
+static void close_discard(int fd) {
+    if (fd < 0) return;
+    int outq = 0;
+    if (ioctl(fd, TIOCOUTQ, &outq) == 0 && outq > 0) {
+        struct linger lg = { 1, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, (const void *)&lg, sizeof(lg));
+        // 只印前 10 次：release 版沒有週期性 stats，這行是唯一能確認修復生效的證據
+        long long n = atomic_fetch_add(&g_st_abort_rst, 1) + 1;
+        if (n <= 10) {
+            LOGI("close_discard: RST, dropped %d queued byte(s) (fd=%d, total=%lld)",
+                 outq, fd, n);
+        }
+    }
+    close(fd);
+}
 static atomic_llong g_st_conn_fail = 0;    // 對外連線建立失敗（回覆 REP=0x04）
 // [流量統計] per-worker tx/rx 位元組累加器。tx = 經 5G target socket 送出的位元組
 // （上傳），rx = 自 5G target socket 收到的位元組（下載）。各 worker 各自累加，
@@ -344,7 +378,9 @@ static void conn_finalize(full_conn_t *conn) {
     pthread_mutex_unlock(&w->list_lock);
 
     // 關閉 FDs（close 會自動把 fd 從所屬 epoll 移除）
-    if (conn->client_fd >= 0) { close(conn->client_fd); conn->client_fd = -1; }
+    // [orphan 修復 2026-11-12] 一律走 close_discard：送佇列還有資料時直接 RST，
+    // 不要留成 orphan 在蜂巢上重複重傳（見 close_discard 的完整說明）。
+    if (conn->client_fd >= 0) { close_discard(conn->client_fd); conn->client_fd = -1; }
     if (conn->target_fd >= 0) {
         // [根因修復 v2 2026-08-23] 實測（HyperOS/Android 15 單連線追蹤）：
         // ParcelFileDescriptor.fromSocket() 是「DUP」語意 —— 同一個 socket
@@ -361,7 +397,7 @@ static void conn_finalize(full_conn_t *conn) {
         // dup 語意下兩邊是不同編號、指向同一描述，先關 Java 端不影響 C 端副本，
         // 描述要等 C 端也 close 後才真正銷毀（發 FIN）。
         release_java_socket(conn->target_fd); // Java 端 socket.close() 收掉原生 fd
-        close(conn->target_fd);
+        close_discard(conn->target_fd);
         conn->target_fd = -1;
     }
 
@@ -651,12 +687,13 @@ static void* worker_loop_safe(void* arg) {
             static time_t last_stats = 0;
             if (my_widx == 0 && now - last_stats >= 30) {
                 last_stats = now;
-                LOGI("stats: conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld auth_fail=%lld conn_fail=%lld",
+                LOGI("stats: conns=%d acquired=%lld released=%lld stale_skip=%lld bad_slot=%lld exhausted=%lld purged=%lld auth_fail=%lld conn_fail=%lld abort_rst=%lld",
                      atomic_load(&g_conn_count),
                      (long long)atomic_load(&g_st_acquired), (long long)atomic_load(&g_st_released),
                      (long long)atomic_load(&g_st_stale_skip), (long long)atomic_load(&g_st_bad_slot),
                      (long long)atomic_load(&g_st_exhausted), ghost_purge_get_count(),
-                     (long long)atomic_load(&g_st_auth_fail), (long long)atomic_load(&g_st_conn_fail));
+                     (long long)atomic_load(&g_st_auth_fail), (long long)atomic_load(&g_st_conn_fail),
+                     (long long)atomic_load(&g_st_abort_rst));
             }
 #endif
         }
