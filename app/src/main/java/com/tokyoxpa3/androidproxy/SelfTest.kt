@@ -126,7 +126,10 @@ object SelfTest {
                     return@withContext Result(steps, false)
                 }
 
-                // 4. 資料回流：透過隧道送出 HTTP GET，讀回並驗證收到 HTTP 回應
+                // 4. 資料回流：透過隧道送出 HTTP GET，只驗「有沒有位元組回來」
+                //    刻意不檢查內容是不是 HTTP/ 開頭 —— 電信商導頁、入口網站的 HTML
+                //    都證明封包確實走完了整條代理路徑，而那是這一步唯一想證明的事。
+                //    判內容只會讓一條其實正常的代理被回報成故障。
                 val http = "GET / HTTP/1.0\r\nHost: $TEST_HOST\r\nConnection: close\r\n\r\n"
                     .toByteArray(Charsets.US_ASCII)
                 output.write(http)
@@ -136,11 +139,6 @@ object SelfTest {
                     val n = input.read(buf)
                     if (n <= 0) {
                         add(Step(StepKind.DATA, false, "0 bytes received (connection closed with no data)"))
-                        return@withContext Result(steps, false)
-                    }
-                    val head = String(buf, 0, n, Charsets.US_ASCII)
-                    if (!head.startsWith("HTTP/")) {
-                        add(Step(StepKind.DATA, false, "$n bytes, unexpected: ${head.take(60)}"))
                         return@withContext Result(steps, false)
                     }
                     add(Step(StepKind.DATA, true, "$n bytes received"))
