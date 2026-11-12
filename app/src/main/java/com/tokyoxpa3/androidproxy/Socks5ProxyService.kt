@@ -77,6 +77,14 @@ class Socks5ProxyService : Service() {
     @Volatile private var lastEchoCalibrationAt = 0L
     /** 最近一次探測的摘要（位址 / 來源 / 耗時），供診斷報告顯示。 */
     @Volatile private var lastProbeSummary: String? = null
+    /**
+     * 上次成功的健康檢查端點。
+     *
+     * 下一輪先打這一個，穩態下只發 1 個請求。舊版用固定順序，於是「第一個端點被
+     * 地區封鎖」的網路每一輪都要先吃滿一次 timeout —— 閒置時每 15 秒一次，一天
+     * 數千次白等。這裡刻意不在換網路時清除：它只是排序提示，猜錯一次就會自己修正。
+     */
+    @Volatile private var lastHealthSuccessUrl: String? = null
     // 需要 ConnectivityManager 才能讀本機介面上的全域 IPv6（探測的第三層備援）
     private val publicIpChecker by lazy { PublicIPChecker(connectivityManager) }
     // [LAN 監聽重建] 最後一次送給 native 引擎的 LAN 綁定位址集合。用來判斷介面位址
@@ -333,6 +341,22 @@ class Socks5ProxyService : Service() {
          * 還長，迴圈會變成幾乎連續探測。資料平面卡住時尤其明顯，所以設總上限。
          */
         private const val HEALTH_PROBE_BUDGET_MS = 8_000L
+
+        /**
+         * 單一端點的 timeout。
+         *
+         * 不縮短：204 端點的回應只有幾百 bytes，但在擁塞的蜂巢網路上 3 秒仍是合理
+         * 容錯；真正的浪費是「每一輪都打同一個被封鎖的端點」，那用排序解決，不是砍 timeout。
+         */
+        private const val HEALTH_PROBE_ENDPOINT_TIMEOUT_MS = 3_000L
+
+        /**
+         * 回應 body 最多讀多少 bytes。
+         *
+         * 只需要判斷 apple 那個端點的 "Success" 字樣；導頁可能是整頁 HTML，
+         * 讀完只是浪費流量與時間。
+         */
+        private const val HEALTH_PROBE_BODY_LIMIT = 512
 
         @Volatile var isServiceRunning = false
 
@@ -1149,43 +1173,109 @@ class Socks5ProxyService : Service() {
     }
 
     /**
-     * 依序嘗試健康檢查端點，任一成功即視為通過。
+     * 依序嘗試健康檢查端點，任一「語意上真的成功」即視為通過。
      *
-     * 有總預算（[HEALTH_PROBE_BUDGET_MS]）：三個端點各自 3 秒連線 + 3 秒讀取，
-     * 最壞會拖 18 秒，比 15 秒的檢查週期還長。資料平面卡住時（issue #8）每一輪
-     * 都會走滿最壞情況，迴圈因此退化成幾乎連續探測。
+     * 三件事跟舊版不同：
      *
-     * 失敗原因寫進 [lastHealthProbeDetail]：`FAILED (3/3)` 本身分不出「三個端點
-     * 被地區封鎖」與「真的收不到位元組」，而這兩者的處置完全相反。
+     * 1. **驗語意**（[HealthProbe.isHealthy]）。舊版讀到一個 byte 就當健康，於是
+     *    電信商流量用完的導頁（200 + HTML）會被判成健康 —— 那正好是本 App 使用者
+     *    最常遇到的情況。這裡也關掉自動跟隨 3xx，避免「302 導到登入頁 → 200」漏判。
+     * 2. **上次成功的端點排最前面**（[HealthProbe.order]）。固定順序會讓「第一個
+     *    端點被封鎖」的地區每一輪都白吃一次 timeout，閒置時每 15 秒一次、一天數千次。
+     * 3. **總預算**（[HEALTH_PROBE_BUDGET_MS]）：三個端點各 3 秒連線 + 3 秒讀取，
+     *    最壞 18 秒比 15 秒的檢查週期還長，資料平面卡住時迴圈會退化成連續探測。
+     *
+     * 失敗原因寫進 [lastHealthProbeDetail]：`FAILED (3/3)` 本身分不出「端點被地區
+     * 封鎖」、「被導頁攔住」與「真的收不到位元組」，而這三者的處置完全不同。
      */
     private fun healthProbeSucceeds(network: android.net.Network): Boolean {
         val startedAt = System.currentTimeMillis()
         val deadline = startedAt + HEALTH_PROBE_BUDGET_MS
-        val failures = StringBuilder()
-        for (url in healthCheckUrls) {
+        val order = HealthProbe.order(healthCheckUrls, lastHealthSuccessUrl)
+        val replies = ArrayList<HealthProbe.Reply>(order.size)
+
+        for (url in order) {
             val remaining = deadline - System.currentTimeMillis()
             if (remaining <= 0) {
-                failures.append("budget-exhausted; ")
-                break
+                replies.add(HealthProbe.Reply(url, error = "budget"))
+                continue
             }
-            val timeout = remaining.coerceAtMost(3000L).toInt()
-            val host = url.substringAfter("//").substringBefore("/")
-            try {
-                network.openConnection(java.net.URL(url)).apply {
-                    connectTimeout = timeout
-                    readTimeout = timeout
-                    inputStream.use { it.read() }
-                }
-                lastHealthProbeDetail =
-                    "ok $host ${System.currentTimeMillis() - startedAt}ms"
+            val attemptStartedAt = System.currentTimeMillis()
+            val reply = probeOne(
+                network,
+                url,
+                remaining.coerceAtMost(HEALTH_PROBE_ENDPOINT_TIMEOUT_MS).toInt(),
+                attemptStartedAt
+            )
+            replies.add(reply)
+            if (HealthProbe.isHealthy(reply)) {
+                lastHealthSuccessUrl = url
+                lastHealthProbeDetail = HealthProbe.summarize(replies, order) +
+                    " (${System.currentTimeMillis() - startedAt}ms)"
                 return true
-            } catch (e: Exception) {
-                failures.append("$host=${e.javaClass.simpleName}; ")
             }
         }
-        lastHealthProbeDetail =
-            "fail ${System.currentTimeMillis() - startedAt}ms: ${failures.toString().trim()}"
+
+        lastHealthProbeDetail = HealthProbe.summarize(replies, order) +
+            " (${System.currentTimeMillis() - startedAt}ms)"
         return false
+    }
+
+    /**
+     * 對單一端點發一次請求並把結果正規化成 [HealthProbe.Reply]。
+     *
+     * 關閉 `instanceFollowRedirects`：導頁就是導頁，跟到登入頁只會讓 200 掩蓋問題。
+     * body 只讀前 [HEALTH_PROBE_BODY_LIMIT] bytes —— 導頁可能是整頁 HTML，
+     * 我們只需要判斷有沒有一小段文字。
+     */
+    private fun probeOne(
+        network: android.net.Network,
+        url: String,
+        timeoutMs: Int,
+        startedAt: Long
+    ): HealthProbe.Reply {
+        var connection: java.net.HttpURLConnection? = null
+        return try {
+            connection = network.openConnection(java.net.URL(url)) as java.net.HttpURLConnection
+            connection.connectTimeout = timeoutMs
+            connection.readTimeout = timeoutMs
+            connection.instanceFollowRedirects = false
+            val code = connection.responseCode
+            val body = if (code in 200..299) {
+                connection.inputStream.use { readBounded(it, HEALTH_PROBE_BODY_LIMIT) }
+            } else {
+                ""
+            }
+            HealthProbe.Reply(
+                url = url,
+                code = code,
+                body = body,
+                error = null,
+                elapsedMs = System.currentTimeMillis() - startedAt
+            )
+        } catch (e: Exception) {
+            HealthProbe.Reply(
+                url = url,
+                code = null,
+                body = null,
+                error = e.javaClass.simpleName,
+                elapsedMs = System.currentTimeMillis() - startedAt
+            )
+        } finally {
+            try { connection?.disconnect() } catch (_: Exception) {}
+        }
+    }
+
+    /** 最多讀 [max] bytes 後停止（不用 `readNBytes`：那要 API 33）。 */
+    private fun readBounded(input: java.io.InputStream, max: Int): String {
+        val buffer = ByteArray(max)
+        var offset = 0
+        while (offset < max) {
+            val n = input.read(buffer, offset, max - offset)
+            if (n < 0) break
+            offset += n
+        }
+        return String(buffer, 0, offset, Charsets.UTF_8)
     }
     
     /**

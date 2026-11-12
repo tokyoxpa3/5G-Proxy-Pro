@@ -61,6 +61,10 @@ class PublicIPChecker(
         withContext(Dispatchers.IO) {
             val failures = StringBuilder()
             val startedAt = System.currentTimeMillis()
+            // 總預算：STUN 兩個各 2 秒 + echo 兩個各 3+3 秒，最壞超過 16 秒，而這個
+            // 探測每 15 秒跑一次。全失敗時若不設上限，探測週期會被自己拖成一分鐘以上，
+            // 而「全失敗」正是最需要準時回報的時候。
+            val deadline = startedAt + PROBE_BUDGET_MS
 
             val order = if (forceEcho) {
                 listOf(Source.ECHO, Source.STUN)
@@ -76,7 +80,11 @@ class PublicIPChecker(
                             continue
                         }
                         for (server in stunServers) {
-                            val ip = tryStun(network, server, failures)
+                            if (System.currentTimeMillis() >= deadline) {
+                                failures.append("stun=budget; ")
+                                break
+                            }
+                            val ip = tryStun(network, server, failures, deadline)
                             if (ip != null) {
                                 stunCooldownUntil = 0L
                                 return@withContext Result(
@@ -95,7 +103,11 @@ class PublicIPChecker(
                     }
                     Source.ECHO -> {
                         for (endpoint in echoEndpoints) {
-                            val ip = tryEcho(network, endpoint, failures)
+                            if (System.currentTimeMillis() >= deadline) {
+                                failures.append("echo=budget; ")
+                                break
+                            }
+                            val ip = tryEcho(network, endpoint, failures, deadline)
                             if (ip != null) {
                                 return@withContext Result(
                                     ip, Source.ECHO, endpoint, elapsed(startedAt)
@@ -147,7 +159,18 @@ class PublicIPChecker(
         }
     }
 
-    private fun tryEcho(network: Network?, endpoint: String, failures: StringBuilder): String? {
+    private fun tryEcho(
+        network: Network?,
+        endpoint: String,
+        failures: StringBuilder,
+        deadline: Long
+    ): String? {
+        val connectBudget = (deadline - System.currentTimeMillis())
+            .coerceAtMost(ECHO_CONNECT_TIMEOUT_MS.toLong())
+        if (connectBudget <= 0) {
+            failures.append("$endpoint=budget; ")
+            return null
+        }
         return try {
             val url = URL(endpoint)
             val connection = if (network != null) {
@@ -157,8 +180,10 @@ class PublicIPChecker(
             }
 
             connection.requestMethod = "GET"
-            connection.connectTimeout = ECHO_CONNECT_TIMEOUT_MS
-            connection.readTimeout = ECHO_READ_TIMEOUT_MS
+            connection.connectTimeout = connectBudget.toInt()
+            connection.readTimeout = connectBudget
+                .coerceAtMost(ECHO_READ_TIMEOUT_MS.toLong())
+                .toInt()
             connection.setRequestProperty("User-Agent", "AndroidProxy/1.0")
             // 中間可能有電信商的透明代理：不讓它回快取，否則出口變了也讀到舊值
             connection.setRequestProperty("Cache-Control", "no-cache")
@@ -194,11 +219,22 @@ class PublicIPChecker(
      * 所以這個值**只作為 echo 失敗時的備援**；上層會依 [Source] 分開比對，
      * 不會拿 STUN 值去和先前的 echo 值相減。
      */
-    private fun tryStun(network: Network?, server: String, failures: StringBuilder): String? {
+    private fun tryStun(
+        network: Network?,
+        server: String,
+        failures: StringBuilder,
+        deadline: Long
+    ): String? {
         val host = server.substringBeforeLast(':')
         val port = server.substringAfterLast(':').toIntOrNull()
         if (host.isEmpty() || port == null) {
             failures.append("$server=bad-server; ")
+            return null
+        }
+        val timeoutBudget = (deadline - System.currentTimeMillis())
+            .coerceAtMost(STUN_TIMEOUT_MS.toLong())
+        if (timeoutBudget <= 0) {
+            failures.append("$server=budget; ")
             return null
         }
         var socket: DatagramSocket? = null
@@ -223,7 +259,7 @@ class PublicIPChecker(
             val ds = DatagramSocket()
             socket = ds
             network?.bindSocket(ds)                 // 把 UDP socket 也釘到蜂巢出口
-            ds.soTimeout = STUN_TIMEOUT_MS
+            ds.soTimeout = timeoutBudget.toInt()
             ds.connect(target, port)
             ds.send(DatagramPacket(request, request.size))
 
@@ -290,6 +326,15 @@ class PublicIPChecker(
         private const val ECHO_CONNECT_TIMEOUT_MS = 3000
         private const val ECHO_READ_TIMEOUT_MS = 3000
         private const val STUN_TIMEOUT_MS = 2000
+
+        /**
+         * 一輪探測的總預算。
+         *
+         * 兩層都失敗時最壞是 2×2 秒（STUN）+ 2×6 秒（echo）= 20 秒，而探測每 15 秒
+         * 一次 —— 全失敗會讓週期被自己拖垮，偏偏那正是最需要準時回報的時候。
+         * 8 秒足以讓 STUN 完整試完（4 秒）再留一次 echo 的機會（3 秒）。
+         */
+        private const val PROBE_BUDGET_MS = 8000L
 
         /** STUN 連續失敗後的冷卻時間：期間直接走 echo，不再白等 UDP timeout。 */
         private const val STUN_COOLDOWN_MS = 10 * 60 * 1000L
