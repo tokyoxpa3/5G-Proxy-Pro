@@ -350,14 +350,6 @@ class Socks5ProxyService : Service() {
          */
         private const val HEALTH_PROBE_ENDPOINT_TIMEOUT_MS = 3_000L
 
-        /**
-         * 回應 body 最多讀多少 bytes。
-         *
-         * 只需要判斷 apple 那個端點的 "Success" 字樣；導頁可能是整頁 HTML，
-         * 讀完只是浪費流量與時間。
-         */
-        private const val HEALTH_PROBE_BODY_LIMIT = 512
-
         @Volatile var isServiceRunning = false
 
         /**
@@ -1177,11 +1169,11 @@ class Socks5ProxyService : Service() {
      *
      * 三件事跟舊版不同：
      *
-     * 1. **判定改成「有沒有收到 HTTP 回應」**（[HealthProbe.isReachable]）。舊版讀到
-     *    一個 byte 就當健康，這條**保留** —— 因為「收到回應」正是資料平面活著的證據，
-     *    而健康檢查唯一的用途是決定要不要重建代理，重建對導頁毫無幫助。
-     *    語意不符（302、電信商導頁）只標在 [lastHealthProbeDetail] 裡，不影響判定。
-     *    真正該判失敗的是「一個位元組都沒回來」，也就是 issue #8 的形態。
+     * 1. **只問「有沒有收到回應」**（[HealthProbe.isReachable]）。舊版讀到一個 byte
+     *    就當健康，結論一樣但過程要靠「讀 body」；現在只取狀態行，不讀 body。
+     *    刻意不分類回應內容（302、電信商導頁、204 帶 body）：那些都證明資料平面活著，
+     *    而重建代理對它們一個都修不了。真正該判失敗的是「一個位元組都沒回來」，
+     *    也就是 issue #8 的形態。
      * 2. **上次成功的端點排最前面**（[HealthProbe.order]）。固定順序會讓「第一個
      *    端點被封鎖」的地區每一輪都白吃一次 timeout，閒置時每 15 秒一次、一天數千次。
      * 3. **總預算**（[HEALTH_PROBE_BUDGET_MS]）：三個端點各 3 秒連線 + 3 秒讀取，
@@ -1226,9 +1218,11 @@ class Socks5ProxyService : Service() {
     /**
      * 對單一端點發一次請求並把結果正規化成 [HealthProbe.Reply]。
      *
-     * 關閉 `instanceFollowRedirects`：不是為了改變判定（302 一樣算通），而是
-     * 不要把導頁的整頁 HTML 抓下來再丟掉，同時讓診斷字串看到乾淨的 `HTTP302`。
-     * body 只讀前 [HEALTH_PROBE_BODY_LIMIT] bytes —— 只需要判斷有沒有一小段文字。
+     * 只取狀態行，**不讀 body**。我們要的答案只有「有沒有回應」，內容一概不需要；
+     * 導頁可能是整頁 HTML，讀它只是白白消耗流量。
+     *
+     * 關閉 `instanceFollowRedirects` 也不是為了分類（302 一樣算通），而是不要
+     * 為了跟隨轉址而多發一次請求。
      */
     private fun probeOne(
         network: android.net.Network,
@@ -1242,16 +1236,9 @@ class Socks5ProxyService : Service() {
             connection.connectTimeout = timeoutMs
             connection.readTimeout = timeoutMs
             connection.instanceFollowRedirects = false
-            val code = connection.responseCode
-            val body = if (code in 200..299) {
-                connection.inputStream.use { readBounded(it, HEALTH_PROBE_BODY_LIMIT) }
-            } else {
-                ""
-            }
             HealthProbe.Reply(
                 url = url,
-                code = code,
-                body = body,
+                code = connection.responseCode,
                 error = null,
                 elapsedMs = System.currentTimeMillis() - startedAt
             )
@@ -1259,7 +1246,6 @@ class Socks5ProxyService : Service() {
             HealthProbe.Reply(
                 url = url,
                 code = null,
-                body = null,
                 error = e.javaClass.simpleName,
                 elapsedMs = System.currentTimeMillis() - startedAt
             )
@@ -1269,17 +1255,6 @@ class Socks5ProxyService : Service() {
     }
 
     /** 最多讀 [max] bytes 後停止（不用 `readNBytes`：那要 API 33）。 */
-    private fun readBounded(input: java.io.InputStream, max: Int): String {
-        val buffer = ByteArray(max)
-        var offset = 0
-        while (offset < max) {
-            val n = input.read(buffer, offset, max - offset)
-            if (n < 0) break
-            offset += n
-        }
-        return String(buffer, 0, offset, Charsets.UTF_8)
-    }
-    
     /**
      * 序列化 native 引擎的停止：stopProxy 的協程（IO）、pauseProxy/restartProxy
      * 與 onDestroy（主執行緒）可能同時呼叫，而 native_stop_socks5_server 本身
