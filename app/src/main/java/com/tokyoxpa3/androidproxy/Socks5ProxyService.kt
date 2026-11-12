@@ -1173,13 +1173,15 @@ class Socks5ProxyService : Service() {
     }
 
     /**
-     * 依序嘗試健康檢查端點，任一「語意上真的成功」即視為通過。
+     * 依序嘗試健康檢查端點，任一「有收到回應」即視為通過。
      *
      * 三件事跟舊版不同：
      *
-     * 1. **驗語意**（[HealthProbe.isHealthy]）。舊版讀到一個 byte 就當健康，於是
-     *    電信商流量用完的導頁（200 + HTML）會被判成健康 —— 那正好是本 App 使用者
-     *    最常遇到的情況。這裡也關掉自動跟隨 3xx，避免「302 導到登入頁 → 200」漏判。
+     * 1. **判定改成「有沒有收到 HTTP 回應」**（[HealthProbe.isReachable]）。舊版讀到
+     *    一個 byte 就當健康，這條**保留** —— 因為「收到回應」正是資料平面活著的證據，
+     *    而健康檢查唯一的用途是決定要不要重建代理，重建對導頁毫無幫助。
+     *    語意不符（302、電信商導頁）只標在 [lastHealthProbeDetail] 裡，不影響判定。
+     *    真正該判失敗的是「一個位元組都沒回來」，也就是 issue #8 的形態。
      * 2. **上次成功的端點排最前面**（[HealthProbe.order]）。固定順序會讓「第一個
      *    端點被封鎖」的地區每一輪都白吃一次 timeout，閒置時每 15 秒一次、一天數千次。
      * 3. **總預算**（[HEALTH_PROBE_BUDGET_MS]）：三個端點各 3 秒連線 + 3 秒讀取，
@@ -1208,7 +1210,7 @@ class Socks5ProxyService : Service() {
                 attemptStartedAt
             )
             replies.add(reply)
-            if (HealthProbe.isHealthy(reply)) {
+            if (HealthProbe.isReachable(reply)) {
                 lastHealthSuccessUrl = url
                 lastHealthProbeDetail = HealthProbe.summarize(replies, order) +
                     " (${System.currentTimeMillis() - startedAt}ms)"
@@ -1224,9 +1226,9 @@ class Socks5ProxyService : Service() {
     /**
      * 對單一端點發一次請求並把結果正規化成 [HealthProbe.Reply]。
      *
-     * 關閉 `instanceFollowRedirects`：導頁就是導頁，跟到登入頁只會讓 200 掩蓋問題。
-     * body 只讀前 [HEALTH_PROBE_BODY_LIMIT] bytes —— 導頁可能是整頁 HTML，
-     * 我們只需要判斷有沒有一小段文字。
+     * 關閉 `instanceFollowRedirects`：不是為了改變判定（302 一樣算通），而是
+     * 不要把導頁的整頁 HTML 抓下來再丟掉，同時讓診斷字串看到乾淨的 `HTTP302`。
+     * body 只讀前 [HEALTH_PROBE_BODY_LIMIT] bytes —— 只需要判斷有沒有一小段文字。
      */
     private fun probeOne(
         network: android.net.Network,
