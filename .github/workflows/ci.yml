@@ -1,0 +1,79 @@
+name: CI
+
+# Pull-request feedback. `release.yml` only runs on `v*` tags, so until now a
+# contributor had no way to know whether their branch even compiled without
+# asking the maintainer to build it by hand.
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Fork PRs only get a read-only token; nothing here needs more than that.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Same workaround as release.yml: android-actions/setup-android@v3 runs
+      # `sdkmanager tools`, and the `tools` package was removed from the SDK
+      # repository. The runner image already ships an SDK, so just put its
+      # cmdline-tools on PATH.
+      - name: Set up Android SDK
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          CT_BIN="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$CT_BIN" ]; then
+            echo "$CT_BIN" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install NDK and build-tools
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "ndk;26.3.11579264" "build-tools;34.0.0" "platforms;android-34"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # gradlew is committed as mode 100644, so the exec bit has to be set here.
+      - name: Unit tests
+        run: |
+          chmod +x gradlew
+          ./gradlew test --no-daemon
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      # No keystore on PRs, so this emits unsigned APKs. It still compiles the
+      # release variant of every module, which is where signing config and
+      # release-only code paths live.
+      - name: Build release APK (unsigned)
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: '**/build/reports/tests/**'
+          if-no-files-found: ignore
