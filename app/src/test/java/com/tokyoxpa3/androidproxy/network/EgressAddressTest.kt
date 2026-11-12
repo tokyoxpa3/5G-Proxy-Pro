@@ -9,50 +9,13 @@ import org.junit.Test
 /**
  * [EgressAddress] 的迴歸測試。
  *
- * 這裡錯一個分類就會讓出口偵測整條失效：
- *  - 把 CGNAT 位址當成公網 → 探測永遠回傳同一個假值，真正的出口變更看不到。
- *  - 把 IPv6 link-local／ULA 當成公網 → 拿一個不會變的位址當出口，
- *    等於完全失去偵測能力。
+ * 這裡錯一個分類就會讓出口偵測整條失效：把 IPv6 link-local／ULA 當成公網，
+ * 等於拿一個不會變的位址當出口，完全失去偵測能力。
+ *
+ * IPv4 沒有對應的分類測試 —— 本機 IPv4 位址（含 CGNAT）一律不可信，
+ * 生產程式碼不看它，出口位址只由 STUN／echo 回報。
  */
 class EgressAddressTest {
-
-    @Test
-    fun cgnatAddressIsNotPublic() {
-        // 實測值：rodin 在台灣大車隊行動網路上的 ccmni3 位址
-        assertFalse(EgressAddress.isPublicIpv4("100.96.34.49"))
-        assertFalse(EgressAddress.isPublicIpv4("100.64.0.1"))
-        assertFalse(EgressAddress.isPublicIpv4("100.127.255.254"))
-    }
-
-    @Test
-    fun privateRangesAreNotPublic() {
-        assertFalse(EgressAddress.isPublicIpv4("10.0.0.1"))
-        assertFalse(EgressAddress.isPublicIpv4("172.16.5.4"))
-        assertFalse(EgressAddress.isPublicIpv4("172.31.255.255"))
-        assertFalse(EgressAddress.isPublicIpv4("192.168.1.1"))
-        assertFalse(EgressAddress.isPublicIpv4("169.254.1.1"))
-        assertFalse(EgressAddress.isPublicIpv4("127.0.0.1"))
-        assertFalse(EgressAddress.isPublicIpv4("0.0.0.0"))
-    }
-
-    @Test
-    fun publicRangesArePublic() {
-        assertTrue(EgressAddress.isPublicIpv4("8.8.8.8"))
-        assertTrue(EgressAddress.isPublicIpv4("49.215.1.1"))
-        assertTrue(EgressAddress.isPublicIpv4("172.32.0.1"))   // 172.16/12 之外
-        assertTrue(EgressAddress.isPublicIpv4("100.128.0.1"))  // 100.64/10 之外
-        assertTrue(EgressAddress.isPublicIpv4("1.1.1.1"))
-    }
-
-    @Test
-    fun malformedIpv4IsNotPublic() {
-        assertFalse(EgressAddress.isPublicIpv4(""))
-        assertFalse(EgressAddress.isPublicIpv4("8.8.8"))
-        assertFalse(EgressAddress.isPublicIpv4("8.8.8.8.8"))
-        assertFalse(EgressAddress.isPublicIpv4("256.1.1.1"))
-        assertFalse(EgressAddress.isPublicIpv4("8.8.8.a"))
-        assertFalse(EgressAddress.isPublicIpv4("8.8.8.+1"))
-    }
 
     @Test
     fun globalIpv6IsGlobal() {
@@ -87,11 +50,5 @@ class EgressAddressTest {
     fun pickGlobalIpv6ReturnsNullWhenOnlyLinkLocal() {
         assertNull(EgressAddress.pickGlobalIpv6(listOf("fe80::1", "::1")))
         assertNull(EgressAddress.pickGlobalIpv6(emptyList()))
-    }
-
-    @Test
-    fun pickPublicIpv4SkipsCgnat() {
-        assertNull(EgressAddress.pickPublicIpv4(listOf("100.96.34.49", "10.0.0.2")))
-        assertEquals("49.215.1.1", EgressAddress.pickPublicIpv4(listOf("10.0.0.2", "49.215.1.1")))
     }
 }

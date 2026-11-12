@@ -1,6 +1,5 @@
 package com.tokyoxpa3.androidproxy.network
 
-import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 
@@ -17,11 +16,6 @@ object VpnDetector {
      * 它唯一的用途是「措辭」：在已由 `Network.bindSocket` 探測確認無法綁定蜂巢式出口
      * 之後，決定把原因歸給 VPN 還是歸給網路本身。判定邏輯見 [NetworkHealthClassifier]。
      */
-    fun isVpnActive(context: Context): Boolean {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
-        return isVpnActive(cm)
-    }
-
     fun isVpnActive(cm: ConnectivityManager?): Boolean {
         if (cm == null) return false
         return try {

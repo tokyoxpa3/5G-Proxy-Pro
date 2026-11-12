@@ -135,30 +135,6 @@ class PublicIPChecker(
 
     private fun elapsed(startedAt: Long): Long = System.currentTimeMillis() - startedAt
 
-    /** 相容舊介面：只要位址，不要來源與原因。 */
-    suspend fun getPublicIP(network: android.net.Network? = null): String? = probe(network).ip
-
-    suspend fun checkConnectivity(network: android.net.Network? = null): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val url = URL("https://www.google.com")
-            val connection = if (network != null) {
-                network.openConnection(url) as HttpURLConnection
-            } else {
-                url.openConnection() as HttpURLConnection
-            }
-
-            connection.requestMethod = "HEAD"
-            connection.connectTimeout = 5000
-            connection.readTimeout = 5000
-
-            val responseCode = connection.responseCode
-            responseCode == HttpURLConnection.HTTP_OK
-        } catch (e: Exception) {
-            AppLog.w(TAG, "connectivity check failed: ${e.javaClass.simpleName}: ${e.message}")
-            false
-        }
-    }
-
     private fun tryEcho(
         network: Network?,
         endpoint: String,
