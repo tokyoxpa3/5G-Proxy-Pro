@@ -30,15 +30,24 @@ object SelfTest {
         withContext(Dispatchers.IO) {
             val steps = mutableListOf<Step>()
             var socket: Socket? = null
+            // [回報用] 每一步都同時寫進 AppLog：使用者按「複製日誌」時，
+            // 哪一步失敗、失敗訊息是什麼會直接附在回報裡，不必再猜。
+            fun add(step: Step) {
+                steps.add(step)
+                AppLog.i(
+                    "SelfTest",
+                    "${step.kind} ${if (step.pass) "PASS" else "FAIL"}: ${step.detail}"
+                )
+            }
             try {
                 // 0. TCP 連線到 loopback（偵測「proxy 沒在聽」）
                 socket = Socket()
                 socket.soTimeout = TIMEOUT_MS
                 try {
                     socket.connect(InetSocketAddress("127.0.0.1", port), TIMEOUT_MS)
-                    steps.add(Step(StepKind.CONNECT_SOCKET, true, "127.0.0.1:$port"))
+                    add(Step(StepKind.CONNECT_SOCKET, true, "127.0.0.1:$port"))
                 } catch (e: Exception) {
-                    steps.add(Step(StepKind.CONNECT_SOCKET, false, "${e.javaClass.simpleName}: ${e.message}"))
+                    add(Step(StepKind.CONNECT_SOCKET, false, "${e.javaClass.simpleName}: ${e.message}"))
                     return@withContext Result(steps, false)
                 }
 
@@ -55,14 +64,14 @@ object SelfTest {
                     readFully(input, resp)
                     if (!Socks5ClientProtocol.validMethodReply(resp, method)) {
                         val chosen = if (resp.size >= 2) resp[1].toInt() and 0xff else -1
-                        steps.add(Step(StepKind.GREETING, false,
+                        add(Step(StepKind.GREETING, false,
                             "server chose method $chosen, expected $method"))
                         return@withContext Result(steps, false)
                     }
-                    steps.add(Step(StepKind.GREETING, true,
+                    add(Step(StepKind.GREETING, true,
                         if (authEnabled) "auth required" else "no-auth accepted"))
                 } catch (e: Exception) {
-                    steps.add(Step(StepKind.GREETING, false, "${e.javaClass.simpleName}: ${e.message}"))
+                    add(Step(StepKind.GREETING, false, "${e.javaClass.simpleName}: ${e.message}"))
                     return@withContext Result(steps, false)
                 }
 
@@ -74,12 +83,12 @@ object SelfTest {
                         val resp = ByteArray(2)
                         readFully(input, resp)
                         if (!Socks5ClientProtocol.validAuthReply(resp)) {
-                            steps.add(Step(StepKind.AUTH, false, "auth rejected (01 ${resp[1].toInt() and 0xff})"))
+                            add(Step(StepKind.AUTH, false, "auth rejected (01 ${resp[1].toInt() and 0xff})"))
                             return@withContext Result(steps, false)
                         }
-                        steps.add(Step(StepKind.AUTH, true, "credentials accepted"))
+                        add(Step(StepKind.AUTH, true, "credentials accepted"))
                     } catch (e: Exception) {
-                        steps.add(Step(StepKind.AUTH, false, "${e.javaClass.simpleName}: ${e.message}"))
+                        add(Step(StepKind.AUTH, false, "${e.javaClass.simpleName}: ${e.message}"))
                         return@withContext Result(steps, false)
                     }
                 }
@@ -92,11 +101,11 @@ object SelfTest {
                     readFully(input, header)
                     val rep = Socks5ClientProtocol.connectReplyRep(header)
                     if (rep < 0) {
-                        steps.add(Step(StepKind.CONNECT, false, "bad VER ${header[0].toInt() and 0xff}"))
+                        add(Step(StepKind.CONNECT, false, "bad VER ${header[0].toInt() and 0xff}"))
                         return@withContext Result(steps, false)
                     }
                     if (rep != Socks5ClientProtocol.REP_SUCCESS) {
-                        steps.add(Step(StepKind.CONNECT, false, "REP=$rep (${repName(rep)})"))
+                        add(Step(StepKind.CONNECT, false, "REP=$rep (${repName(rep)})"))
                         return@withContext Result(steps, false)
                     }
                     // 依 ATYP 讀掉剩餘的 bind 位址 + port，保持串流對齊
@@ -111,9 +120,9 @@ object SelfTest {
                     }
                     if (addrLen > 0) readFully(input, ByteArray(addrLen))
                     readFully(input, ByteArray(2))
-                    steps.add(Step(StepKind.CONNECT, true, "$TEST_HOST:$TEST_PORT"))
+                    add(Step(StepKind.CONNECT, true, "$TEST_HOST:$TEST_PORT"))
                 } catch (e: Exception) {
-                    steps.add(Step(StepKind.CONNECT, false, "${e.javaClass.simpleName}: ${e.message}"))
+                    add(Step(StepKind.CONNECT, false, "${e.javaClass.simpleName}: ${e.message}"))
                     return@withContext Result(steps, false)
                 }
 
@@ -126,17 +135,17 @@ object SelfTest {
                     val buf = ByteArray(4096)
                     val n = input.read(buf)
                     if (n <= 0) {
-                        steps.add(Step(StepKind.DATA, false, "0 bytes received (connection closed with no data)"))
+                        add(Step(StepKind.DATA, false, "0 bytes received (connection closed with no data)"))
                         return@withContext Result(steps, false)
                     }
                     val head = String(buf, 0, n, Charsets.US_ASCII)
                     if (!head.startsWith("HTTP/")) {
-                        steps.add(Step(StepKind.DATA, false, "$n bytes, unexpected: ${head.take(60)}"))
+                        add(Step(StepKind.DATA, false, "$n bytes, unexpected: ${head.take(60)}"))
                         return@withContext Result(steps, false)
                     }
-                    steps.add(Step(StepKind.DATA, true, "$n bytes received"))
+                    add(Step(StepKind.DATA, true, "$n bytes received"))
                 } catch (e: Exception) {
-                    steps.add(Step(StepKind.DATA, false, "${e.javaClass.simpleName}: ${e.message}"))
+                    add(Step(StepKind.DATA, false, "${e.javaClass.simpleName}: ${e.message}"))
                     return@withContext Result(steps, false)
                 }
 

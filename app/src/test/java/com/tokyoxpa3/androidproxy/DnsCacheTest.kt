@@ -84,8 +84,7 @@ class DnsCacheTest {
     }
 
     @Test
-    fun followerReturnsEmptyWhenLeaderStalls() {
-        // 縮短 follower 等待時間，測試才不會拖 3 秒
+    fun followerReturnsEmptyWhenLeaderStalls() {        // 縮短 follower 等待時間，測試才不會拖 3 秒
         val cache = DnsCache(followerWaitMs = 200)
         val now = 1_000_000L
         val neverResolve = CountDownLatch(1)
@@ -100,5 +99,63 @@ class DnsCacheTest {
         assertTrue(followerResult.isEmpty()) // follower 等 200ms 超時回空
         neverResolve.countDown()
         leader.join(5000)
+    }
+
+    // --- lookupDetailed：回報結果來源（issue #8 用來分辨「真的查了」與「快取命中」） ---
+
+    @Test
+    fun detailedReportsFreshThenCache() {
+        val cache = DnsCache()
+        val now = 1_000_000L
+        val first = cache.lookupDetailed("a.com", now) { listOf(addr("1.2.3.4")) }
+        assertEquals(DnsCache.Source.FRESH, first.source)
+        assertEquals(listOf(addr("1.2.3.4")), first.addresses)
+
+        val second = cache.lookupDetailed("a.com", now + 1000) { listOf(addr("5.6.7.8")) }
+        assertEquals(DnsCache.Source.CACHE, second.source)
+        assertEquals(listOf(addr("1.2.3.4")), second.addresses)
+    }
+
+    @Test
+    fun detailedReportsNegativeForEmptyResultAndNegativeCache() {
+        val cache = DnsCache()
+        val now = 1_000_000L
+        val fresh = cache.lookupDetailed("nx.com", now) { emptyList() }
+        assertEquals(DnsCache.Source.NEGATIVE, fresh.source)
+        assertTrue(fresh.addresses.isEmpty())
+
+        // 負快取命中：仍然標成 NEGATIVE（不是 CACHE），避免被讀成「有效位址」
+        val cached = cache.lookupDetailed("nx.com", now + 1000) { listOf(addr("1.2.3.4")) }
+        assertEquals(DnsCache.Source.NEGATIVE, cached.source)
+        assertTrue(cached.addresses.isEmpty())
+    }
+
+    @Test
+    fun detailedReportsFollower() {
+        val cache = DnsCache()
+        val now = 1_000_000L
+        val resolveStarted = CountDownLatch(1)
+        val releaseResolve = CountDownLatch(1)
+        val leader = Thread {
+            cache.lookupDetailed("a.com", now) {
+                resolveStarted.countDown()
+                releaseResolve.await(5, TimeUnit.SECONDS)
+                listOf(addr("1.2.3.4"))
+            }
+        }
+        leader.start()
+        assertTrue(resolveStarted.await(3, TimeUnit.SECONDS))
+        // 必須由第三條執行緒放行：follower 是阻塞在 in-flight 的 latch 上等 leader，
+        // 若在同一條執行緒裡先 countDown 就永遠測不到 follower 分支。
+        val releaser = Thread {
+            Thread.sleep(150)
+            releaseResolve.countDown()
+        }
+        releaser.start()
+        val follower = cache.lookupDetailed("a.com", now) { listOf(addr("9.9.9.9")) }
+        releaser.join(5000)
+        leader.join(5000)
+        assertEquals(DnsCache.Source.FOLLOWER, follower.source)
+        assertEquals(listOf(addr("1.2.3.4")), follower.addresses)
     }
 }

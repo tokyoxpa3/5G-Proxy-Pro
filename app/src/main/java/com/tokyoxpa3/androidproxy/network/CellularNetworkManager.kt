@@ -6,6 +6,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import com.tokyoxpa3.androidproxy.AppLog
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
@@ -20,15 +21,15 @@ class CellularNetworkManager(private val context: Context) {
             val cm = service as? ConnectivityManager
             if (cm == null) {
                 val errorMsg = "Cannot cast service to ConnectivityManager. Service type: ${service?.javaClass?.name}"
-                android.util.Log.e("CellularNetwork", errorMsg)
+                AppLog.e("CellularNetwork", errorMsg)
                 throw IllegalStateException(errorMsg)
             }
             cm
         } catch (e: ClassCastException) {
-            android.util.Log.e("CellularNetwork", "ClassCastException when getting ConnectivityManager", e)
+            AppLog.e("CellularNetwork", "ClassCastException when getting ConnectivityManager", e)
             throw IllegalStateException("Cannot cast service to ConnectivityManager", e)
         } catch (e: Exception) {
-            android.util.Log.e("CellularNetwork", "Failed to initialize ConnectivityManager", e)
+            AppLog.e("CellularNetwork", "Failed to initialize ConnectivityManager", e)
             throw e
         }
     }
@@ -59,7 +60,7 @@ class CellularNetworkManager(private val context: Context) {
             try {
                 connectivityManager.unregisterNetworkCallback(cb)
             } catch (e: Exception) {
-                android.util.Log.e("CellularNetwork", "Error unregistering network callback", e)
+                AppLog.e("CellularNetwork", "Error unregistering network callback", e)
             }
         }
         
@@ -85,17 +86,17 @@ class CellularNetworkManager(private val context: Context) {
                             cellularNetwork = network
                             resumeOnce(network)
                         } catch (e: Exception) {
-                            android.util.Log.e("CellularNetwork", "Error in onAvailable callback", e)
+                            AppLog.e("CellularNetwork", "Error in onAvailable callback", e)
                         }
                     }
                     
                     override fun onUnavailable() {
                         super.onUnavailable()
-                        android.util.Log.w("CellularNetwork", "Network request unavailable")
+                        AppLog.w("CellularNetwork", "Network request unavailable")
                         try {
                             resumeOnce(null)
                         } catch (e: Exception) {
-                            android.util.Log.e("CellularNetwork", "Error in onUnavailable callback", e)
+                            AppLog.e("CellularNetwork", "Error in onUnavailable callback", e)
                         }
                     }
                 }
@@ -103,7 +104,7 @@ class CellularNetworkManager(private val context: Context) {
                 try {
                     connectivityManager.requestNetwork(networkRequest, callback!!)
                 } catch (e: Exception) {
-                    android.util.Log.e("CellularNetwork", "Failed to request network", e)
+                    AppLog.e("CellularNetwork", "Failed to request network", e)
                     continuation.resumeWithException(e)
                     return@suspendCancellableCoroutine
                 }
@@ -120,7 +121,7 @@ class CellularNetworkManager(private val context: Context) {
         }
         result
     } catch (e: Exception) {
-        android.util.Log.e("CellularNetwork", "Exception in requestCellularNetwork", e)
+        AppLog.e("CellularNetwork", "Exception in requestCellularNetwork", e)
         null
     }
     
@@ -141,13 +142,17 @@ class CellularNetworkManager(private val context: Context) {
                 super.onAvailable(network)
                 try {
                     cellularNetwork = network
+                    // [回報用] 這一行回答「系統眼中的這條蜂巢網路是什麼」：有沒有
+                    // INTERNET、有沒有被 VALIDATED、本地位址是 IPv4 還是 IPv6。
+                    // issue #8 這類「行動數據正常但代理不通」全靠這些欄位分流。
+                    AppLog.i("CellularNetwork", "onAvailable: $network ${describe(network)}")
                     // 記下初始簽章：onAvailable 之後系統通常還會再送一次
                     // onLinkPropertiesChanged，內容相同就不該觸發清理。
                     linkSignature = signatureOf(network)
                     pendingNetworkWaiter?.invoke(network)
                     onAvailable(network)
                 } catch (e: Exception) {
-                    android.util.Log.e("CellularNetwork", "Error in monitor onAvailable", e)
+                    AppLog.e("CellularNetwork", "Error in monitor onAvailable", e)
                 }
             }
 
@@ -166,14 +171,14 @@ class CellularNetworkManager(private val context: Context) {
                     linkSignature = signature
                     // previous == null 代表註冊後的第一次回報（初始值），不是變更。
                     if (previous != null && previous != signature && network == cellularNetwork) {
-                        android.util.Log.w(
+                        AppLog.w(
                             "CellularNetwork",
                             "行動網路位址已變更（$previous → $signature），通知上層清理舊出口"
                         )
                         onLinkChanged()
                     }
                 } catch (e: Exception) {
-                    android.util.Log.e("CellularNetwork", "Error in onLinkPropertiesChanged", e)
+                    AppLog.e("CellularNetwork", "Error in onLinkPropertiesChanged", e)
                 }
             }
 
@@ -181,11 +186,12 @@ class CellularNetworkManager(private val context: Context) {
                 super.onLost(network)
                 try {
                     if (network == cellularNetwork) {
+                        AppLog.w("CellularNetwork", "onLost: $network")
                         cellularNetwork = null
                         onLost()
                     }
                 } catch (e: Exception) {
-                    android.util.Log.e("CellularNetwork", "Error in monitor onLost", e)
+                    AppLog.e("CellularNetwork", "Error in monitor onLost", e)
                 }
             }
         }
@@ -199,7 +205,7 @@ class CellularNetworkManager(private val context: Context) {
             // 形成重建迴圈（實測 5 分鐘內重建 16 次、onLost 時有 163 條連線被切斷）。
             connectivityManager.requestNetwork(cellularRequest(), callback)
         } catch (e: Exception) {
-            android.util.Log.e("CellularNetwork", "Failed to register network monitor", e)
+            AppLog.e("CellularNetwork", "Failed to register network monitor", e)
             monitorCallback = null
         }
     }
@@ -241,7 +247,7 @@ class CellularNetworkManager(private val context: Context) {
                 connectivityManager.unregisterNetworkCallback(cb)
             }
         } catch (e: Exception) {
-            android.util.Log.e("CellularNetwork", "Error unregistering network monitor", e)
+            AppLog.e("CellularNetwork", "Error unregistering network monitor", e)
         }
         monitorCallback = null
         pendingNetworkWaiter = null
@@ -252,6 +258,33 @@ class CellularNetworkManager(private val context: Context) {
         connectivityManager.getLinkProperties(network)?.let { signatureOf(it) }
     } catch (e: Exception) {
         null
+    }
+
+    /**
+     * 一行描述這條網路在系統眼中的狀態，只給 App 內日誌用。
+     *
+     * 刻意包含 `validated` 與 `notRestricted`：Android 只有在「真的連得出去」時才會給
+     * VALIDATED，而 NOT_RESTRICTED 可以抓出「被資料節省模式／管理員政策限制」的網路。
+     * 這兩者搭配本地位址，就足以分辨 issue #8 那種「手機能上網、代理不能」的情況。
+     */
+    private fun describe(network: Network): String = try {
+        val caps = connectivityManager.getNetworkCapabilities(network)
+        val lp = connectivityManager.getLinkProperties(network)
+        val iface = lp?.interfaceName ?: "-"
+        val addrs = lp?.linkAddresses
+            ?.mapNotNull { it.address?.hostAddress }
+            ?.joinToString(",")
+            ?: "-"
+        if (caps == null) {
+            "iface=$iface addrs=$addrs caps=null"
+        } else {
+            "iface=$iface addrs=$addrs" +
+                " internet=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)}" +
+                " validated=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}" +
+                " notRestricted=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)}"
+        }
+    } catch (e: Exception) {
+        "describe failed: ${e.javaClass.simpleName}"
     }
 
     private fun signatureOf(lp: LinkProperties): String = LinkSignature.from(

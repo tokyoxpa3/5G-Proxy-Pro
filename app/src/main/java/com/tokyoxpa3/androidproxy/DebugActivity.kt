@@ -55,7 +55,10 @@ class DebugActivity : Activity() {
     private var pendingNotificationPermission = false
     private val REQUEST_NOTIFICATION_PERMISSION = 1002
     private val networkManager by lazy { CellularNetworkManager(this) }
-    private val ipChecker by lazy { PublicIPChecker() }
+    // 需要 ConnectivityManager 才能讀本機介面上的全域 IPv6（echo/STUN 全失敗時的備援）
+    private val ipChecker by lazy {
+        PublicIPChecker(getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+    }
     // [例外處理] SupervisorJob 讓單一子協程失敗不影響其他；CoroutineExceptionHandler
     // 攔下未捕捉例外並記 log，避免冒到 process 預設 handler 直接崩潰（背景 IP/網路查詢）。
     private val activityScope = CoroutineScope(
@@ -122,7 +125,10 @@ class DebugActivity : Activity() {
     private val ipRefreshRunnable = object : Runnable {
         override fun run() {
             try {
-                val live = Socks5ProxyService.instance?.currentEgressIp()
+                val service = Socks5ProxyService.instance
+                // echo/STUN 都不可用時退回本機 IPv6：issue #8 那種「行動數據正常、
+                // 畫面卻只有 Failed」的情況，至少還有一個出口位址可以回報。
+                val live = service?.currentEgressIp() ?: service?.currentLocalEgressIp()
                 if (live != null && this@DebugActivity::cellularIPText.isInitialized) {
                     val text = getString(R.string.cellular_ip_format, live)
                     if (cellularIPText.text != text) cellularIPText.text = text
@@ -644,6 +650,35 @@ class DebugActivity : Activity() {
             }
             addView(copyDiagnosticsButton)
 
+            // [回報用] 一鍵匯出「App 內日誌 + 本行程 logcat」。存在的理由：回報問題的人
+            // 幾乎不會用 adb，而「Cellular IP: Failed」這種一行訊息完全看不出原因。
+            val copyLogButton = Button(context).apply {
+                text = getString(R.string.btn_copy_log)
+                textSize = 14f
+                setTextColor(0xFF17A2B8.toInt())
+                background = GradientDrawable().apply {
+                    setColor(Color.WHITE)
+                    cornerRadius = 12f
+                    setStroke(2, 0xFF17A2B8.toInt())
+                }
+                setPadding(0, 24, 0, 24)
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = 12
+                }
+                setOnClickListener { copyLog() }
+            }
+            addView(copyLogButton)
+
+            addView(TextView(context).apply {
+                text = getString(R.string.log_hint)
+                textSize = 12f
+                setTextColor(0xFF868E96.toInt())
+                setPadding(0, 8, 0, 0)
+            })
+
             selfTestResultText = TextView(context).apply {
                 textSize = 14f
                 setTextColor(0xFF495057.toInt())
@@ -923,6 +958,34 @@ class DebugActivity : Activity() {
         Toast.makeText(this, getString(R.string.diagnostics_copied), Toast.LENGTH_SHORT).show()
     }
 
+    /**
+     * 匯出「App 內環形緩衝 + 本行程 logcat」到剪貼簿。
+     *
+     * 這是 `adb logcat -s PublicIPChecker CellularNetwork Socks5ProxyService` 的 App 內
+     * 替代品：使用者不必裝 platform-tools，貼到 issue 就等於把 logcat 帶過來。
+     * 組字串（含 logcat 子行程）放到 IO 執行緒，避免最長 2.5 秒的等待卡住 UI。
+     */
+    private fun copyLog() {
+        activityScope.launch {
+            val text = withContext(Dispatchers.IO) { LogExporter.build() }
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("5G Proxy Pro log", text))
+            val lines = text.count { it == '\n' } + 1
+            Toast.makeText(
+                this@DebugActivity,
+                getString(R.string.log_copied, lines),
+                Toast.LENGTH_SHORT
+            ).show()
+            // 摘要寫進 logcat：萬一使用者說「複製了但貼出來是空的」，
+            // 這一行能區分「匯出真的空」與「剪貼簿被系統攔掉」；
+            // logcat_lines=-1 則代表這台 ROM 不讓 App 讀 logcat，只剩 AppLog 那份。
+            AppLog.i(
+                "LogExport",
+                "copied $lines lines, ${text.length} chars, logcat_lines=${LogExporter.lastLogcatLines}"
+            )
+        }
+    }
+
     private fun buildDiagnosticsReport(): String {
         val sb = StringBuilder()
         sb.append("===== ").append(getString(R.string.diagnostics_title)).append(" =====\n")
@@ -948,6 +1011,9 @@ class DebugActivity : Activity() {
         sb.append("Status: ").append(statusName).append("\n")
         sb.append("Restarts: ").append(Socks5ProxyService.restartCount).append("\n")
         Socks5ProxyService.lastHealthCheck?.let { sb.append("LastHealthCheck: ").append(it).append("\n") }
+        // 健康探測失敗的「原因」：端點名稱 + 例外型別 + 耗時。只有 FAILED (3/3)
+        // 分不出「三個端點都被地區封鎖」與「真的收不到位元組」（issue #8）。
+        Socks5ProxyService.lastHealthProbeDetail?.let { sb.append("HealthProbe: ").append(it).append("\n") }
         Socks5ProxyService.lastErrorMessage?.let { sb.append("LastError: ").append(it).append("\n") }
 
         val port = portInput.text.toString().toIntOrNull() ?: 1080
@@ -964,6 +1030,11 @@ class DebugActivity : Activity() {
         sb.append(hotspotIPText.text).append("\n")
         sb.append(usbTetherIPText.text).append("\n")
         sb.append(cellularIPText.text).append("\n")
+        // 出口探測摘要：位址 / 走哪一層（STUN 或 echo）/ 耗時。issue #8 這類
+        // 「IP 顯示 Failed」的報告，一眼就能看出是哪一層掛掉、花了多久。
+        Socks5ProxyService.instance?.currentProbeSummary()?.let {
+            sb.append("EgressProbe: ").append(it).append("\n")
+        }
 
         sb.append("NativeStats: ").append(NativeEngine.safeGetStats()).append("\n")
         // [非同步解析] UDP 網域解析計數。drop/qfull/jobfull/lost 只要非 0，
@@ -983,6 +1054,15 @@ class DebugActivity : Activity() {
             }
         } catch (e: Exception) {
             sb.append("\nengine_stats.log: unreadable (").append(e.message).append(")\n")
+        }
+
+        // [回報用] 附上最近 200 行 App 內日誌。使用者按「複製診斷報告」時，
+        // 失敗原因（探測端點、健康狀態、自檢步驟）會跟著一起過來，不必再多按一次。
+        // 只取 tail：完整日誌另外由「複製日誌」提供，避免這段無限膨脹。
+        val logTail = AppLog.tail(200)
+        if (logTail.isNotBlank()) {
+            sb.append("\n----- app log (tail 200) -----\n")
+            sb.append(logTail).append("\n")
         }
 
         return sb.toString()
@@ -1037,8 +1117,12 @@ class DebugActivity : Activity() {
                 }
 
                 if (cellularNetwork != null) {
-                    val publicIP = ipChecker.getPublicIP(cellularNetwork)
-                    cellularIPText.text = getString(R.string.cellular_ip_format, publicIP ?: getString(R.string.cellular_ip_failed))
+                    // 三層探測（本機 IPv6 → STUN → HTTPS echo），失敗時 detail 會進 AppLog
+                    val result = ipChecker.probe(cellularNetwork)
+                    cellularIPText.text = getString(
+                        R.string.cellular_ip_format,
+                        result.ip ?: getString(R.string.cellular_ip_failed)
+                    )
                 } else {
                     cellularIPText.text = getString(R.string.cellular_ip_not_locked)
                 }

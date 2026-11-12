@@ -19,6 +19,23 @@ class DnsCache(
 ) {
     private class Entry(val addresses: List<InetAddress>, val expiresAt: Long)
 
+    /** 這次查詢的結果是從哪裡來的（診斷用，不影響快取行為）。 */
+    enum class Source {
+        /** 正快取命中，沒有發出查詢。 */
+        CACHE,
+
+        /** 真的發出了查詢（leader）。 */
+        FRESH,
+
+        /** 併發等待別人查完後讀快取。 */
+        FOLLOWER,
+
+        /** 沒有任何位址：可能是負快取命中，或 leader 查詢失敗。 */
+        NEGATIVE,
+    }
+
+    data class Lookup(val addresses: List<InetAddress>, val source: Source)
+
     private val cache = ConcurrentHashMap<String, Entry>()
     private val inFlight = ConcurrentHashMap<String, CountDownLatch>()
 
@@ -29,9 +46,28 @@ class DnsCache(
      * @param nowMs 目前時間（毫秒）。由呼叫端注入，便於測試控制 TTL。
      * @param resolve 僅 leader 呼叫的實際查詢；回傳解析結果（空清單＝負快取）。
      */
-    fun lookup(key: String, nowMs: Long, resolve: () -> List<InetAddress>): List<InetAddress> {
+    fun lookup(key: String, nowMs: Long, resolve: () -> List<InetAddress>): List<InetAddress> =
+        lookupDetailed(key, nowMs, resolve).addresses
+
+    /**
+     * 與 [lookup] 相同，但額外回報結果來源。
+     *
+     * 為什麼需要：issue #8 那台機器「可 bind、可握手、卻收不到位元組」，此時
+     * 「DNS 到底有沒有真的查成功」是判斷資料平面是否活著的關鍵證據 —— 但快取
+     * 命中會讓呼叫端誤以為剛才有一次成功的查詢。把來源分開才不會讀錯。
+     */
+    fun lookupDetailed(
+        key: String,
+        nowMs: Long,
+        resolve: () -> List<InetAddress>
+    ): Lookup {
         val hit = cache[key]
-        if (hit != null && hit.expiresAt > nowMs) return hit.addresses
+        if (hit != null && hit.expiresAt > nowMs) {
+            return Lookup(
+                hit.addresses,
+                if (hit.addresses.isEmpty()) Source.NEGATIVE else Source.CACHE
+            )
+        }
 
         val leaderLatch = CountDownLatch(1)
         val existing = inFlight.putIfAbsent(key, leaderLatch)
@@ -41,12 +77,20 @@ class DnsCache(
             // 直接把過期位址回給呼叫端會讓新連線指向已失效的 IP。
             try { existing.await(followerWaitMs, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) {}
             val followerHit = cache[key]
-            return if (followerHit != null && followerHit.expiresAt > nowMs) followerHit.addresses else emptyList()
+            return if (followerHit != null && followerHit.expiresAt > nowMs) {
+                Lookup(followerHit.addresses, Source.FOLLOWER)
+            } else {
+                Lookup(emptyList(), Source.NEGATIVE)
+            }
         }
         try {
             if (cache.size >= maxEntries) cache.clear()
             val addresses = resolve()
-            return put(key, nowMs, addresses)
+            put(key, nowMs, addresses)
+            return Lookup(
+                addresses,
+                if (addresses.isEmpty()) Source.NEGATIVE else Source.FRESH
+            )
         } finally {
             inFlight.remove(key, leaderLatch)
             leaderLatch.countDown()

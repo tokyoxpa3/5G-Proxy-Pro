@@ -53,3 +53,4 @@ AGENTS.md
 .test-artifacts/
 docs/pr-6-*.md
 docs/pr-ci-body.md
+docs/issue-*-reply*.md

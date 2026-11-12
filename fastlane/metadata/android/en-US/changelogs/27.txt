@@ -1,0 +1,6 @@
+- New: "Copy Log" in the diagnostics card. The app keeps a 1500-line rolling buffer and merges it with its own logcat, so a full report can be pasted without adb
+- New: egress IP probing now tries STUN first (a single ~100 byte UDP round trip) and falls back to the HTTPS echo. Much less mobile data, and it still answers within a fraction of a second on a healthy network
+- New: the cellular network callback now logs the interface, addresses and the internet / validated / notRestricted capabilities, and DNS records real lookups with their timing. That is enough to tell "no network" apart from "network present but no payload"
+- New: the health check reports why it failed (endpoint, exception, elapsed), so "FAILED (3/3)" is no longer ambiguous
+- Fixed: when the cellular network could be bound and completed a TCP handshake but no application data came back, the watchdog rebuilt the proxy every ~45 seconds. That dropped every in-flight connection and never fixed anything. Rebuilds are now capped at 2, after which the app reports the stalled state instead of thrashing
+- Fixed: the health check could spend up to 18 seconds per round (three endpoints x two 3-second timeouts), longer than its own 15-second interval. It now runs on an 8-second budget

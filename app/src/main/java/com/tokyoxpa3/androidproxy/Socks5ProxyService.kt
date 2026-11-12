@@ -56,7 +56,29 @@ class Socks5ProxyService : Service() {
     @Volatile private var lastAutoEgressResetAt = 0L
     /** 上次探測到的公網出口 IP；null 代表還沒建立基線（首次只記錄、不觸發）。 */
     @Volatile private var lastEgressIp: String? = null
-    private val publicIpChecker = PublicIPChecker()
+    /** [lastEgressIp] 是誰說的（ECHO / STUN）。 */
+    @Volatile private var lastEgressSource: PublicIPChecker.Source? = null
+    /**
+     * 各來源各自的上次值。
+     *
+     * 不能只留一個 `lastEgressIp`：echo 走 TCP、STUN 走 UDP，兩者可能落在不同 NAT 池，
+     * 值本來就不同。共用一個欄位會讓「echo 失敗一次 → STUN 覆寫 → echo 恢復」把
+     * 真正的 IPv4 出口變更蓋掉，變成漏判。
+     */
+    @Volatile private var lastEchoIp: String? = null
+    @Volatile private var lastStunIp: String? = null
+    /** echo/STUN 都不可用時的本機 IPv6 出口。僅供顯示，不參與比對。 */
+    @Volatile private var lastLocalEgressIp: String? = null
+    /** 連續探測失敗次數；達到門檻代表進入「盲區」。 */
+    @Volatile private var consecutiveProbeFailures = 0
+    /** 進入盲區的時間點（0 代表不在盲區），用來判斷恢復時要不要保守清理。 */
+    @Volatile private var egressProbeStaleSince = 0L
+    /** 上次用 echo 校正 TCP 出口的時間。0 代表啟動後還沒校正過（第一次一定走 echo）。 */
+    @Volatile private var lastEchoCalibrationAt = 0L
+    /** 最近一次探測的摘要（位址 / 來源 / 耗時），供診斷報告顯示。 */
+    @Volatile private var lastProbeSummary: String? = null
+    // 需要 ConnectivityManager 才能讀本機介面上的全域 IPv6（探測的第三層備援）
+    private val publicIpChecker by lazy { PublicIPChecker(connectivityManager) }
     // [LAN 監聽重建] 最後一次送給 native 引擎的 LAN 綁定位址集合。用來判斷介面位址
     // 是否真的變了 —— 位址沒變時不重送，避免無謂地動 listener（同一位址的介面
     // 「關掉再開」由 native 每秒對帳自行修復，不需要 Java 插手）。
@@ -116,9 +138,22 @@ class Socks5ProxyService : Service() {
         // 不查 DNS、不進快取 —— 與 v1.5 getAllByName 的字面值行為一致
         IpLiteral.parse(host)?.let { return listOf(it) }
         val key = host.lowercase()
-        return dnsCache.lookup(key, System.currentTimeMillis()) {
+        val startedAt = System.currentTimeMillis()
+        val result = dnsCache.lookupDetailed(key, startedAt) {
             doResolve(network, host)
         }
+        // [issue #8] 只有「真的發了查詢」才寫一行：這一行的存在就等於證明
+        // 「這個網路上小封包（UDP DNS）還通」。快取命中刻意不記，否則會把
+        // 1500 行的緩衝沖掉，而快取命中本來也不代表網路現在還能用。
+        val elapsed = System.currentTimeMillis() - startedAt
+        when (result.source) {
+            DnsCache.Source.FRESH ->
+                AppLog.i("Dns", "fresh $host -> ${result.addresses.size} addr ${elapsed}ms")
+            DnsCache.Source.NEGATIVE ->
+                AppLog.w("Dns", "failed $host ${elapsed}ms（負快取 3 秒）")
+            else -> Unit
+        }
+        return result.addresses
     }
 
     /** 實際 DNS 查詢（僅在快取未命中時由 single-flight 的 leader 呼叫） */
@@ -264,6 +299,41 @@ class Socks5ProxyService : Service() {
         /** 閒置（沒有活躍連線）時的探測間隔：降到 30 秒省流量與電量。 */
         private const val EGRESS_PROBE_IDLE_MS = 30_000L
 
+        /**
+         * 連續失敗幾次才視為「探測盲區」。
+         *
+         * 3 次約 45–90 秒：足以濾掉單次抖動（換 IP 當下 echo 幾乎必然失敗一次），
+         * 又不會長到讓盲區期間的變更完全沒被記錄。
+         */
+        private const val EGRESS_PROBE_STALE_AFTER = 3
+
+        /**
+         * 每隔多久用 echo 校正一次真正的 TCP 出口。
+         *
+         * STUN 是常態探測（一個 UDP 往返、約 100 bytes），但它走 UDP，與代理實際
+         * 使用的 TCP 出口不一定落在同一個 NAT 池。實測這家電信商兩者相同
+         * （`49.215.88.137`），但不能假設所有電信商都這樣，所以仍定期用 echo 確認。
+         */
+        private const val ECHO_CALIBRATION_INTERVAL_MS = 5 * 60 * 1000L
+
+        /**
+         * 「可 bind 但沒有資料回流」時最多重建幾次。
+         *
+         * 這種狀態（[NetworkHealthStatus.CELLULAR_STALLED]）的問題在下游資料平面，
+         * 重建 native 引擎不會改變它，卻會把每一條在途連線砍掉。給 2 次是為了保留
+         * 「Network 物件其實已經換了、只是回呼沒到」這種罕見情況的自癒能力；
+         * 超過就停手並回報，避免變成每 45 秒一次的無限斷線迴圈（issue #8 實測 4 次）。
+         */
+        private const val MAX_STALLED_RESTARTS = 2
+
+        /**
+         * 一次健康檢查的總預算。
+         *
+         * 三個端點各自 3 秒連線 + 3 秒讀取，最壞會拖 18 秒 —— 比 15 秒的檢查週期
+         * 還長，迴圈會變成幾乎連續探測。資料平面卡住時尤其明顯，所以設總上限。
+         */
+        private const val HEALTH_PROBE_BUDGET_MS = 8_000L
+
         @Volatile var isServiceRunning = false
 
         /**
@@ -280,6 +350,14 @@ class Socks5ProxyService : Service() {
         // 這兩個值補上該脈絡，讓使用者複製的報告能直接看出「代理一直在重啟」。
         @Volatile var restartCount = 0
         @Volatile var lastHealthCheck: String? = null
+        /**
+         * 上一次健康探測的失敗摘要（端點 + 例外型別 + 耗時）。
+         *
+         * issue #8 的痛點：`FAILED (3/3)` 只說「失敗」，看不出是三個探測端點被地區
+         * 封鎖（假陰性）還是真的收不到位元組 —— 這兩者的處置完全相反。這個字串
+         * 會附在診斷報告裡，讓下一份回報不需要再猜。
+         */
+        @Volatile var lastHealthProbeDetail: String? = null
         @Volatile var onStatusChanged: ((ProxyStatus) -> Unit)? = null
 
         // 允許監聽的 LAN 介面前綴（Wi-Fi / 熱點 / USB 分享 / 乙太網路 / 藍牙 PAN）。
@@ -408,6 +486,14 @@ class Socks5ProxyService : Service() {
                 isProxyRunning = true
                 // 每次啟動都重新建立出口 IP 基線：首次探測只記錄，不觸發清理。
                 lastEgressIp = null
+                lastEgressSource = null
+                lastEchoIp = null
+                lastStunIp = null
+                lastLocalEgressIp = null
+                consecutiveProbeFailures = 0
+                egressProbeStaleSince = 0L
+                lastEchoCalibrationAt = 0L
+                lastProbeSummary = null
                 // [重建迴圈修復] 先開始長期請求並監控：startMonitoring 用 requestNetwork
                 // 把蜂巢式 PDN 在服務期間 pin 住，避免「一次性 request 拿到就放掉」造成
                 // PDN 被系統收回 → onLost → 重建的自激迴圈。設定後再等目前可用的網路。
@@ -421,6 +507,7 @@ class Socks5ProxyService : Service() {
                 val network = networkManager.currentNetwork()
                 if (network == null) { failStop(getString(R.string.error_cellular_unavailable)); return@launch }
                 cellularNetwork = network
+                AppLog.i(TAG, "start: port=$port egress=$network")
 
                 // [VPN 判定改為實測] 舊版只要「系統裡存在任何 VPN 網路」就拒絕啟動。
                 // 但 VPN 存在 ≠ 它接管了本 App 的路由：per-app VPN（split tunneling）
@@ -467,6 +554,7 @@ class Socks5ProxyService : Service() {
                     return@launch
                 }
                 Log.i(TAG, "SOCKS5 listener bind addresses: ${bindAddrs.joinToString()}")
+                AppLog.i(TAG, "listener bind: ${bindAddrs.joinToString()}")
                 lanBindAddrs = bindAddrs.toSet()
                 val startResult = NativeEngine.startSocks5Server(port, bindAddrs)
                 if (startResult != "Started") {
@@ -483,6 +571,13 @@ class Socks5ProxyService : Service() {
                 loopsJob = serviceScope.launch {
                     launch {
                         var consecutiveFailures = 0
+                        // [issue #8] 「bind 成功但沒有資料回流」的獨立計數：這種情況
+                        // 重建引擎修不了，只會砍掉在途連線，所以要設上限、之後停手。
+                        var stalledRestarts = 0
+                        var stallNotified = false
+                        // [回報用] 只在狀態「變化」時寫一行：健康檢查每 15 秒跑一次，
+                        // 每次都寫會把 1500 行的緩衝沖掉，反而看不到真正的事件。
+                        var lastHealthState: NetworkHealthStatus? = null
                         var lastRxBytes = NativeEngine.safeGetTrafficBytes()?.getOrNull(1) ?: 0L
                         while (isProxyRunning) {
                             delay(15000)
@@ -495,6 +590,10 @@ class Socks5ProxyService : Service() {
                             lastRxBytes = rxBytes
                             if (trafficFlowing) {
                                 consecutiveFailures = 0
+                                // 真的有位元組在進來 → 資料平面沒問題，卡住的計數歸零，
+                                // 下次真的卡住時才有重建額度可用。
+                                stalledRestarts = 0
+                                stallNotified = false
                                 lastHealthCheck = "OK (traffic)"
                                 continue
                             }
@@ -503,9 +602,20 @@ class Socks5ProxyService : Service() {
                                 lastHealthCheck = "WAITING_NETWORK"
                                 continue
                             }
-                            when (checkNetworkHealth(currentNetwork)) {
+                            when (checkNetworkHealth(currentNetwork).also { health ->
+                                if (health != lastHealthState) {
+                                    AppLog.w(
+                                        TAG,
+                                        "health: ${lastHealthState?.name ?: "-"} -> ${health.name} " +
+                                            "egress=$currentNetwork probe=${lastHealthProbeDetail ?: "-"}"
+                                    )
+                                    lastHealthState = health
+                                }
+                            }) {
                                 NetworkHealthStatus.OK -> {
                                     consecutiveFailures = 0
+                                    stalledRestarts = 0
+                                    stallNotified = false
                                     lastHealthCheck = "OK"
                                 }
                                 NetworkHealthStatus.BLOCKED_BY_VPN -> {
@@ -516,16 +626,60 @@ class Socks5ProxyService : Service() {
                                     // 的完整條件；缺任何一項都會落到 NETWORK_DEAD 走重建。
                                     consecutiveFailures = 0
                                     lastHealthCheck = "BLOCKED_BY_VPN"
-                                    Log.w(TAG, "健康檢查判定為被 VPN 阻擋（蜂巢式出口 bind 被拒且網路仍有效）；跳過自動重啟，請將本 App 排除在 VPN 之外")
+                                    AppLog.w(TAG, "健康檢查判定為被 VPN 阻擋（蜂巢式出口 bind 被拒且網路仍有效）；跳過自動重啟，請將本 App 排除在 VPN 之外")
                                     val nm = getSystemService(NotificationManager::class.java)
                                     nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.status_proxy_running), getString(R.string.notification_vpn_warning)))
+                                }
+                                NetworkHealthStatus.CELLULAR_STALLED -> {
+                                    // [issue #8] bind 成功、但連 HTTP 探測都收不到位元組。
+                                    // 問題在下游資料平面，重建 native 引擎不會改變它，卻會把
+                                    // 每一條在途連線砍掉 —— 所以只給有限次數，之後停手。
+                                    consecutiveFailures++
+                                    lastHealthCheck =
+                                        "STALLED (${consecutiveFailures}/3, no payload)"
+                                    AppLog.w(
+                                        TAG,
+                                        "蜂巢可 bind 但沒有資料回流 (${consecutiveFailures}/3)，" +
+                                            "已重建 $stalledRestarts/$MAX_STALLED_RESTARTS 次"
+                                    )
+                                    if (consecutiveFailures >= 3) {
+                                        consecutiveFailures = 0
+                                        if (stalledRestarts < MAX_STALLED_RESTARTS) {
+                                            stalledRestarts++
+                                            AppLog.w(
+                                                TAG,
+                                                "資料平面卡住，第 $stalledRestarts/$MAX_STALLED_RESTARTS 次重建代理"
+                                            )
+                                            restartProxy(port)
+                                            break
+                                        } else if (!stallNotified) {
+                                            // 重建額度用完：再重建只會製造斷線。明確告訴使用者
+                                            // 問題在行動數據本身，而不是讓它靜靜地重啟。
+                                            stallNotified = true
+                                            lastHealthCheck =
+                                                "STALLED (no payload, $MAX_STALLED_RESTARTS rebuilds exhausted)"
+                                            AppLog.e(
+                                                TAG,
+                                                "已重建 $MAX_STALLED_RESTARTS 次仍無資料回流；停止自動重建。" +
+                                                    "此症狀代表行動網路可 bind、可握手，但收不到應用層資料"
+                                            )
+                                            val nm = getSystemService(NotificationManager::class.java)
+                                            nm.notify(
+                                                NOTIFICATION_ID,
+                                                createNotification(
+                                                    getString(R.string.status_proxy_running),
+                                                    getString(R.string.notification_cellular_stalled)
+                                                )
+                                            )
+                                        }
+                                    }
                                 }
                                 NetworkHealthStatus.NETWORK_DEAD -> {
                                     consecutiveFailures++
                                     lastHealthCheck = "FAILED (${consecutiveFailures}/3)"
-                                    Log.w(TAG, "5G 網路健康檢查失敗 (${consecutiveFailures}/3)，準備自動重建...")
+                                    AppLog.w(TAG, "5G 網路健康檢查失敗 (${consecutiveFailures}/3)，準備自動重建...")
                                     if (consecutiveFailures >= 3) {
-                                        Log.w(TAG, "5G 網路連續異常，自動重建代理連線...")
+                                        AppLog.w(TAG, "5G 網路連續異常，自動重建代理連線...")
                                         restartProxy(port)
                                         break
                                     }
@@ -539,7 +693,7 @@ class Socks5ProxyService : Service() {
                             delay(10000)
                             if (stopRequested || !isProxyRunning) break
                             if (NativeEngine.isLibraryLoaded() && !isNativeThreadAlive() && !isRestarting && !engineStarting) {
-                                Log.e(TAG, "偵測到 Native 引擎異常停止，嘗試重啟...")
+                                AppLog.e(TAG, "偵測到 Native 引擎異常停止，嘗試重啟...")
                                 restartProxy(port)
                                 break
                             }
@@ -585,16 +739,14 @@ class Socks5ProxyService : Service() {
                             // 先記時間再探測：探測失敗也等一個間隔，不要每 5 秒重打。
                             lastProbeAt = now
                             val net = cellularNetwork ?: continue
-                            val ip = publicIpChecker.getPublicIP(net) ?: continue
-                            val previous = lastEgressIp
-                            lastEgressIp = ip
-                            if (previous == null) {
-                                // 基線只記錄不觸發：啟動當下不該清掉任何連線。
-                                Log.i(TAG, "出口 IP 基線: $ip（之後每 ${EGRESS_PROBE_INTERVAL_MS / 1000}s 比對）")
-                            } else if (previous != ip) {
-                                Log.w(TAG, "出口 IP 已變更（$previous → $ip），清理綁在舊出口的連線")
-                                resetStaleConnections("egress_ip_changed")
+                            // 常態走 STUN（便宜），每 5 分鐘用 echo 校正一次 TCP 出口
+                            val forceEcho =
+                                now - lastEchoCalibrationAt >= ECHO_CALIBRATION_INTERVAL_MS
+                            val result = publicIpChecker.probe(net, forceEcho)
+                            if (result.source == PublicIPChecker.Source.ECHO) {
+                                lastEchoCalibrationAt = now
                             }
+                            handleEgressProbe(result)
                         }
                     }
 
@@ -766,6 +918,110 @@ class Socks5ProxyService : Service() {
     fun currentEgressIp(): String? = lastEgressIp
 
     /**
+     * echo 與 STUN 都不可用時，本機介面上的全域 IPv6。
+     *
+     * 這不是公網 echo 值（來源不同，見 [PublicIPChecker.Source]），所以只用來讓 UI
+     * 在「Cellular IP: Failed」時還能顯示一點有意義的資訊 —— 至少能看出網路是活的、
+     * 出口位址是什麼。
+     */
+    fun currentLocalEgressIp(): String? = lastLocalEgressIp
+
+    /** 最近一次出口探測的摘要：`位址 [來源] 耗時`，供診斷報告使用。 */
+    fun currentProbeSummary(): String? = lastProbeSummary
+
+    /**
+     * 出口探測結果的狀態機。
+     *
+     * 三件事必須分開處理，混在一起就會互相污染：
+     *
+     *  - **探測失敗 ≠ 出口變更**：失敗只累計，絕不清連線。把「問不到」當成「換了」
+     *    會在使用者網路不穩時反覆砍掉正在跑的下載。
+     *  - **來源不同 ≠ 同一個量**：STUN 的 UDP 映射與 echo 的 TCP 出口可能落在不同
+     *    NAT 池，所以兩者各自保存上次值、各自比對（見 [lastEchoIp] / [lastStunIp]）。
+     *    共用一個欄位會讓其中一方把另一方的變更蓋掉。
+     *  - **盲區恢復**：連續失敗達到門檻後，若恢復時仍沒有基線（啟動後從未成功），
+     *    就無法證明出口沒變 → 保守清理一次，避免連線卡在黑洞裡等 300 秒逾時。
+     */
+    private fun handleEgressProbe(result: PublicIPChecker.Result) {
+        // 只留摘要、不逐次寫 log：探測每 15~30 秒一次，寫進環形緩衝會把其他訊息沖掉。
+        // 診斷報告會讀這個值，能直接看出目前走哪一層、花多久。
+        lastProbeSummary = "${result.ip ?: "fail"} [${result.source}] ${result.elapsedMs}ms"
+
+        val ip = result.ip
+        if (ip == null) {
+            consecutiveProbeFailures++
+            if (consecutiveProbeFailures == EGRESS_PROBE_STALE_AFTER) {
+                egressProbeStaleSince = System.currentTimeMillis()
+                AppLog.w(
+                    TAG,
+                    "出口探測連續失敗 $consecutiveProbeFailures 次，進入盲區：${result.detail}"
+                )
+            }
+            return
+        }
+
+        val recoveredFromStale = egressProbeStaleSince != 0L
+
+        // 本機 IPv6 只在 echo/STUN 全掛時出現。它代表「介面出口」，與公網 echo 值
+        // 不是同一個量，寫進 lastEgressIp 會製造假變更 → 只記下來給 UI 用。
+        if (result.source == PublicIPChecker.Source.LOCAL_IPV6) {
+            if (lastLocalEgressIp != ip) {
+                AppLog.i(TAG, "本機 IPv6 出口: $ip（echo/STUN 不可用，僅供顯示）")
+                lastLocalEgressIp = ip
+            }
+            // 刻意不清 consecutiveProbeFailures / egressProbeStaleSince：
+            // 這不算探測成功，盲區還沒結束。
+            return
+        }
+
+        val staleForSeconds =
+            if (recoveredFromStale) (System.currentTimeMillis() - egressProbeStaleSince) / 1000 else 0
+        consecutiveProbeFailures = 0
+        egressProbeStaleSince = 0L
+
+        val previous = when (result.source) {
+            PublicIPChecker.Source.ECHO -> lastEchoIp
+            PublicIPChecker.Source.STUN -> lastStunIp
+            else -> null
+        }
+        when (result.source) {
+            PublicIPChecker.Source.ECHO -> lastEchoIp = ip
+            PublicIPChecker.Source.STUN -> lastStunIp = ip
+            else -> Unit
+        }
+        lastEgressIp = ip
+        lastEgressSource = result.source
+
+        when {
+            previous == null && recoveredFromStale -> {
+                // 啟動後從未建立基線，又經歷過一段盲區：那段時間的出口變更
+                // 我們完全沒看到，只能保守清一次讓連線重建。
+                AppLog.w(
+                    TAG,
+                    "出口探測從盲區恢復（盲區 ${staleForSeconds}s，現值 $ip [${result.source}]），" +
+                        "期間無基線可比對 → 保守清理連線"
+                )
+                resetStaleConnections("egress_probe_recovered")
+            }
+            previous == null -> {
+                // 基線只記錄不觸發：啟動當下不該清掉任何連線。
+                AppLog.i(
+                    TAG,
+                    "出口 IP 基線: $ip [${result.source}] ${result.elapsedMs}ms" +
+                        "（之後每 ${EGRESS_PROBE_INTERVAL_MS / 1000}s 比對）"
+                )
+            }
+            previous != ip -> {
+                AppLog.w(
+                    TAG,
+                    "出口 IP 已變更（$previous → $ip [${result.source}]），清理綁在舊出口的連線"
+                )
+                resetStaleConnections("egress_ip_changed")
+            }
+        }
+    }
+
+    /**
      * 切斷所有進行中的 TCP 出口連線，讓客戶端改用新的行動網路出口重連。
      *
      * ## 為什麼是 shutdown，不是 close
@@ -892,21 +1148,43 @@ class Socks5ProxyService : Service() {
         )
     }
 
-    /** 依序嘗試健康檢查端點，任一成功即視為通過。 */
+    /**
+     * 依序嘗試健康檢查端點，任一成功即視為通過。
+     *
+     * 有總預算（[HEALTH_PROBE_BUDGET_MS]）：三個端點各自 3 秒連線 + 3 秒讀取，
+     * 最壞會拖 18 秒，比 15 秒的檢查週期還長。資料平面卡住時（issue #8）每一輪
+     * 都會走滿最壞情況，迴圈因此退化成幾乎連續探測。
+     *
+     * 失敗原因寫進 [lastHealthProbeDetail]：`FAILED (3/3)` 本身分不出「三個端點
+     * 被地區封鎖」與「真的收不到位元組」，而這兩者的處置完全相反。
+     */
     private fun healthProbeSucceeds(network: android.net.Network): Boolean {
+        val startedAt = System.currentTimeMillis()
+        val deadline = startedAt + HEALTH_PROBE_BUDGET_MS
+        val failures = StringBuilder()
         for (url in healthCheckUrls) {
-            val ok = try {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) {
+                failures.append("budget-exhausted; ")
+                break
+            }
+            val timeout = remaining.coerceAtMost(3000L).toInt()
+            val host = url.substringAfter("//").substringBefore("/")
+            try {
                 network.openConnection(java.net.URL(url)).apply {
-                    connectTimeout = 3000
-                    readTimeout = 3000
+                    connectTimeout = timeout
+                    readTimeout = timeout
                     inputStream.use { it.read() }
                 }
-                true
+                lastHealthProbeDetail =
+                    "ok $host ${System.currentTimeMillis() - startedAt}ms"
+                return true
             } catch (e: Exception) {
-                false
+                failures.append("$host=${e.javaClass.simpleName}; ")
             }
-            if (ok) return true
         }
+        lastHealthProbeDetail =
+            "fail ${System.currentTimeMillis() - startedAt}ms: ${failures.toString().trim()}"
         return false
     }
     

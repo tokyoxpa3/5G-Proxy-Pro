@@ -67,12 +67,35 @@ class NetworkHealthClassifierTest {
         )
     }
 
-    /** bind 過得去 → 出口可用，探測端點全失敗代表上游真的壞了，必須可重建。 */
+    /**
+     * bind 過得去、但探測收不到位元組 → CELLULAR_STALLED，不是 NETWORK_DEAD。
+     *
+     * 這一格以前回 NETWORK_DEAD，於是 watchdog 每 45 秒重建一次代理。issue #8
+     * 的實機（Galaxy S23 / One UI 9）就是這種：bind 成功、TCP 握手成功、DNS 也
+     * 解析得出來，但應用層資料完全回不來 —— 重建引擎修不了，只會砍掉在途連線。
+     */
     @Test
-    fun bindOkButProbesFailedIsNetworkDeadEvenWithVpn() {
+    fun bindOkButProbesFailedIsCellularStalled() {
+        assertEquals(
+            NetworkHealthStatus.CELLULAR_STALLED,
+            classify(bindOk = true, vpnActive = true, probeOk = false)
+        )
+    }
+
+    @Test
+    fun bindOkButProbesFailedIsCellularStalledWithoutVpnToo() {
+        assertEquals(
+            NetworkHealthStatus.CELLULAR_STALLED,
+            classify(bindOk = true, vpnActive = false, probeOk = false)
+        )
+    }
+
+    /** 真正的斷線（連 bind 都不行）仍然要落在 NETWORK_DEAD，不能被新狀態吃掉。 */
+    @Test
+    fun bindFailureStillIsNetworkDead() {
         assertEquals(
             NetworkHealthStatus.NETWORK_DEAD,
-            classify(bindOk = true, vpnActive = true, probeOk = false)
+            classify(bindOk = false, vpnActive = false, probeOk = false)
         )
     }
 }
