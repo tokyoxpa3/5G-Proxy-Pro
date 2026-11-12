@@ -84,7 +84,7 @@
     <string name="error_vpn_running">偵測到 VPN 正在運作，本 App 可能已被納入 VPN 隧道，因此無法綁定行動網路。請在 VPN 的「分應用 / 排除清單」中將本 App（5G Proxy Pro）排除，或先關閉 VPN 後重試</string>
     <string name="error_cellular_bind_denied">無法綁定行動網路出口（系統拒絕），請確認 5G 網路正常後重試</string>
     <string name="notification_vpn_warning">⚠️ 本 App 疑被 VPN 隧道攔截，行動網路代理無法運作；請將 5G Proxy Pro 排除在 VPN 之外</string>
-    <string name="notification_cellular_stalled">⚠️ 行動數據顯示已連線，但沒有任何應用層資料回流。代理能連上網路、也能完成 TCP 握手，之後卻收不到任何位元組。請檢查行動數據本身（APN／重置網路設定／系統更新）；重建代理無法解決這個問題。</string>
+    <string name="notification_cellular_stalled">⚠️ 行動數據顯示已連線，但沒有任何應用層資料回流。代理能連上網路、也能完成 TCP 握手，之後卻收不到任何位元組。請檢查行動數據本身——先看方案是否還有流量、是否已被電信商停用，其次才是 APN／重置網路設定／系統更新；重建代理無法解決這個問題。</string>
     <string name="error_native_start">原生伺服器啟動失敗: %1$s</string>
 
     <string name="btn_self_test">🧪 自我檢測</string>
